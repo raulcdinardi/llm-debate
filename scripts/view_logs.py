@@ -174,6 +174,79 @@ def visualize_token_mask_with_separators(
     )
 
 
+def visualize_training_datum_with_advantages(
+    tokenizer,
+    title: str,
+    *,
+    prompt_tokens: list[int] | None,
+    target_tokens: list[int],
+    advantages: list[float],
+    sampling_logprobs: list[float] | None = None,
+) -> None:
+    """Visualize a training datum using the *advantages mask*.
+
+    - prompt_tokens is optional, but when provided we can distinguish:
+      - prompt tokens (mask=0, before prompt_len-1)
+      - injected/continuation tokens (mask=0, after prompt_len-1)
+    - target_tokens/advantages are aligned (same length).
+    """
+
+    prompt_len_minus_1 = None
+    if prompt_tokens is not None:
+        prompt_len_minus_1 = max(0, len(prompt_tokens) - 1)
+
+    text = Text()
+
+    # Legend
+    text.append("Legend: ", style="dim")
+    text.append("prompt(mask=0)", style="dim blue")
+    text.append(" │ ", style="dim")
+    text.append("injected(mask=0)", style="dim yellow")
+    text.append(" │ ", style="dim")
+    text.append("trained(mask>0)", style="green")
+    text.append("\n\n", style="dim")
+
+    n = min(len(target_tokens), len(advantages))
+    if sampling_logprobs is not None:
+        n = min(n, len(sampling_logprobs))
+
+    for i in range(n):
+        tok = target_tokens[i]
+        adv = advantages[i]
+        lp = sampling_logprobs[i] if sampling_logprobs is not None else None
+
+        decoded = tokenizer.decode([tok])
+        has_newline = "\n" in decoded
+        decoded = decoded.replace("\n", "↵\n").replace("\t", "→")
+
+        if adv != 0.0:
+            # trained token
+            style = get_logprob_style(lp) if lp is not None else "green"
+        else:
+            # masked token: prompt vs injected continuation
+            if prompt_len_minus_1 is not None and i >= prompt_len_minus_1:
+                style = "dim yellow"
+            else:
+                style = "dim blue"
+
+        text.append(decoded, style=style)
+        if i < n - 1 and not has_newline:
+            text.append("│", style="dim")
+
+    num_trained = sum(1 for a in advantages[:n] if a != 0.0)
+    num_masked = n - num_trained
+    subtitle = f"len={n} │ trained={num_trained} │ masked={num_masked}"
+
+    console.print(
+        Panel(
+            text,
+            title=f"[cyan]{title}[/cyan]",
+            subtitle=f"[dim]{subtitle}[/dim]",
+            border_style="blue",
+        )
+    )
+
+
 def render_log(log_data: dict, show_tokens: bool = False) -> None:
     console.clear()
 
@@ -336,13 +409,27 @@ def render_training_step(log_data: dict, show_tokens: bool = False) -> None:
         console.print(f"  Tokens: {num_prompt} prompt + {num_completion} completion")
 
         if show_tokens and tokenizer:
-            visualize_token_mask_with_separators(
-                tokenizer,
-                f"Datum {i+1}",
-                prompt_tokens=datum.get("prompt_tokens", []),
-                completion_tokens=datum.get("completion_tokens", []),
-                completion_logprobs=datum.get("completion_logprobs"),
-            )
+            # Prefer advantage-mask visualization if available (this correctly masks injected continuation tokens).
+            advantages = datum.get("advantages")
+            target_tokens = datum.get("target_tokens")
+            if isinstance(advantages, list) and isinstance(target_tokens, list) and advantages and target_tokens:
+                visualize_training_datum_with_advantages(
+                    tokenizer,
+                    f"Datum {i+1}",
+                    prompt_tokens=datum.get("prompt_tokens"),
+                    target_tokens=target_tokens,
+                    advantages=advantages,
+                    sampling_logprobs=datum.get("sampling_logprobs"),
+                )
+            else:
+                # Fallback: simple prompt vs completion split (less accurate for merged datums).
+                visualize_token_mask_with_separators(
+                    tokenizer,
+                    f"Datum {i+1}",
+                    prompt_tokens=datum.get("prompt_tokens", []),
+                    completion_tokens=datum.get("completion_tokens", []),
+                    completion_logprobs=None,
+                )
 
 
 def compute_run_stats(log_files: list[Path]) -> dict:
