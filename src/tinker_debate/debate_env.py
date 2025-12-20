@@ -1,0 +1,539 @@
+"""Debate environment for tinker-style training.
+
+Implements symmetric 3-round debate:
+- R1: Both agents propose solutions (FROZEN after this)
+- R2: Each agent sees opponent's R1, argues for own solution
+- R3: Each agent sees opponent's R2, responds to criticism
+- Judge: Separate LLM call declares winner (A or B)
+
+Training uses rejection sampling: only winners are trained on.
+"""
+
+from __future__ import annotations
+
+import random
+import re
+from dataclasses import dataclass
+from typing import Callable, Literal
+
+from .debate_types import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
+
+
+# === Extraction ===
+
+def extract_solution(text: str) -> str | None:
+    match = re.search(r"<SOLUTION>(.*?)</SOLUTION>", text, re.DOTALL)
+    return match.group(1).strip() if match else None
+
+
+def extract_verdict(text: str) -> Verdict:
+    match = re.search(r"<VERDICT>(.*?)</VERDICT>", text, re.DOTALL)
+    if not match:
+        raise ValueError("Judge response missing <VERDICT> tag")
+
+    verdict = match.group(1).strip().upper()
+    if verdict in ("A", "B"):
+        return verdict  # type: ignore[return-value]
+
+    raise ValueError(f"Invalid verdict: {verdict!r} (expected 'A' or 'B')")
+
+
+def extract_reasoning(text: str) -> str:
+    match = re.search(r"<REASONING>(.*?)</REASONING>", text, re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+
+# === Prompt Builders ===
+
+def _im_start(role: str) -> str:
+    return f"<|im_start|>{role}\n"
+
+
+def _im_end() -> str:
+    return "<|im_end|>\n"
+
+
+def build_r1_prompt(question: str, config: DebateConfig) -> str:
+    return (
+        _im_start("system")
+        + config.system_propose
+        + "\n"
+        + _im_end()
+        + _im_start("user")
+        + question
+        + "\n"
+        + _im_end()
+        + _im_start("assistant")
+    )
+
+
+def build_r2_continuation(opponent_r1: str, config: DebateConfig) -> str:
+    # Continues conversation from R1; starts with <|im_end|> to close previous assistant turn.
+    user_msg = config.r2_user_template.format(opponent_r1=opponent_r1)
+    return _im_end() + _im_start("user") + user_msg + "\n" + _im_end() + _im_start("assistant")
+
+
+def build_r3_continuation(opponent_r2: str, config: DebateConfig) -> str:
+    user_msg = config.r3_user_template.format(opponent_r2=opponent_r2)
+    return _im_end() + _im_start("user") + user_msg + "\n" + _im_end() + _im_start("assistant")
+
+
+def build_judge_prompt(
+    *,
+    question: str,
+    r1_a: str,
+    r1_b: str,
+    r2_a: str,
+    r2_b: str,
+    r3_a: str,
+    r3_b: str,
+    config: DebateConfig,
+    strict: bool = False,
+) -> str:
+    extra = "\n\nIMPORTANT: Output ONLY the tags. No extra text." if strict else ""
+    system = config.system_judge + extra
+
+    return (
+        _im_start("system")
+        + system
+        + "\n"
+        + _im_end()
+        + _im_start("user")
+        + f"Question: {question}\n\n"
+        + "=== AGENT A ===\n"
+        + "Round 1 (Proposal):\n"
+        + f"{r1_a}\n\n"
+        + "Round 2 (Argument):\n"
+        + f"{r2_a}\n\n"
+        + "Round 3 (Response):\n"
+        + f"{r3_a}\n\n"
+        + "=== AGENT B ===\n"
+        + "Round 1 (Proposal):\n"
+        + f"{r1_b}\n\n"
+        + "Round 2 (Argument):\n"
+        + f"{r2_b}\n\n"
+        + "Round 3 (Response):\n"
+        + f"{r3_b}\n\n"
+        + "Based on the debate above, which agent made a more convincing case?\n"
+        + "Consider: solution correctness, argument quality, rebuttal effectiveness.\n"
+        + _im_end()
+        + _im_start("assistant")
+    )
+
+
+# === Rollout Client ===
+
+@dataclass
+class DebateRolloutClient:
+    """Adapter: generation and tokenization interface."""
+
+    # generate_fn(prompts, max_tokens, temperature)
+    # -> list[(completion_text, prompt_tokens, completion_tokens, completion_logprobs)]
+    generate_fn: Callable[
+        [list[str], int | None, float], list[tuple[str, list[int], list[int], list[float]]]
+    ]
+
+    def generate(
+        self, *, prompts: list[str], max_tokens: int | None, temperature: float
+    ) -> list[tuple[str, list[int], list[int], list[float]]]:
+        return self.generate_fn(prompts, max_tokens, temperature)
+
+
+# === Judge Functions ===
+
+JudgeFn = Callable[
+    [str, str, str, str, str, str, str],  # question, r1_a, r1_b, r2_a, r2_b, r3_a, r3_b
+    tuple[Verdict, str],
+]
+
+
+def mock_judge_random(
+    question: str,
+    r1_a: str,
+    r1_b: str,
+    r2_a: str,
+    r2_b: str,
+    r3_a: str,
+    r3_b: str,
+) -> tuple[Verdict, str]:
+    verdict: Verdict = random.choice(["A", "B"])
+    reasoning = f"[MOCK JUDGE] Randomly selected {verdict}."
+    return verdict, reasoning
+
+
+def llm_judge(
+    *,
+    client: DebateRolloutClient,
+    question: str,
+    r1_a: str,
+    r1_b: str,
+    r2_a: str,
+    r2_b: str,
+    r3_a: str,
+    r3_b: str,
+    config: DebateConfig,
+) -> tuple[Verdict, str, dict]:
+    """LLM judge (single-pass, no retry).
+
+    If parsing fails, we raise to avoid silently corrupting training / analysis.
+    """
+
+    meta: dict[str, object] = {}
+
+    prompt = build_judge_prompt(
+        question=question,
+        r1_a=r1_a,
+        r1_b=r1_b,
+        r2_a=r2_a,
+        r2_b=r2_b,
+        r3_a=r3_a,
+        r3_b=r3_b,
+        config=config,
+        strict=False,
+    )
+    (judge_text, _p, _c, _lp) = client.generate(
+        prompts=[prompt], max_tokens=config.max_tokens_per_turn, temperature=0.3
+    )[0]
+
+    verdict = extract_verdict(judge_text)
+    reasoning = extract_reasoning(judge_text)
+    return verdict, reasoning, meta
+
+
+# === Debate Rollout ===
+
+def run_debate(
+    question: str,
+    ground_truth: str | None,
+    client: DebateRolloutClient,
+    config: DebateConfig,
+    judge_fn: JudgeFn | None = None,
+) -> DebateResult:
+    if config.num_rounds != 3:
+        raise NotImplementedError("Only num_rounds=3 is currently supported")
+
+    # === Round 1: Propose ===
+    r1_prompt = build_r1_prompt(question, config)
+    r1_results = client.generate(
+        prompts=[r1_prompt, r1_prompt],
+        max_tokens=config.max_tokens_per_turn,
+        temperature=config.temperature,
+    )
+    r1_a, r1_a_prompt_tokens, r1_a_tokens, r1_a_logprobs = r1_results[0]
+    r1_b, r1_b_prompt_tokens, r1_b_tokens, r1_b_logprobs = r1_results[1]
+
+    solution_a = extract_solution(r1_a)
+    solution_b = extract_solution(r1_b)
+
+    transition_a_r1 = Transition(
+        prompt_tokens=r1_a_prompt_tokens,
+        completion_tokens=r1_a_tokens,
+        completion_logprobs=r1_a_logprobs,
+        round_num=1,
+        metrics={"solution": solution_a},
+    )
+    transition_b_r1 = Transition(
+        prompt_tokens=r1_b_prompt_tokens,
+        completion_tokens=r1_b_tokens,
+        completion_logprobs=r1_b_logprobs,
+        round_num=1,
+        metrics={"solution": solution_b},
+    )
+
+    # === Round 2: Argue ===
+    r2_a_prompt = r1_prompt + r1_a + build_r2_continuation(r1_b, config)
+    r2_b_prompt = r1_prompt + r1_b + build_r2_continuation(r1_a, config)
+
+    r2_results = client.generate(
+        prompts=[r2_a_prompt, r2_b_prompt],
+        max_tokens=config.max_tokens_per_turn,
+        temperature=config.temperature,
+    )
+    r2_a, r2_a_prompt_tokens, r2_a_tokens, r2_a_logprobs = r2_results[0]
+    r2_b, r2_b_prompt_tokens, r2_b_tokens, r2_b_logprobs = r2_results[1]
+
+    transition_a_r2 = Transition(
+        prompt_tokens=r2_a_prompt_tokens,
+        completion_tokens=r2_a_tokens,
+        completion_logprobs=r2_a_logprobs,
+        round_num=2,
+    )
+    transition_b_r2 = Transition(
+        prompt_tokens=r2_b_prompt_tokens,
+        completion_tokens=r2_b_tokens,
+        completion_logprobs=r2_b_logprobs,
+        round_num=2,
+    )
+
+    # === Round 3: Respond ===
+    r3_a_prompt = r2_a_prompt + r2_a + build_r3_continuation(r2_b, config)
+    r3_b_prompt = r2_b_prompt + r2_b + build_r3_continuation(r2_a, config)
+
+    r3_results = client.generate(
+        prompts=[r3_a_prompt, r3_b_prompt],
+        max_tokens=config.max_tokens_per_turn,
+        temperature=config.temperature,
+    )
+    r3_a, r3_a_prompt_tokens, r3_a_tokens, r3_a_logprobs = r3_results[0]
+    r3_b, r3_b_prompt_tokens, r3_b_tokens, r3_b_logprobs = r3_results[1]
+
+    transition_a_r3 = Transition(
+        prompt_tokens=r3_a_prompt_tokens,
+        completion_tokens=r3_a_tokens,
+        completion_logprobs=r3_a_logprobs,
+        round_num=3,
+    )
+    transition_b_r3 = Transition(
+        prompt_tokens=r3_b_prompt_tokens,
+        completion_tokens=r3_b_tokens,
+        completion_logprobs=r3_b_logprobs,
+        round_num=3,
+    )
+
+    # === Judge ===
+    judge_meta: dict[str, object] = {}
+    if judge_fn is not None:
+        verdict, reasoning = judge_fn(question, r1_a, r1_b, r2_a, r2_b, r3_a, r3_b)
+    else:
+        verdict, reasoning, judge_meta = llm_judge(
+            client=client,
+            question=question,
+            r1_a=r1_a,
+            r1_b=r1_b,
+            r2_a=r2_a,
+            r2_b=r2_b,
+            r3_a=r3_a,
+            r3_b=r3_b,
+            config=config,
+        )
+
+    trajectory_a = DebateTrajectory(
+        agent="A",
+        transitions=[transition_a_r1, transition_a_r2, transition_a_r3],
+        frozen_solution=solution_a,
+        metrics={"r1": r1_a, "r2": r2_a, "r3": r3_a},
+    )
+    trajectory_b = DebateTrajectory(
+        agent="B",
+        transitions=[transition_b_r1, transition_b_r2, transition_b_r3],
+        frozen_solution=solution_b,
+        metrics={"r1": r1_b, "r2": r2_b, "r3": r3_b},
+    )
+
+    return DebateResult(
+        question=question,
+        ground_truth=ground_truth,
+        trajectory_a=trajectory_a,
+        trajectory_b=trajectory_b,
+        verdict=verdict,
+        judge_reasoning=reasoning,
+        metrics={
+            "judge_meta": judge_meta,
+            "solution_agreement": solution_a == solution_b if solution_a and solution_b else None,
+        },
+    )
+
+
+def run_debate_batch(
+    questions: list[tuple[str, str | None]],
+    client: DebateRolloutClient,
+    config: DebateConfig,
+    judge_fn: JudgeFn | None = None,
+) -> list[DebateResult]:
+    """Batched debate runner.
+
+    This is parallelizable because it batches all rounds across all debates:
+    - one batched generate for all R1
+    - one batched generate for all R2
+    - one batched generate for all R3
+    - one batched judge (if using llm_judge)
+    """
+
+    if config.num_rounds != 3:
+        raise NotImplementedError("Only num_rounds=3 is currently supported")
+
+    # R1 prompts: 2 per debate
+    r1_prompts: list[str] = []
+    for q, _gt in questions:
+        p = build_r1_prompt(q, config)
+        r1_prompts.extend([p, p])
+
+    r1_results = client.generate(
+        prompts=r1_prompts,
+        max_tokens=config.max_tokens_per_turn,
+        temperature=config.temperature,
+    )
+
+    # Group R1 results
+    r1_text_a: list[str] = []
+    r1_text_b: list[str] = []
+    r1_prompt_tokens_a: list[list[int]] = []
+    r1_prompt_tokens_b: list[list[int]] = []
+    r1_tokens_a: list[list[int]] = []
+    r1_tokens_b: list[list[int]] = []
+    r1_lps_a: list[list[float]] = []
+    r1_lps_b: list[list[float]] = []
+
+    for i in range(0, len(r1_results), 2):
+        a_txt, a_p, a_c, a_lp = r1_results[i]
+        b_txt, b_p, b_c, b_lp = r1_results[i + 1]
+        r1_text_a.append(a_txt)
+        r1_text_b.append(b_txt)
+        r1_prompt_tokens_a.append(a_p)
+        r1_prompt_tokens_b.append(b_p)
+        r1_tokens_a.append(a_c)
+        r1_tokens_b.append(b_c)
+        r1_lps_a.append(a_lp)
+        r1_lps_b.append(b_lp)
+
+    # R2 prompts: 2 per debate
+    r2_prompts: list[str] = []
+    base_r1_prompts: list[str] = [build_r1_prompt(q, config) for q, _ in questions]
+    for idx, (q, _gt) in enumerate(questions):
+        _ = q
+        r2_prompts.append(base_r1_prompts[idx] + r1_text_a[idx] + build_r2_continuation(r1_text_b[idx], config))
+        r2_prompts.append(base_r1_prompts[idx] + r1_text_b[idx] + build_r2_continuation(r1_text_a[idx], config))
+
+    r2_results = client.generate(
+        prompts=r2_prompts,
+        max_tokens=config.max_tokens_per_turn,
+        temperature=config.temperature,
+    )
+
+    r2_text_a: list[str] = []
+    r2_text_b: list[str] = []
+    r2_prompt_tokens_a: list[list[int]] = []
+    r2_prompt_tokens_b: list[list[int]] = []
+    r2_tokens_a: list[list[int]] = []
+    r2_tokens_b: list[list[int]] = []
+    r2_lps_a: list[list[float]] = []
+    r2_lps_b: list[list[float]] = []
+
+    for i in range(0, len(r2_results), 2):
+        a_txt, a_p, a_c, a_lp = r2_results[i]
+        b_txt, b_p, b_c, b_lp = r2_results[i + 1]
+        r2_text_a.append(a_txt)
+        r2_text_b.append(b_txt)
+        r2_prompt_tokens_a.append(a_p)
+        r2_prompt_tokens_b.append(b_p)
+        r2_tokens_a.append(a_c)
+        r2_tokens_b.append(b_c)
+        r2_lps_a.append(a_lp)
+        r2_lps_b.append(b_lp)
+
+    # R3 prompts
+    r3_prompts: list[str] = []
+    for idx, (q, _gt) in enumerate(questions):
+        _ = q
+        r2_a_prompt = base_r1_prompts[idx] + r1_text_a[idx] + build_r2_continuation(r1_text_b[idx], config)
+        r2_b_prompt = base_r1_prompts[idx] + r1_text_b[idx] + build_r2_continuation(r1_text_a[idx], config)
+        r3_prompts.append(r2_a_prompt + r2_text_a[idx] + build_r3_continuation(r2_text_b[idx], config))
+        r3_prompts.append(r2_b_prompt + r2_text_b[idx] + build_r3_continuation(r2_text_a[idx], config))
+
+    r3_results = client.generate(
+        prompts=r3_prompts,
+        max_tokens=config.max_tokens_per_turn,
+        temperature=config.temperature,
+    )
+
+    r3_text_a: list[str] = []
+    r3_text_b: list[str] = []
+    r3_prompt_tokens_a: list[list[int]] = []
+    r3_prompt_tokens_b: list[list[int]] = []
+    r3_tokens_a: list[list[int]] = []
+    r3_tokens_b: list[list[int]] = []
+    r3_lps_a: list[list[float]] = []
+    r3_lps_b: list[list[float]] = []
+
+    for i in range(0, len(r3_results), 2):
+        a_txt, a_p, a_c, a_lp = r3_results[i]
+        b_txt, b_p, b_c, b_lp = r3_results[i + 1]
+        r3_text_a.append(a_txt)
+        r3_text_b.append(b_txt)
+        r3_prompt_tokens_a.append(a_p)
+        r3_prompt_tokens_b.append(b_p)
+        r3_tokens_a.append(a_c)
+        r3_tokens_b.append(b_c)
+        r3_lps_a.append(a_lp)
+        r3_lps_b.append(b_lp)
+
+    # Judge
+    verdicts: list[Verdict] = []
+    reasons: list[str] = []
+    judge_metas: list[dict[str, object]] = []
+
+    if judge_fn is not None:
+        # Not batchable (user function), so do serial
+        for idx, (q, _gt) in enumerate(questions):
+            v, r = judge_fn(q, r1_text_a[idx], r1_text_b[idx], r2_text_a[idx], r2_text_b[idx], r3_text_a[idx], r3_text_b[idx])
+            verdicts.append(v)
+            reasons.append(r)
+            judge_metas.append({})
+    else:
+        judge_prompts = [
+            build_judge_prompt(
+                question=q,
+                r1_a=r1_text_a[idx],
+                r1_b=r1_text_b[idx],
+                r2_a=r2_text_a[idx],
+                r2_b=r2_text_b[idx],
+                r3_a=r3_text_a[idx],
+                r3_b=r3_text_b[idx],
+                config=config,
+                strict=False,
+            )
+            for idx, (q, _gt) in enumerate(questions)
+        ]
+
+        judge_results = client.generate(
+            prompts=judge_prompts, max_tokens=config.max_tokens_per_turn, temperature=0.3
+        )
+        for judge_text, _p, _c, _lp in judge_results:
+            v = extract_verdict(judge_text)
+            reason = extract_reasoning(judge_text)
+            verdicts.append(v)
+            reasons.append(reason)
+            judge_metas.append({})
+
+    results: list[DebateResult] = []
+    for idx, (q, gt) in enumerate(questions):
+        sol_a = extract_solution(r1_text_a[idx])
+        sol_b = extract_solution(r1_text_b[idx])
+
+        traj_a = DebateTrajectory(
+            agent="A",
+            transitions=[
+                Transition(r1_prompt_tokens_a[idx], r1_tokens_a[idx], r1_lps_a[idx], 1, {"solution": sol_a}),
+                Transition(r2_prompt_tokens_a[idx], r2_tokens_a[idx], r2_lps_a[idx], 2),
+                Transition(r3_prompt_tokens_a[idx], r3_tokens_a[idx], r3_lps_a[idx], 3),
+            ],
+            frozen_solution=sol_a,
+            metrics={"r1": r1_text_a[idx], "r2": r2_text_a[idx], "r3": r3_text_a[idx]},
+        )
+        traj_b = DebateTrajectory(
+            agent="B",
+            transitions=[
+                Transition(r1_prompt_tokens_b[idx], r1_tokens_b[idx], r1_lps_b[idx], 1, {"solution": sol_b}),
+                Transition(r2_prompt_tokens_b[idx], r2_tokens_b[idx], r2_lps_b[idx], 2),
+                Transition(r3_prompt_tokens_b[idx], r3_tokens_b[idx], r3_lps_b[idx], 3),
+            ],
+            frozen_solution=sol_b,
+            metrics={"r1": r1_text_b[idx], "r2": r2_text_b[idx], "r3": r3_text_b[idx]},
+        )
+
+        results.append(
+            DebateResult(
+                question=q,
+                ground_truth=gt,
+                trajectory_a=traj_a,
+                trajectory_b=traj_b,
+                verdict=verdicts[idx],
+                judge_reasoning=reasons[idx],
+                metrics={
+                    "judge_meta": judge_metas[idx],
+                    "solution_agreement": sol_a == sol_b if sol_a and sol_b else None,
+                },
+            )
+        )
+
+    return results

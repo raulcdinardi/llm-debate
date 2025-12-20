@@ -1,0 +1,4 @@
+# Minimal deps for Tinker API usage
+tinker
+python-dotenv
+tqdm
