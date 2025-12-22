@@ -276,6 +276,14 @@ def render_log(log_data: dict, show_tokens: bool = False) -> None:
     )
     console.print(f"[dim]Judge: {log_data.get('judge_reasoning', '')}[/dim]")
 
+    # Show judge token info if available
+    judge_data = log_data.get("judge", {})
+    if judge_data and judge_data.get("prompt_token_count"):
+        console.print(
+            f"[dim]Judge tokens: {judge_data.get('prompt_token_count', 0)} prompt + "
+            f"{judge_data.get('completion_token_count', 0)} completion[/dim]"
+        )
+
     agent_a = log_data.get("agent_a", {})
     agent_b = log_data.get("agent_b", {})
 
@@ -289,13 +297,17 @@ def render_log(log_data: dict, show_tokens: bool = False) -> None:
     sol_b = agent_b.get("frozen_solution", "?")
     console.print(f"\n[bold]Frozen Solutions:[/bold] A=[cyan]{sol_a}[/cyan]  B=[green]{sol_b}[/green]")
 
-    console.rule("[bold]Token Counts[/bold]")
+    console.rule("[bold]Token Counts (from API)[/bold]")
 
     def get_token_counts(agent_data):
         transitions = agent_data.get("transitions")
         if transitions:
+            # Use explicit counts if available, otherwise compute from token lists
             return {
-                f"r{t['round']}": {"prompt": len(t["prompt_tokens"]), "completion": len(t["completion_tokens"])}
+                f"r{t['round']}": {
+                    "prompt": t.get("prompt_token_count", len(t.get("prompt_tokens", []))),
+                    "completion": t.get("completion_token_count", len(t.get("completion_tokens", []))),
+                }
                 for t in transitions
             }
         return agent_data.get("token_counts", {})
@@ -305,16 +317,57 @@ def render_log(log_data: dict, show_tokens: bool = False) -> None:
 
     table = Table(box=box.SIMPLE)
     table.add_column("Round", style="cyan")
-    table.add_column("Agent A (prompt+completion)", justify="right")
-    table.add_column("Agent B (prompt+completion)", justify="right")
+    table.add_column("Agent A (prompt + completion)", justify="right")
+    table.add_column("Agent B (prompt + completion)", justify="right")
+    table.add_column("Extension Check", justify="center")
+
+    # Track for extension verification
+    prev_total_a = 0
+    prev_total_b = 0
 
     for round_key in ["r1", "r2", "r3"]:
         a_counts = tc_a.get(round_key, {})
         b_counts = tc_b.get(round_key, {})
+
+        a_prompt = a_counts.get("prompt", 0)
+        a_comp = a_counts.get("completion", 0)
+        b_prompt = b_counts.get("prompt", 0)
+        b_comp = b_counts.get("completion", 0)
+
+        # Check if this round's prompt equals previous round's total (extension property)
+        if round_key == "r1":
+            ext_check = "[dim]-[/dim]"
+        else:
+            # R2 prompt should = R1 prompt + R1 completion + continuation tokens
+            # R3 prompt should = R2 prompt + R2 completion + continuation tokens
+            # Simplified check: prompt should be > prev_total
+            a_ok = a_prompt > prev_total_a
+            b_ok = b_prompt > prev_total_b
+            if a_ok and b_ok:
+                ext_check = "[green]OK[/green]"
+            else:
+                ext_check = f"[red]A:{a_ok} B:{b_ok}[/red]"
+
+        prev_total_a = a_prompt + a_comp
+        prev_total_b = b_prompt + b_comp
+
         table.add_row(
             round_key.upper(),
-            f"{a_counts.get('prompt', 0)} + {a_counts.get('completion', 0)}",
-            f"{b_counts.get('prompt', 0)} + {b_counts.get('completion', 0)}",
+            f"{a_prompt} + {a_comp} = {a_prompt + a_comp}",
+            f"{b_prompt} + {b_comp} = {b_prompt + b_comp}",
+            ext_check,
+        )
+
+    # Add judge row if available
+    judge_data = log_data.get("judge", {})
+    if judge_data and judge_data.get("prompt_token_count"):
+        j_prompt = judge_data.get("prompt_token_count", 0)
+        j_comp = judge_data.get("completion_token_count", 0)
+        table.add_row(
+            "JUDGE",
+            f"{j_prompt} + {j_comp} = {j_prompt + j_comp}",
+            "[dim]-[/dim]",
+            "[dim]-[/dim]",
         )
 
     console.print(table)

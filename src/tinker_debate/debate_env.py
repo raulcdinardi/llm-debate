@@ -1,4 +1,4 @@
-"""Debate environment for tinker-style training.
+"""Debate environment for tinker-style training (async).
 
 Implements symmetric 3-round debate:
 - R1: Both agents propose solutions (FROZEN after this)
@@ -14,7 +14,7 @@ from __future__ import annotations
 import random
 import re
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Awaitable, Callable
 
 from .debate_types import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
 
@@ -27,15 +27,16 @@ def extract_solution(text: str) -> str | None:
 
 
 def extract_verdict(text: str) -> Verdict:
+    """Extract verdict from judge response. Returns 'INVALID' if parsing fails."""
     match = re.search(r"<VERDICT>(.*?)</VERDICT>", text, re.DOTALL)
     if not match:
-        raise ValueError("Judge response missing <VERDICT> tag")
+        return "INVALID"
 
     verdict = match.group(1).strip().upper()
     if verdict in ("A", "B"):
         return verdict  # type: ignore[return-value]
 
-    raise ValueError(f"Invalid verdict: {verdict!r} (expected 'A' or 'B')")
+    return "INVALID"
 
 
 def extract_reasoning(text: str) -> str:
@@ -125,18 +126,19 @@ def build_judge_prompt(
 
 @dataclass
 class DebateRolloutClient:
-    """Adapter: generation and tokenization interface."""
+    """Adapter: async generation and tokenization interface."""
 
-    # generate_fn(prompts, max_tokens, temperature)
-    # -> list[(completion_text, prompt_tokens, completion_tokens, completion_logprobs)]
+    # generate_fn(prompts, max_tokens, temperature) -> awaitable
+    # -> list[(completion_text, prompt_tokens, completion_tokens, completion_logprobs, raw_response)]
     generate_fn: Callable[
-        [list[str], int | None, float], list[tuple[str, list[int], list[int], list[float]]]
+        [list[str], int | None, float],
+        Awaitable[list[tuple[str, list[int], list[int], list[float], dict]]],
     ]
 
-    def generate(
+    async def generate(
         self, *, prompts: list[str], max_tokens: int | None, temperature: float
-    ) -> list[tuple[str, list[int], list[int], list[float]]]:
-        return self.generate_fn(prompts, max_tokens, temperature)
+    ) -> list[tuple[str, list[int], list[int], list[float], dict]]:
+        return await self.generate_fn(prompts, max_tokens, temperature)
 
 
 # === Judge Functions ===
@@ -161,7 +163,7 @@ def mock_judge_random(
     return verdict, reasoning
 
 
-def llm_judge(
+async def llm_judge(
     *,
     client: DebateRolloutClient,
     question: str,
@@ -172,10 +174,12 @@ def llm_judge(
     r3_a: str,
     r3_b: str,
     config: DebateConfig,
-) -> tuple[Verdict, str, dict]:
-    """LLM judge (single-pass, no retry).
+) -> tuple[Verdict, str, dict, list[int], list[int], list[float], dict]:
+    """LLM judge (single-pass, no retry, async).
 
     If parsing fails, we raise to avoid silently corrupting training / analysis.
+
+    Returns: (verdict, reasoning, meta, prompt_tokens, completion_tokens, completion_logprobs, raw_response)
     """
 
     meta: dict[str, object] = {}
@@ -191,18 +195,19 @@ def llm_judge(
         config=config,
         strict=False,
     )
-    (judge_text, _p, _c, _lp) = client.generate(
+    results = await client.generate(
         prompts=[prompt], max_tokens=config.max_tokens_per_turn, temperature=0.3
-    )[0]
+    )
+    (judge_text, prompt_tokens, completion_tokens, completion_logprobs, raw_response) = results[0]
 
     verdict = extract_verdict(judge_text)
     reasoning = extract_reasoning(judge_text)
-    return verdict, reasoning, meta
+    return verdict, reasoning, meta, prompt_tokens, completion_tokens, completion_logprobs, raw_response
 
 
 # === Debate Rollout ===
 
-def run_debate(
+async def run_debate(
     question: str,
     ground_truth: str | None,
     client: DebateRolloutClient,
@@ -214,13 +219,13 @@ def run_debate(
 
     # === Round 1: Propose ===
     r1_prompt = build_r1_prompt(question, config)
-    r1_results = client.generate(
+    r1_results = await client.generate(
         prompts=[r1_prompt, r1_prompt],
         max_tokens=config.max_tokens_per_turn,
         temperature=config.temperature,
     )
-    r1_a, r1_a_prompt_tokens, r1_a_tokens, r1_a_logprobs = r1_results[0]
-    r1_b, r1_b_prompt_tokens, r1_b_tokens, r1_b_logprobs = r1_results[1]
+    r1_a, r1_a_prompt_tokens, r1_a_tokens, r1_a_logprobs, r1_a_raw = r1_results[0]
+    r1_b, r1_b_prompt_tokens, r1_b_tokens, r1_b_logprobs, r1_b_raw = r1_results[1]
 
     solution_a = extract_solution(r1_a)
     solution_b = extract_solution(r1_b)
@@ -231,6 +236,7 @@ def run_debate(
         completion_logprobs=r1_a_logprobs,
         round_num=1,
         metrics={"solution": solution_a},
+        raw_response=r1_a_raw,
     )
     transition_b_r1 = Transition(
         prompt_tokens=r1_b_prompt_tokens,
@@ -238,64 +244,74 @@ def run_debate(
         completion_logprobs=r1_b_logprobs,
         round_num=1,
         metrics={"solution": solution_b},
+        raw_response=r1_b_raw,
     )
 
     # === Round 2: Argue ===
     r2_a_prompt = r1_prompt + r1_a + build_r2_continuation(r1_b, config)
     r2_b_prompt = r1_prompt + r1_b + build_r2_continuation(r1_a, config)
 
-    r2_results = client.generate(
+    r2_results = await client.generate(
         prompts=[r2_a_prompt, r2_b_prompt],
         max_tokens=config.max_tokens_per_turn,
         temperature=config.temperature,
     )
-    r2_a, r2_a_prompt_tokens, r2_a_tokens, r2_a_logprobs = r2_results[0]
-    r2_b, r2_b_prompt_tokens, r2_b_tokens, r2_b_logprobs = r2_results[1]
+    r2_a, r2_a_prompt_tokens, r2_a_tokens, r2_a_logprobs, r2_a_raw = r2_results[0]
+    r2_b, r2_b_prompt_tokens, r2_b_tokens, r2_b_logprobs, r2_b_raw = r2_results[1]
 
     transition_a_r2 = Transition(
         prompt_tokens=r2_a_prompt_tokens,
         completion_tokens=r2_a_tokens,
         completion_logprobs=r2_a_logprobs,
         round_num=2,
+        raw_response=r2_a_raw,
     )
     transition_b_r2 = Transition(
         prompt_tokens=r2_b_prompt_tokens,
         completion_tokens=r2_b_tokens,
         completion_logprobs=r2_b_logprobs,
         round_num=2,
+        raw_response=r2_b_raw,
     )
 
     # === Round 3: Respond ===
     r3_a_prompt = r2_a_prompt + r2_a + build_r3_continuation(r2_b, config)
     r3_b_prompt = r2_b_prompt + r2_b + build_r3_continuation(r2_a, config)
 
-    r3_results = client.generate(
+    r3_results = await client.generate(
         prompts=[r3_a_prompt, r3_b_prompt],
         max_tokens=config.max_tokens_per_turn,
         temperature=config.temperature,
     )
-    r3_a, r3_a_prompt_tokens, r3_a_tokens, r3_a_logprobs = r3_results[0]
-    r3_b, r3_b_prompt_tokens, r3_b_tokens, r3_b_logprobs = r3_results[1]
+    r3_a, r3_a_prompt_tokens, r3_a_tokens, r3_a_logprobs, r3_a_raw = r3_results[0]
+    r3_b, r3_b_prompt_tokens, r3_b_tokens, r3_b_logprobs, r3_b_raw = r3_results[1]
 
     transition_a_r3 = Transition(
         prompt_tokens=r3_a_prompt_tokens,
         completion_tokens=r3_a_tokens,
         completion_logprobs=r3_a_logprobs,
         round_num=3,
+        raw_response=r3_a_raw,
     )
     transition_b_r3 = Transition(
         prompt_tokens=r3_b_prompt_tokens,
         completion_tokens=r3_b_tokens,
         completion_logprobs=r3_b_logprobs,
         round_num=3,
+        raw_response=r3_b_raw,
     )
 
     # === Judge ===
     judge_meta: dict[str, object] = {}
+    judge_prompt_tokens: list[int] | None = None
+    judge_completion_tokens: list[int] | None = None
+    judge_completion_logprobs: list[float] | None = None
+    judge_raw_response: dict | None = None
+
     if judge_fn is not None:
         verdict, reasoning = judge_fn(question, r1_a, r1_b, r2_a, r2_b, r3_a, r3_b)
     else:
-        verdict, reasoning, judge_meta = llm_judge(
+        verdict, reasoning, judge_meta, judge_prompt_tokens, judge_completion_tokens, judge_completion_logprobs, judge_raw_response = await llm_judge(
             client=client,
             question=question,
             r1_a=r1_a,
@@ -331,16 +347,20 @@ def run_debate(
             "judge_meta": judge_meta,
             "solution_agreement": solution_a == solution_b if solution_a and solution_b else None,
         },
+        judge_prompt_tokens=judge_prompt_tokens,
+        judge_completion_tokens=judge_completion_tokens,
+        judge_completion_logprobs=judge_completion_logprobs,
+        judge_raw_response=judge_raw_response,
     )
 
 
-def run_debate_batch(
+async def run_debate_batch(
     questions: list[tuple[str, str | None]],
     client: DebateRolloutClient,
     config: DebateConfig,
     judge_fn: JudgeFn | None = None,
 ) -> list[DebateResult]:
-    """Batched debate runner.
+    """Batched debate runner (async).
 
     This is parallelizable because it batches all rounds across all debates:
     - one batched generate for all R1
@@ -358,7 +378,7 @@ def run_debate_batch(
         p = build_r1_prompt(q, config)
         r1_prompts.extend([p, p])
 
-    r1_results = client.generate(
+    r1_results = await client.generate(
         prompts=r1_prompts,
         max_tokens=config.max_tokens_per_turn,
         temperature=config.temperature,
@@ -373,10 +393,12 @@ def run_debate_batch(
     r1_tokens_b: list[list[int]] = []
     r1_lps_a: list[list[float]] = []
     r1_lps_b: list[list[float]] = []
+    r1_raw_a: list[dict] = []
+    r1_raw_b: list[dict] = []
 
     for i in range(0, len(r1_results), 2):
-        a_txt, a_p, a_c, a_lp = r1_results[i]
-        b_txt, b_p, b_c, b_lp = r1_results[i + 1]
+        a_txt, a_p, a_c, a_lp, a_raw = r1_results[i]
+        b_txt, b_p, b_c, b_lp, b_raw = r1_results[i + 1]
         r1_text_a.append(a_txt)
         r1_text_b.append(b_txt)
         r1_prompt_tokens_a.append(a_p)
@@ -385,6 +407,8 @@ def run_debate_batch(
         r1_tokens_b.append(b_c)
         r1_lps_a.append(a_lp)
         r1_lps_b.append(b_lp)
+        r1_raw_a.append(a_raw)
+        r1_raw_b.append(b_raw)
 
     # R2 prompts: 2 per debate
     r2_prompts: list[str] = []
@@ -394,7 +418,7 @@ def run_debate_batch(
         r2_prompts.append(base_r1_prompts[idx] + r1_text_a[idx] + build_r2_continuation(r1_text_b[idx], config))
         r2_prompts.append(base_r1_prompts[idx] + r1_text_b[idx] + build_r2_continuation(r1_text_a[idx], config))
 
-    r2_results = client.generate(
+    r2_results = await client.generate(
         prompts=r2_prompts,
         max_tokens=config.max_tokens_per_turn,
         temperature=config.temperature,
@@ -408,10 +432,12 @@ def run_debate_batch(
     r2_tokens_b: list[list[int]] = []
     r2_lps_a: list[list[float]] = []
     r2_lps_b: list[list[float]] = []
+    r2_raw_a: list[dict] = []
+    r2_raw_b: list[dict] = []
 
     for i in range(0, len(r2_results), 2):
-        a_txt, a_p, a_c, a_lp = r2_results[i]
-        b_txt, b_p, b_c, b_lp = r2_results[i + 1]
+        a_txt, a_p, a_c, a_lp, a_raw = r2_results[i]
+        b_txt, b_p, b_c, b_lp, b_raw = r2_results[i + 1]
         r2_text_a.append(a_txt)
         r2_text_b.append(b_txt)
         r2_prompt_tokens_a.append(a_p)
@@ -420,6 +446,8 @@ def run_debate_batch(
         r2_tokens_b.append(b_c)
         r2_lps_a.append(a_lp)
         r2_lps_b.append(b_lp)
+        r2_raw_a.append(a_raw)
+        r2_raw_b.append(b_raw)
 
     # R3 prompts
     r3_prompts: list[str] = []
@@ -430,7 +458,7 @@ def run_debate_batch(
         r3_prompts.append(r2_a_prompt + r2_text_a[idx] + build_r3_continuation(r2_text_b[idx], config))
         r3_prompts.append(r2_b_prompt + r2_text_b[idx] + build_r3_continuation(r2_text_a[idx], config))
 
-    r3_results = client.generate(
+    r3_results = await client.generate(
         prompts=r3_prompts,
         max_tokens=config.max_tokens_per_turn,
         temperature=config.temperature,
@@ -444,10 +472,12 @@ def run_debate_batch(
     r3_tokens_b: list[list[int]] = []
     r3_lps_a: list[list[float]] = []
     r3_lps_b: list[list[float]] = []
+    r3_raw_a: list[dict] = []
+    r3_raw_b: list[dict] = []
 
     for i in range(0, len(r3_results), 2):
-        a_txt, a_p, a_c, a_lp = r3_results[i]
-        b_txt, b_p, b_c, b_lp = r3_results[i + 1]
+        a_txt, a_p, a_c, a_lp, a_raw = r3_results[i]
+        b_txt, b_p, b_c, b_lp, b_raw = r3_results[i + 1]
         r3_text_a.append(a_txt)
         r3_text_b.append(b_txt)
         r3_prompt_tokens_a.append(a_p)
@@ -456,11 +486,17 @@ def run_debate_batch(
         r3_tokens_b.append(b_c)
         r3_lps_a.append(a_lp)
         r3_lps_b.append(b_lp)
+        r3_raw_a.append(a_raw)
+        r3_raw_b.append(b_raw)
 
     # Judge
     verdicts: list[Verdict] = []
     reasons: list[str] = []
     judge_metas: list[dict[str, object]] = []
+    judge_prompt_tokens_list: list[list[int] | None] = []
+    judge_completion_tokens_list: list[list[int] | None] = []
+    judge_completion_logprobs_list: list[list[float] | None] = []
+    judge_raw_response_list: list[dict | None] = []
 
     if judge_fn is not None:
         # Not batchable (user function), so do serial
@@ -469,6 +505,10 @@ def run_debate_batch(
             verdicts.append(v)
             reasons.append(r)
             judge_metas.append({})
+            judge_prompt_tokens_list.append(None)
+            judge_completion_tokens_list.append(None)
+            judge_completion_logprobs_list.append(None)
+            judge_raw_response_list.append(None)
     else:
         judge_prompts = [
             build_judge_prompt(
@@ -485,15 +525,19 @@ def run_debate_batch(
             for idx, (q, _gt) in enumerate(questions)
         ]
 
-        judge_results = client.generate(
+        judge_results = await client.generate(
             prompts=judge_prompts, max_tokens=config.max_tokens_per_turn, temperature=0.3
         )
-        for judge_text, _p, _c, _lp in judge_results:
+        for judge_text, j_prompt_toks, j_comp_toks, j_lps, j_raw in judge_results:
             v = extract_verdict(judge_text)
             reason = extract_reasoning(judge_text)
             verdicts.append(v)
             reasons.append(reason)
             judge_metas.append({})
+            judge_prompt_tokens_list.append(j_prompt_toks)
+            judge_completion_tokens_list.append(j_comp_toks)
+            judge_completion_logprobs_list.append(j_lps)
+            judge_raw_response_list.append(j_raw)
 
     results: list[DebateResult] = []
     for idx, (q, gt) in enumerate(questions):
@@ -503,9 +547,9 @@ def run_debate_batch(
         traj_a = DebateTrajectory(
             agent="A",
             transitions=[
-                Transition(r1_prompt_tokens_a[idx], r1_tokens_a[idx], r1_lps_a[idx], 1, {"solution": sol_a}),
-                Transition(r2_prompt_tokens_a[idx], r2_tokens_a[idx], r2_lps_a[idx], 2),
-                Transition(r3_prompt_tokens_a[idx], r3_tokens_a[idx], r3_lps_a[idx], 3),
+                Transition(r1_prompt_tokens_a[idx], r1_tokens_a[idx], r1_lps_a[idx], 1, {"solution": sol_a}, r1_raw_a[idx]),
+                Transition(r2_prompt_tokens_a[idx], r2_tokens_a[idx], r2_lps_a[idx], 2, {}, r2_raw_a[idx]),
+                Transition(r3_prompt_tokens_a[idx], r3_tokens_a[idx], r3_lps_a[idx], 3, {}, r3_raw_a[idx]),
             ],
             frozen_solution=sol_a,
             metrics={"r1": r1_text_a[idx], "r2": r2_text_a[idx], "r3": r3_text_a[idx]},
@@ -513,9 +557,9 @@ def run_debate_batch(
         traj_b = DebateTrajectory(
             agent="B",
             transitions=[
-                Transition(r1_prompt_tokens_b[idx], r1_tokens_b[idx], r1_lps_b[idx], 1, {"solution": sol_b}),
-                Transition(r2_prompt_tokens_b[idx], r2_tokens_b[idx], r2_lps_b[idx], 2),
-                Transition(r3_prompt_tokens_b[idx], r3_tokens_b[idx], r3_lps_b[idx], 3),
+                Transition(r1_prompt_tokens_b[idx], r1_tokens_b[idx], r1_lps_b[idx], 1, {"solution": sol_b}, r1_raw_b[idx]),
+                Transition(r2_prompt_tokens_b[idx], r2_tokens_b[idx], r2_lps_b[idx], 2, {}, r2_raw_b[idx]),
+                Transition(r3_prompt_tokens_b[idx], r3_tokens_b[idx], r3_lps_b[idx], 3, {}, r3_raw_b[idx]),
             ],
             frozen_solution=sol_b,
             metrics={"r1": r1_text_b[idx], "r2": r2_text_b[idx], "r3": r3_text_b[idx]},
@@ -533,6 +577,10 @@ def run_debate_batch(
                     "judge_meta": judge_metas[idx],
                     "solution_agreement": sol_a == sol_b if sol_a and sol_b else None,
                 },
+                judge_prompt_tokens=judge_prompt_tokens_list[idx],
+                judge_completion_tokens=judge_completion_tokens_list[idx],
+                judge_completion_logprobs=judge_completion_logprobs_list[idx],
+                judge_raw_response=judge_raw_response_list[idx],
             )
         )
 

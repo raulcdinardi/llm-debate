@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
-Verdict = Literal["A", "B"]
+Verdict = Literal["A", "B", "INVALID"]
 
 
 @dataclass
@@ -34,6 +34,9 @@ class Transition:
     round_num: int
 
     metrics: dict[str, Any] = field(default_factory=dict)
+
+    # Raw API response (all fields) for debugging
+    raw_response: dict[str, Any] | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -66,6 +69,12 @@ class DebateResult:
     judge_reasoning: str
     metrics: dict[str, Any] = field(default_factory=dict)
 
+    # Judge token info (None if mock judge used)
+    judge_prompt_tokens: list[int] | None = None
+    judge_completion_tokens: list[int] | None = None
+    judge_completion_logprobs: list[float] | None = None
+    judge_raw_response: dict[str, Any] | None = None
+
     def get_winner_trajectory(self) -> DebateTrajectory:
         if self.verdict == "A":
             return self.trajectory_a
@@ -94,11 +103,7 @@ class DebateConfig:
 
     # Prompts / templates (move hardcoding out of env)
     system_propose: str = (
-        "You are solving a problem. Think step by step, then provide your answer.\n\n"
-        "Format:\n"
-        "<THINKING>\n"
-        "[Your reasoning process]\n"
-        "</THINKING>\n"
+        "You are solving a problem. Provide your answer in the following format:\n\n"
         "<SOLUTION>[Your final answer]</SOLUTION>"
     )
 
@@ -238,13 +243,14 @@ def compute_training_stats(debates: list[DebateResult]) -> dict[str, Any]:
 
     a_wins = sum(1 for d in debates if d.verdict == "A")
     b_wins = sum(1 for d in debates if d.verdict == "B")
+    invalid = sum(1 for d in debates if d.verdict == "INVALID")
 
     correct_wins = 0
     wrong_wins = 0
     accuracy_calculable = 0
 
     for d in debates:
-        if d.ground_truth is None:
+        if d.ground_truth is None or d.verdict not in ("A", "B"):
             continue
         winner = d.get_winner_trajectory()
         accuracy_calculable += 1
@@ -253,12 +259,14 @@ def compute_training_stats(debates: list[DebateResult]) -> dict[str, Any]:
         else:
             wrong_wins += 1
 
+    valid_total = a_wins + b_wins
     return {
         "total": total,
         "a_wins": a_wins,
         "b_wins": b_wins,
-        "win_rate_a": a_wins / total,
-        "win_rate_b": b_wins / total,
+        "invalid": invalid,
+        "win_rate_a": a_wins / valid_total if valid_total > 0 else None,
+        "win_rate_b": b_wins / valid_total if valid_total > 0 else None,
         "correct_wins": correct_wins,
         "wrong_wins": wrong_wins,
         "accuracy_from_debates": correct_wins / accuracy_calculable if accuracy_calculable > 0 else None,

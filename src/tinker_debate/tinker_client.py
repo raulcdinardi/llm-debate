@@ -1,42 +1,108 @@
-"""Tinker API client for debate training.
+"""Tinker API client for debate training (async).
 
 Implements:
 - parallelizable sampling (submit all requests first, then await futures)
 - forward_backward for policy gradient-style losses (importance sampling)
 
 This is the API boundary; avoid silent fallbacks here.
+Uses async Tinker API throughout for better performance.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Literal
 
 import tinker
 from tinker import types as tinker_types
 
 from tinker_cookbook.renderers import Qwen3InstructRenderer
 
+LossFn = Literal["cross_entropy", "importance_sampling", "ppo", "cispo", "dro"]
+
+
+def serialize_response(response: Any, sequence_idx: int = 0) -> dict:
+    """Serialize a Tinker SampleResponse to a dict with ALL fields.
+
+    Captures everything the API returns for debugging/logging.
+    """
+    raw: dict[str, Any] = {
+        "response_type": type(response).__name__,
+        "response_dir": [a for a in dir(response) if not a.startswith("_")],
+    }
+
+    # Capture all non-callable attributes from response
+    for attr in dir(response):
+        if attr.startswith("_"):
+            continue
+        try:
+            val = getattr(response, attr)
+            if callable(val):
+                continue
+            # Handle sequences specially
+            if attr == "sequences":
+                raw["sequences_count"] = len(val) if val else 0
+            else:
+                raw[f"response_{attr}"] = _serialize_value(val)
+        except Exception as e:
+            raw[f"response_{attr}_error"] = str(e)
+
+    # Capture the specific sequence we used
+    if hasattr(response, "sequences") and response.sequences:
+        seq = response.sequences[sequence_idx]
+        raw["sequence_type"] = type(seq).__name__
+        raw["sequence_dir"] = [a for a in dir(seq) if not a.startswith("_")]
+
+        for attr in dir(seq):
+            if attr.startswith("_"):
+                continue
+            try:
+                val = getattr(seq, attr)
+                if callable(val):
+                    continue
+                raw[f"seq_{attr}"] = _serialize_value(val)
+            except Exception as e:
+                raw[f"seq_{attr}_error"] = str(e)
+
+    return raw
+
+
+def _serialize_value(val: Any) -> Any:
+    """Serialize a value for JSON, handling common types. Keeps everything."""
+    if val is None:
+        return None
+    if isinstance(val, (str, int, float, bool)):
+        return val
+    if isinstance(val, (list, tuple)):
+        return [_serialize_value(x) for x in val]
+    if isinstance(val, dict):
+        return {k: _serialize_value(v) for k, v in val.items()}
+    if hasattr(val, "__dict__"):
+        return {"_type": type(val).__name__, "_dict": _serialize_value(val.__dict__)}
+    # Fallback: convert to string
+    return {"_type": type(val).__name__, "_str": str(val)}
+
 
 @dataclass
 class TinkerDebateClient:
-    """Combined sampling and training client using Tinker API."""
+    """Combined sampling and training client using async Tinker API."""
 
     service: tinker.ServiceClient
     training_client: tinker.TrainingClient
     sampling_client: tinker.SamplingClient
-    tokenizer: object
+    tokenizer: Any  # HuggingFace tokenizer
     renderer: Qwen3InstructRenderer
     model_name: str
 
     @classmethod
-    def create(
+    async def create(
         cls, model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
     ) -> "TinkerDebateClient":
         service = tinker.ServiceClient()
-        training_client = service.create_lora_training_client(base_model=model_name)
+        training_client = await service.create_lora_training_client_async(base_model=model_name)
         tokenizer = training_client.get_tokenizer()
         renderer = Qwen3InstructRenderer(tokenizer)
-        sampling_client = training_client.save_weights_and_get_sampling_client("debate_init")
+        sampling_client = await training_client.save_weights_and_get_sampling_client_async("debate_init")
 
         return cls(
             service=service,
@@ -47,28 +113,31 @@ class TinkerDebateClient:
             model_name=model_name,
         )
 
-    def generate(
+    async def generate(
         self,
         prompts: list[str],
         max_tokens: int | None = None,
         temperature: float = 0.8,
-    ) -> list[tuple[str, list[int], list[int], list[float]]]:
-        """Generate completions.
+    ) -> list[tuple[str, list[int], list[int], list[float], dict]]:
+        """Generate completions (async, parallel).
 
         Returns list of:
-          (completion_text, prompt_tokens, completion_tokens, completion_logprobs)
+          (completion_text, prompt_tokens, completion_tokens, completion_logprobs, raw_response)
+
+        raw_response contains ALL fields returned by the API for debugging.
 
         NOTE: we require completion logprobs for RL-style training; if the server
         doesn't return them, we raise (no silent fallback).
         """
+        import asyncio
 
         stop_strings = self.renderer.get_stop_sequences()
         stop = stop_strings if (stop_strings and isinstance(stop_strings[0], str)) else None
 
         prompt_tokens_list: list[list[int]] = []
-        futures = []
+        sample_coros = []
 
-        # Submit all requests first (parallelizable)
+        # Prepare all requests
         for prompt in prompts:
             prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
             prompt_tokens_list.append(prompt_tokens)
@@ -78,21 +147,24 @@ class TinkerDebateClient:
                 temperature=temperature,
                 stop=stop,
             )
-            # Intentionally do NOT set max_tokens unless explicitly requested.
             if max_tokens is not None:
                 sampling_params.max_tokens = max_tokens
-            fut = self.sampling_client.sample(
-                prompt=model_input,
-                num_samples=1,
-                sampling_params=sampling_params,
+
+            # Don't await yet - just create the coroutine
+            sample_coros.append(
+                self.sampling_client.sample_async(
+                    prompt=model_input,
+                    num_samples=1,
+                    sampling_params=sampling_params,
+                )
             )
-            futures.append(fut)
 
-        results: list[tuple[str, list[int], list[int], list[float]]] = []
+        # Run all requests in parallel - sample_async returns results directly
+        responses = await asyncio.gather(*sample_coros)
 
-        # Collect in the same order
-        for prompt_tokens, fut in zip(prompt_tokens_list, futures):
-            resp = fut.result()
+        results: list[tuple[str, list[int], list[int], list[float], dict]] = []
+
+        for prompt_tokens, resp in zip(prompt_tokens_list, responses):
             seq = resp.sequences[0]
 
             completion_tokens = list(seq.tokens)
@@ -106,30 +178,34 @@ class TinkerDebateClient:
             completion_text = self.tokenizer.decode(
                 completion_tokens, skip_special_tokens=True
             )
+
+            # Serialize raw response for logging
+            raw_response = serialize_response(resp, sequence_idx=0)
+
             results.append(
-                (completion_text, prompt_tokens, completion_tokens, completion_logprobs)
+                (completion_text, prompt_tokens, completion_tokens, completion_logprobs, raw_response)
             )
 
         return results
 
     # Back-compat alias
-    def generate_with_logprobs(
+    async def generate_with_logprobs(
         self,
         prompts: list[str],
         max_tokens: int = 512,
         temperature: float = 0.8,
-    ) -> list[tuple[str, list[int], list[int], list[float]]]:
-        return self.generate(prompts, max_tokens=max_tokens, temperature=temperature)
+    ) -> list[tuple[str, list[int], list[int], list[float], dict]]:
+        return await self.generate(prompts, max_tokens=max_tokens, temperature=temperature)
 
-    def forward_backward(
+    async def forward_backward(
         self,
         prompt_tokens_batch: list[list[int]],
         completion_tokens_batch: list[list[int]],
         completion_logprobs_batch: list[list[float]],
         completion_advantages_batch: list[list[float]],
-        loss_fn: str = "importance_sampling",
+        loss_fn: LossFn = "importance_sampling",
     ) -> dict:
-        """Compute forward-backward pass with policy gradient loss.
+        """Compute forward-backward pass with policy gradient loss (async).
 
         Note: if you're doing a full training step, prefer `train_step()` which overlaps
         the forward_backward and optim_step requests (see Tinker docs on clock cycles).
@@ -179,7 +255,8 @@ class TinkerDebateClient:
             )
             data.append(datum)
 
-        fwd_bwd_out = self.training_client.forward_backward(data, loss_fn).result()
+        fwd_bwd_future = await self.training_client.forward_backward_async(data, loss_fn)
+        fwd_bwd_out = await fwd_bwd_future
 
         # Compute approximate loss from returned logprobs
         total_loss = 0.0
@@ -221,12 +298,13 @@ class TinkerDebateClient:
             "metrics": metrics,
         }
 
-    def optim_step(self, learning_rate: float = 1e-5) -> None:
-        self.training_client.optim_step(
+    async def optim_step(self, learning_rate: float = 1e-5) -> None:
+        fut = await self.training_client.optim_step_async(
             tinker_types.AdamParams(learning_rate=learning_rate)
-        ).result()
+        )
+        await fut
 
-    def train_step(
+    async def train_step(
         self,
         *,
         prompt_tokens_batch: list[list[int]],
@@ -234,9 +312,9 @@ class TinkerDebateClient:
         completion_logprobs_batch: list[list[float]],
         completion_advantages_batch: list[list[float]],
         learning_rate: float,
-        loss_fn: str = "importance_sampling",
+        loss_fn: LossFn = "importance_sampling",
     ) -> dict:
-        """One training step with overlapped forward_backward + optim_step.
+        """One training step with overlapped forward_backward + optim_step (async).
 
         This follows the pattern recommended in Tinker docs (submit both operations
         before blocking on results) to avoid missing clock cycles.
@@ -284,14 +362,14 @@ class TinkerDebateClient:
                 )
             )
 
-        # Submit both requests before waiting (overlap).
-        fwd_bwd_future = self.training_client.forward_backward(data, loss_fn)
-        optim_future = self.training_client.optim_step(
+        # Submit both requests before waiting (overlap) - async double-await pattern.
+        fwd_bwd_future = await self.training_client.forward_backward_async(data, loss_fn)
+        optim_future = await self.training_client.optim_step_async(
             tinker_types.AdamParams(learning_rate=learning_rate)
         )
 
-        fwd_bwd_out = fwd_bwd_future.result()
-        _optim_out = optim_future.result()
+        fwd_bwd_out = await fwd_bwd_future
+        _optim_out = await optim_future
 
         # Prefer loss computed server-side if available.
         metrics = getattr(fwd_bwd_out, "metrics", {}) or {}
@@ -331,5 +409,5 @@ class TinkerDebateClient:
             "metrics": metrics,
         }
 
-    def sync_weights(self, name: str = "step") -> None:
-        self.sampling_client = self.training_client.save_weights_and_get_sampling_client(name)
+    async def sync_weights(self, name: str = "step") -> None:
+        self.sampling_client = await self.training_client.save_weights_and_get_sampling_client_async(name)
