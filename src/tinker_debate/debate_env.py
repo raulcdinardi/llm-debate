@@ -124,21 +124,39 @@ def build_judge_prompt(
 
 # === Rollout Client ===
 
+# Placeholder for failed requests - keeps indices aligned
+FAILED_RESULT: tuple[str, list[int], list[int], list[float], dict] = (
+    "[REQUEST FAILED]", [], [], [], {"error": "request_failed"}
+)
+
+
 @dataclass
 class DebateRolloutClient:
     """Adapter: async generation and tokenization interface."""
 
     # generate_fn(prompts, max_tokens, temperature) -> awaitable
-    # -> list[(completion_text, prompt_tokens, completion_tokens, completion_logprobs, raw_response)]
+    # -> list[(completion_text, prompt_tokens, completion_tokens, completion_logprobs, raw_response) | None]
     generate_fn: Callable[
         [list[str], int | None, float],
-        Awaitable[list[tuple[str, list[int], list[int], list[float], dict]]],
+        Awaitable[list[tuple[str, list[int], list[int], list[float], dict] | None]],
     ]
 
     async def generate(
         self, *, prompts: list[str], max_tokens: int | None, temperature: float
     ) -> list[tuple[str, list[int], list[int], list[float], dict]]:
-        return await self.generate_fn(prompts, max_tokens, temperature)
+        """Generate completions. Failed requests return FAILED_RESULT placeholder."""
+        raw_results = await self.generate_fn(prompts, max_tokens, temperature)
+        # Replace None with placeholder, print warning
+        results = []
+        for i, r in enumerate(raw_results):
+            if r is None:
+                print(f"\n{'!'*60}")
+                print(f"!!! REQUEST {i+1}/{len(raw_results)} RETURNED NONE - DEBATE WILL BE INVALID")
+                print(f"{'!'*60}\n")
+                results.append(FAILED_RESULT)
+            else:
+                results.append(r)
+        return results
 
 
 # === Judge Functions ===
@@ -372,6 +390,17 @@ async def run_debate_batch(
     if config.num_rounds != 3:
         raise NotImplementedError("Only num_rounds=3 is currently supported")
 
+    # Track debates with failed requests
+    failed_debate_indices: set[int] = set()
+
+    def check_for_failures(results: list, round_name: str) -> None:
+        """Check results for failures and track affected debate indices."""
+        for i, r in enumerate(results):
+            if r[4].get("error") == "request_failed":  # Check raw_response for error marker
+                debate_idx = i // 2  # 2 results per debate (A and B)
+                failed_debate_indices.add(debate_idx)
+                print(f"!!! {round_name} result {i} failed -> debate {debate_idx} marked INVALID")
+
     # R1 prompts: 2 per debate
     r1_prompts: list[str] = []
     for q, _gt in questions:
@@ -383,6 +412,7 @@ async def run_debate_batch(
         max_tokens=config.max_tokens_per_turn,
         temperature=config.temperature,
     )
+    check_for_failures(r1_results, "R1")
 
     # Group R1 results
     r1_text_a: list[str] = []
@@ -423,6 +453,7 @@ async def run_debate_batch(
         max_tokens=config.max_tokens_per_turn,
         temperature=config.temperature,
     )
+    check_for_failures(r2_results, "R2")
 
     r2_text_a: list[str] = []
     r2_text_b: list[str] = []
@@ -463,6 +494,7 @@ async def run_debate_batch(
         max_tokens=config.max_tokens_per_turn,
         temperature=config.temperature,
     )
+    check_for_failures(r3_results, "R3")
 
     r3_text_a: list[str] = []
     r3_text_b: list[str] = []
@@ -528,6 +560,12 @@ async def run_debate_batch(
         judge_results = await client.generate(
             prompts=judge_prompts, max_tokens=config.max_tokens_per_turn, temperature=0.3
         )
+        # Check judge failures (1 result per debate, not 2)
+        for i, r in enumerate(judge_results):
+            if r[4].get("error") == "request_failed":
+                failed_debate_indices.add(i)
+                print(f"!!! Judge result {i} failed -> debate {i} marked INVALID")
+
         for judge_text, j_prompt_toks, j_comp_toks, j_lps, j_raw in judge_results:
             v = extract_verdict(judge_text)
             reason = extract_reasoning(judge_text)
@@ -543,6 +581,16 @@ async def run_debate_batch(
     for idx, (q, gt) in enumerate(questions):
         sol_a = extract_solution(r1_text_a[idx])
         sol_b = extract_solution(r1_text_b[idx])
+
+        # Override verdict if debate had any failed requests
+        final_verdict = verdicts[idx]
+        final_reasoning = reasons[idx]
+        if idx in failed_debate_indices:
+            final_verdict = "INVALID"
+            final_reasoning = "[DEBATE FAILED: One or more API requests failed]"
+            print(f"\n{'!'*60}")
+            print(f"!!! DEBATE {idx} MARKED INVALID DUE TO FAILED REQUESTS")
+            print(f"{'!'*60}\n")
 
         traj_a = DebateTrajectory(
             agent="A",
@@ -571,11 +619,12 @@ async def run_debate_batch(
                 ground_truth=gt,
                 trajectory_a=traj_a,
                 trajectory_b=traj_b,
-                verdict=verdicts[idx],
-                judge_reasoning=reasons[idx],
+                verdict=final_verdict,
+                judge_reasoning=final_reasoning,
                 metrics={
                     "judge_meta": judge_metas[idx],
                     "solution_agreement": sol_a == sol_b if sol_a and sol_b else None,
+                    "request_failed": idx in failed_debate_indices,
                 },
                 judge_prompt_tokens=judge_prompt_tokens_list[idx],
                 judge_completion_tokens=judge_completion_tokens_list[idx],

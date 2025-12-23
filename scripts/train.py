@@ -7,15 +7,25 @@ Usage:
     python train.py                  # Run 2 debates, 1 train step
     python train.py -n 4 -s 2        # 4 debates, 2 train steps
     python train.py --dry-run        # Run debates but don't train
+
+HTTP Inspection (live):
+    Run `mitmweb --listen-port 8080` in another terminal, then open
+    http://127.0.0.1:8081 to inspect all API traffic.
+
+HTTP Recording:
+    All API calls are recorded to logs/<run>/http_traffic.yaml via VCR.py
+    These cassettes are human-readable and can be replayed for testing.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
 import os
 import random
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,11 +38,50 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 load_dotenv()
 
+# Proxy configuration - auto-launch mitmweb (disabled by default due to SSL issues)
+PROXY_PORT = 8080
+WEB_PORT = 8081
+USE_PROXY = "--proxy" in sys.argv  # Enable with --proxy flag
+
+if USE_PROXY:
+    sys.argv.remove("--proxy")
+    PROXY_URL = f"http://127.0.0.1:{PROXY_PORT}"
+
+    print(f"\n[mitmproxy] Starting mitmweb on port {PROXY_PORT}...")
+    mitm_proc = subprocess.Popen(
+        ["mitmweb", "--listen-port", str(PROXY_PORT), "--web-port", str(WEB_PORT), "--set", "ssl_insecure=true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    atexit.register(mitm_proc.terminate)
+    time.sleep(1)
+
+    os.environ["HTTP_PROXY"] = PROXY_URL
+    os.environ["HTTPS_PROXY"] = PROXY_URL
+
+    # Use mitmproxy's CA certificate
+    mitmproxy_ca = Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.pem"
+    if mitmproxy_ca.exists():
+        os.environ["SSL_CERT_FILE"] = str(mitmproxy_ca)
+        os.environ["REQUESTS_CA_BUNDLE"] = str(mitmproxy_ca)
+
+    print(f"[mitmproxy] Web UI: http://127.0.0.1:{WEB_PORT}\n")
+else:
+    print("\n[mitmproxy] Disabled. Use --proxy flag to enable live HTTP inspection.\n")
+
 from rich import box  # noqa: E402
 from rich.console import Console  # noqa: E402
 from rich.table import Table  # noqa: E402
+import vcr  # noqa: E402
 
 console = Console()
+
+# VCR configuration for recording HTTP traffic
+vcr_config = vcr.VCR(
+    record_mode="new_episodes",  # Record new requests, replay existing
+    match_on=["method", "scheme", "host", "port", "path"],
+    serializer="yaml",
+)
 
 
 def parse_args():
@@ -203,6 +252,11 @@ async def main():
         random.seed(args.seed)
 
     log_dir = get_log_dir(args.experiment, args.dataset)
+    os.makedirs(log_dir, exist_ok=True)
+
+    # VCR cassette for recording all HTTP traffic
+    cassette_path = log_dir / "http_traffic.yaml"
+    console.print(f"[dim]Recording HTTP traffic to {cassette_path}[/dim]")
 
     # Load dataset if specified
     dataset = None
@@ -229,108 +283,110 @@ async def main():
     console.print(f"Run dir → {log_dir}")
     console.print()
 
-    console.print("[dim]Setting up Tinker client...[/dim]")
-    from tinker_debate.tinker_client import TinkerDebateClient
+    # Record all HTTP traffic with VCR
+    with vcr_config.use_cassette(str(cassette_path)):
+        console.print("[dim]Setting up Tinker client...[/dim]")
+        from tinker_debate.tinker_client import TinkerDebateClient
 
-    client = await TinkerDebateClient.create()
+        client = await TinkerDebateClient.create()
 
-    from tinker_debate.debate_env import DebateRolloutClient, mock_judge_random, run_debate_batch
-    from tinker_debate.debate_types import DebateConfig, assemble_training_data, compute_training_stats
+        from tinker_debate.debate_env import DebateRolloutClient, mock_judge_random, run_debate_batch
+        from tinker_debate.debate_types import DebateConfig, assemble_training_data, compute_training_stats
 
-    async def generate_fn(prompts, max_tokens, temp):
-        return await client.generate(prompts, max_tokens=max_tokens, temperature=temp)
+        async def generate_fn(prompts, max_tokens, temp):
+            return await client.generate(prompts, max_tokens=max_tokens, temperature=temp)
 
-    rollout_client = DebateRolloutClient(generate_fn=generate_fn)
+        rollout_client = DebateRolloutClient(generate_fn=generate_fn)
 
-    config = DebateConfig.cheap()
-    judge_fn = mock_judge_random if args.mock_judge else None
+        config = DebateConfig.cheap()
+        judge_fn = mock_judge_random if args.mock_judge else None
 
-    all_losses: list[float] = []
+        all_losses: list[float] = []
 
-    for step in range(1, args.steps + 1):
-        console.rule(f"[bold]Step {step}/{args.steps}[/bold]")
+        for step in range(1, args.steps + 1):
+            console.rule(f"[bold]Step {step}/{args.steps}[/bold]")
 
-        console.print(f"[dim]Running {args.num_debates} debates (batched per-round)...[/dim]")
-        t0 = time.time()
+            console.print(f"[dim]Running {args.num_debates} debates (batched per-round)...[/dim]")
+            t0 = time.time()
 
-        if dataset:
-            from tinker_debate.datasets import sample_questions
-            step_seed = args.seed + step if args.seed is not None else None
-            batch = sample_questions(dataset, args.num_debates, seed=step_seed)
+            if dataset:
+                from tinker_debate.datasets import sample_questions
+                step_seed = args.seed + step if args.seed is not None else None
+                batch = sample_questions(dataset, args.num_debates, seed=step_seed)
+            else:
+                batch = [(args.question, args.ground_truth) for _ in range(args.num_debates)]
+            debates = await run_debate_batch(batch, rollout_client, config, judge_fn=judge_fn)
+
+            for r in debates:
+                save_debate_log(r, log_dir, config=config, model_name=client.model_name)
+
+            rollout_time = time.time() - t0
+
+            stats = compute_training_stats(debates)
+            console.print(
+                f"[dim]Rollout time: {rollout_time:.1f}s | A:{stats['a_wins']} B:{stats['b_wins']} Invalid:{stats['invalid']}[/dim]"
+            )
+
+            training_data = assemble_training_data(debates)
+            console.print(f"Training data: {len(training_data)} datums from {len(debates)} debates")
+
+            if args.dry_run:
+                console.print("[yellow]DRY RUN - skipping training[/yellow]")
+                continue
+
+            console.print("[dim]Running train step (overlapped fwd_bwd + optim_step)...[/dim]")
+            t0 = time.time()
+
+            train_result = await client.train_step(
+                prompt_tokens_batch=[d.prompt_tokens for d in training_data],
+                completion_tokens_batch=[d.completion_tokens for d in training_data],
+                completion_logprobs_batch=[d.completion_logprobs for d in training_data],
+                completion_advantages_batch=[d.completion_advantages for d in training_data],
+                learning_rate=args.lr,
+            )
+
+            train_time = time.time() - t0
+            loss = float(train_result.get("loss", 0.0))
+            num_tokens = int(train_result.get("num_tokens", 0))
+
+            step_log_path = save_training_step_log(
+                step=step,
+                training_data=training_data,
+                fwd_bwd_result=train_result,
+                learning_rate=args.lr,
+                log_dir=log_dir,
+            )
+            console.print(f"[dim]Logged: {step_log_path.name}[/dim]")
+
+            console.print("[dim]Syncing weights...[/dim]")
+            await client.sync_weights(f"step_{step}")
+
+            all_losses.append(loss)
+
+            console.print(f"\n[bold green]Step {step} complete:[/bold green]")
+            console.print(f"  Loss: {loss:.4f}")
+            console.print(f"  Tokens: {num_tokens}")
+            console.print(
+                f"  Time: rollout={rollout_time:.1f}s train={train_time:.1f}s"
+            )
+
+        console.rule("[bold]Training Summary[/bold]")
+
+        if all_losses:
+            table = Table(box=box.ROUNDED)
+            table.add_column("Step", style="cyan")
+            table.add_column("Loss", justify="right")
+
+            for i, loss in enumerate(all_losses, 1):
+                table.add_row(str(i), f"{loss:.4f}")
+
+            console.print(table)
+            console.print(f"\n[bold]Average loss:[/bold] {sum(all_losses)/len(all_losses):.4f}")
         else:
-            batch = [(args.question, args.ground_truth) for _ in range(args.num_debates)]
-        debates = await run_debate_batch(batch, rollout_client, config, judge_fn=judge_fn)
+            console.print("[yellow]No training occurred (dry run)[/yellow]")
 
-        for r in debates:
-            save_debate_log(r, log_dir, config=config, model_name=client.model_name)
-
-        rollout_time = time.time() - t0
-
-        stats = compute_training_stats(debates)
-        console.print(
-            f"[dim]Rollout time: {rollout_time:.1f}s | A:{stats['a_wins']} B:{stats['b_wins']} Invalid:{stats['invalid']}[/dim]"
-        )
-
-        training_data = assemble_training_data(debates)
-        console.print(f"Training data: {len(training_data)} datums from {len(debates)} debates")
-
-        if args.dry_run:
-            console.print("[yellow]DRY RUN - skipping training[/yellow]")
-            continue
-
-        console.print("[dim]Running train step (overlapped fwd_bwd + optim_step)...[/dim]")
-        t0 = time.time()
-
-        train_result = await client.train_step(
-            prompt_tokens_batch=[d.prompt_tokens for d in training_data],
-            completion_tokens_batch=[d.completion_tokens for d in training_data],
-            completion_logprobs_batch=[d.completion_logprobs for d in training_data],
-            completion_advantages_batch=[d.completion_advantages for d in training_data],
-            learning_rate=args.lr,
-        )
-
-        train_time = time.time() - t0
-        loss = float(train_result.get("loss", 0.0))
-        num_tokens = int(train_result.get("num_tokens", 0))
-
-        step_log_path = save_training_step_log(
-            step=step,
-            training_data=training_data,
-            fwd_bwd_result=train_result,
-            learning_rate=args.lr,
-            log_dir=log_dir,
-        )
-        console.print(f"[dim]Logged: {step_log_path.name}[/dim]")
-
-        console.print("[dim]Syncing weights...[/dim]")
-        await client.sync_weights(f"step_{step}")
-
-        all_losses.append(loss)
-
-        console.print(f"\n[bold green]Step {step} complete:[/bold green]")
-        console.print(f"  Loss: {loss:.4f}")
-        console.print(f"  Tokens: {num_tokens}")
-        console.print(
-            f"  Time: rollout={rollout_time:.1f}s train={train_time:.1f}s"
-        )
-
-    console.rule("[bold]Training Summary[/bold]")
-
-    if all_losses:
-        table = Table(box=box.ROUNDED)
-        table.add_column("Step", style="cyan")
-        table.add_column("Loss", justify="right")
-
-        for i, loss in enumerate(all_losses, 1):
-            table.add_row(str(i), f"{loss:.4f}")
-
-        console.print(table)
-        console.print(f"\n[bold]Average loss:[/bold] {sum(all_losses)/len(all_losses):.4f}")
-    else:
-        console.print("[yellow]No training occurred (dry run)[/yellow]")
-
-    console.print(f"\n[dim]View debates: python view_logs.py --log-dir {log_dir} --list[/dim]")
-    console.print(f"[dim]Watch live: python view_logs.py --log-dir {log_dir} --watch[/dim]")
+        console.print(f"\n[dim]View debates: python view_logs.py --log-dir {log_dir} --list[/dim]")
+        console.print(f"[dim]Watch live: python view_logs.py --log-dir {log_dir} --watch[/dim]")
 
 
 if __name__ == "__main__":

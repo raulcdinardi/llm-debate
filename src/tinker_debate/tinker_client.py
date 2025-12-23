@@ -118,7 +118,7 @@ class TinkerDebateClient:
         prompts: list[str],
         max_tokens: int | None = None,
         temperature: float = 0.8,
-    ) -> list[tuple[str, list[int], list[int], list[float], dict]]:
+    ) -> list[tuple[str, list[int], list[int], list[float], dict] | None]:
         """Generate completions (async, parallel).
 
         Returns list of:
@@ -159,12 +159,28 @@ class TinkerDebateClient:
                 )
             )
 
-        # Run all requests in parallel - sample_async returns results directly
-        responses = await asyncio.gather(*sample_coros)
+        # Run requests sequentially with delay to avoid rate limiting (429)
+        responses = []
+        for i, coro in enumerate(sample_coros):
+            try:
+                resp = await coro
+                responses.append(resp)
+            except Exception as e:
+                print(f"\n{'!'*60}")
+                print(f"!!! SAMPLING REQUEST FAILED: {type(e).__name__}: {e}")
+                print(f"!!! Prompt {i+1}/{len(sample_coros)} will be skipped")
+                print(f"{'!'*60}\n")
+                responses.append(None)
+            if i < len(sample_coros) - 1:
+                await asyncio.sleep(1.0)
 
-        results: list[tuple[str, list[int], list[int], list[float], dict]] = []
+        results: list[tuple[str, list[int], list[int], list[float], dict] | None] = []
 
         for prompt_tokens, resp in zip(prompt_tokens_list, responses):
+            if resp is None:
+                results.append(None)
+                continue
+
             seq = resp.sequences[0]
 
             completion_tokens = list(seq.tokens)
