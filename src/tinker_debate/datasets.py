@@ -37,16 +37,20 @@ def format_gpqa_question(row: dict) -> dict:
     """Format a single GPQA row into question + ground_truth."""
     question_text = row["Question"]
 
-    # GPQA has randomized answer order; correct answer indicated by "Correct Answer" field
-    choices = [
-        ("A", row["Correct Answer"]),
-        ("B", row["Incorrect Answer 1"]),
-        ("C", row["Incorrect Answer 2"]),
-        ("D", row["Incorrect Answer 3"]),
+    # Collect answer texts
+    answers = [
+        row["Correct Answer"],
+        row["Incorrect Answer 1"],
+        row["Incorrect Answer 2"],
+        row["Incorrect Answer 3"],
     ]
 
-    # Shuffle choices so correct answer isn't always A
-    random.shuffle(choices)
+    # Shuffle answer texts so correct answer isn't always A
+    random.shuffle(answers)
+
+    # Assign letters by position after shuffling
+    letters = ["A", "B", "C", "D"]
+    choices = list(zip(letters, answers))
 
     # Find which letter the correct answer ended up at
     correct_letter = None
