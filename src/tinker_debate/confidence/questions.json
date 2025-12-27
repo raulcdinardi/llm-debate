@@ -1,0 +1,502 @@
+[
+  {
+    "question": "A coin with 18% chance of heads was flipped 8 times. Were there exactly 6 heads?",
+    "answer": "no",
+    "probability": 0.9994
+  },
+  {
+    "question": "A coin with 43% chance of heads was flipped 12 times. Were there at least 3 heads?",
+    "answer": "yes",
+    "probability": 0.944
+  },
+  {
+    "question": "A coin with 69% chance of heads was flipped 7 times. Were there at least 1 heads?",
+    "answer": "yes",
+    "probability": 0.9997
+  },
+  {
+    "question": "A coin with 42% chance of heads was flipped 7 times. Were there fewer than 2 heads?",
+    "answer": "no",
+    "probability": 0.866
+  },
+  {
+    "question": "A coin with 40% chance of heads was flipped 5 times. Were there at most 4 heads?",
+    "answer": "yes",
+    "probability": 0.9898
+  },
+  {
+    "question": "A coin with 50% chance of heads was flipped 19 times. Were there at most 1 heads?",
+    "answer": "no",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 57% chance of heads was flipped 18 times. Were there at most 9 heads?",
+    "answer": "no",
+    "probability": 0.6764
+  },
+  {
+    "question": "A coin with 57% chance of heads was flipped 11 times. Were there at least 2 heads?",
+    "answer": "yes",
+    "probability": 0.9988
+  },
+  {
+    "question": "A coin with 27% chance of heads was flipped 17 times. Were there exactly 12 heads?",
+    "answer": "no",
+    "probability": 0.9998
+  },
+  {
+    "question": "A coin with 20% chance of heads was flipped 13 times. Were there more than 12 heads?",
+    "answer": "no",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 63% chance of heads was flipped 8 times. Were there fewer than 1 heads?",
+    "answer": "no",
+    "probability": 0.9996
+  },
+  {
+    "question": "A coin with 61% chance of heads was flipped 14 times. Were there at most 10 heads?",
+    "answer": "yes",
+    "probability": 0.8595
+  },
+  {
+    "question": "A coin with 20% chance of heads was flipped 7 times. Were there at most 6 heads?",
+    "answer": "yes",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 25% chance of heads was flipped 14 times. Were there at least 4 heads?",
+    "answer": "no",
+    "probability": 0.5213
+  },
+  {
+    "question": "A coin with 50% chance of heads was flipped 17 times. Were there exactly 15 heads?",
+    "answer": "no",
+    "probability": 0.999
+  },
+  {
+    "question": "A coin with 62% chance of heads was flipped 10 times. Were there at most 6 heads?",
+    "answer": "yes",
+    "probability": 0.5664
+  },
+  {
+    "question": "A coin with 24% chance of heads was flipped 13 times. Were there at most 10 heads?",
+    "answer": "yes",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 35% chance of heads was flipped 12 times. Were there more than 8 heads?",
+    "answer": "no",
+    "probability": 0.9944
+  },
+  {
+    "question": "A coin with 43% chance of heads was flipped 13 times. Were there exactly 11 heads?",
+    "answer": "no",
+    "probability": 0.9976
+  },
+  {
+    "question": "A coin with 44% chance of heads was flipped 6 times. Were there exactly 1 heads?",
+    "answer": "no",
+    "probability": 0.8546
+  },
+  {
+    "question": "A coin with 49% chance of heads was flipped 17 times. Were there at most 3 heads?",
+    "answer": "no",
+    "probability": 0.992
+  },
+  {
+    "question": "A coin with 42% chance of heads was flipped 15 times. Were there more than 11 heads?",
+    "answer": "no",
+    "probability": 0.9968
+  },
+  {
+    "question": "A coin with 73% chance of heads was flipped 17 times. Were there exactly 5 heads?",
+    "answer": "no",
+    "probability": 0.9998
+  },
+  {
+    "question": "A coin with 46% chance of heads was flipped 9 times. Were there fewer than 5 heads?",
+    "answer": "yes",
+    "probability": 0.5976
+  },
+  {
+    "question": "A coin with 66% chance of heads was flipped 18 times. Were there at most 12 heads?",
+    "answer": "yes",
+    "probability": 0.6111
+  },
+  {
+    "question": "A coin with 80% chance of heads was flipped 9 times. Were there at least 8 heads?",
+    "answer": "no",
+    "probability": 0.5638
+  },
+  {
+    "question": "A coin with 28% chance of heads was flipped 6 times. Were there at most 2 heads?",
+    "answer": "yes",
+    "probability": 0.7626
+  },
+  {
+    "question": "A coin with 23% chance of heads was flipped 18 times. Were there more than 13 heads?",
+    "answer": "no",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 82% chance of heads was flipped 19 times. Were there fewer than 9 heads?",
+    "answer": "no",
+    "probability": 0.9999
+  },
+  {
+    "question": "A coin with 28% chance of heads was flipped 5 times. Were there exactly 3 heads?",
+    "answer": "no",
+    "probability": 0.8771
+  },
+  {
+    "question": "A coin with 52% chance of heads was flipped 8 times. Were there at most 4 heads?",
+    "answer": "yes",
+    "probability": 0.5922
+  },
+  {
+    "question": "A coin with 15% chance of heads was flipped 19 times. Were there fewer than 9 heads?",
+    "answer": "yes",
+    "probability": 0.9992
+  },
+  {
+    "question": "A coin with 79% chance of heads was flipped 10 times. Were there exactly 2 heads?",
+    "answer": "no",
+    "probability": 0.9999
+  },
+  {
+    "question": "A coin with 34% chance of heads was flipped 11 times. Were there at most 6 heads?",
+    "answer": "yes",
+    "probability": 0.957
+  },
+  {
+    "question": "A coin with 56% chance of heads was flipped 5 times. Were there at least 4 heads?",
+    "answer": "no",
+    "probability": 0.7286
+  },
+  {
+    "question": "A coin with 61% chance of heads was flipped 8 times. Were there exactly 7 heads?",
+    "answer": "no",
+    "probability": 0.9019
+  },
+  {
+    "question": "A coin with 22% chance of heads was flipped 12 times. Were there fewer than 4 heads?",
+    "answer": "yes",
+    "probability": 0.739
+  },
+  {
+    "question": "A coin with 25% chance of heads was flipped 7 times. Were there more than 6 heads?",
+    "answer": "no",
+    "probability": 0.9999
+  },
+  {
+    "question": "A coin with 83% chance of heads was flipped 7 times. Were there at most 2 heads?",
+    "answer": "no",
+    "probability": 0.9978
+  },
+  {
+    "question": "A coin with 85% chance of heads was flipped 20 times. Were there exactly 6 heads?",
+    "answer": "no",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 42% chance of heads was flipped 18 times. Were there exactly 7 heads?",
+    "answer": "no",
+    "probability": 0.8167
+  },
+  {
+    "question": "A coin with 62% chance of heads was flipped 17 times. Were there fewer than 15 heads?",
+    "answer": "yes",
+    "probability": 0.9815
+  },
+  {
+    "question": "A coin with 30% chance of heads was flipped 19 times. Were there at most 8 heads?",
+    "answer": "yes",
+    "probability": 0.9161
+  },
+  {
+    "question": "A coin with 57% chance of heads was flipped 7 times. Were there fewer than 1 heads?",
+    "answer": "no",
+    "probability": 0.9977
+  },
+  {
+    "question": "A coin with 43% chance of heads was flipped 12 times. Were there at least 1 heads?",
+    "answer": "yes",
+    "probability": 0.9988
+  },
+  {
+    "question": "A coin with 44% chance of heads was flipped 6 times. Were there at least 1 heads?",
+    "answer": "yes",
+    "probability": 0.9692
+  },
+  {
+    "question": "A coin with 24% chance of heads was flipped 15 times. Were there at most 9 heads?",
+    "answer": "yes",
+    "probability": 0.9994
+  },
+  {
+    "question": "A coin with 77% chance of heads was flipped 13 times. Were there fewer than 4 heads?",
+    "answer": "no",
+    "probability": 0.9999
+  },
+  {
+    "question": "A coin with 75% chance of heads was flipped 9 times. Were there more than 4 heads?",
+    "answer": "yes",
+    "probability": 0.9511
+  },
+  {
+    "question": "A coin with 39% chance of heads was flipped 18 times. Were there at least 4 heads?",
+    "answer": "yes",
+    "probability": 0.9606
+  },
+  {
+    "question": "A coin with 60% chance of heads was flipped 18 times. Were there more than 14 heads?",
+    "answer": "no",
+    "probability": 0.9672
+  },
+  {
+    "question": "A coin with 21% chance of heads was flipped 19 times. Were there at least 4 heads?",
+    "answer": "yes",
+    "probability": 0.5877
+  },
+  {
+    "question": "A coin with 57% chance of heads was flipped 17 times. Were there at most 4 heads?",
+    "answer": "no",
+    "probability": 0.9958
+  },
+  {
+    "question": "A coin with 39% chance of heads was flipped 11 times. Were there more than 9 heads?",
+    "answer": "no",
+    "probability": 0.9994
+  },
+  {
+    "question": "A coin with 69% chance of heads was flipped 9 times. Were there exactly 3 heads?",
+    "answer": "no",
+    "probability": 0.9755
+  },
+  {
+    "question": "A coin with 46% chance of heads was flipped 19 times. Were there more than 3 heads?",
+    "answer": "yes",
+    "probability": 0.9939
+  },
+  {
+    "question": "A coin with 21% chance of heads was flipped 8 times. Were there fewer than 6 heads?",
+    "answer": "yes",
+    "probability": 0.9984
+  },
+  {
+    "question": "A coin with 26% chance of heads was flipped 5 times. Were there at most 2 heads?",
+    "answer": "yes",
+    "probability": 0.8857
+  },
+  {
+    "question": "A coin with 77% chance of heads was flipped 18 times. Were there at most 16 heads?",
+    "answer": "yes",
+    "probability": 0.9423
+  },
+  {
+    "question": "A coin with 22% chance of heads was flipped 17 times. Were there more than 6 heads?",
+    "answer": "no",
+    "probability": 0.9402
+  },
+  {
+    "question": "A coin with 64% chance of heads was flipped 5 times. Were there more than 3 heads?",
+    "answer": "no",
+    "probability": 0.5906
+  },
+  {
+    "question": "A coin with 69% chance of heads was flipped 14 times. Were there fewer than 12 heads?",
+    "answer": "yes",
+    "probability": 0.8577
+  },
+  {
+    "question": "A coin with 34% chance of heads was flipped 20 times. Were there exactly 7 heads?",
+    "answer": "no",
+    "probability": 0.8164
+  },
+  {
+    "question": "A coin with 22% chance of heads was flipped 11 times. Were there fewer than 10 heads?",
+    "answer": "yes",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 55% chance of heads was flipped 6 times. Were there at least 1 heads?",
+    "answer": "yes",
+    "probability": 0.9917
+  },
+  {
+    "question": "A coin with 79% chance of heads was flipped 20 times. Were there at most 17 heads?",
+    "answer": "yes",
+    "probability": 0.823
+  },
+  {
+    "question": "A coin with 80% chance of heads was flipped 6 times. Were there at most 1 heads?",
+    "answer": "no",
+    "probability": 0.9984
+  },
+  {
+    "question": "A coin with 23% chance of heads was flipped 7 times. Were there at most 6 heads?",
+    "answer": "yes",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 30% chance of heads was flipped 17 times. Were there fewer than 8 heads?",
+    "answer": "yes",
+    "probability": 0.8954
+  },
+  {
+    "question": "A coin with 25% chance of heads was flipped 6 times. Were there fewer than 4 heads?",
+    "answer": "yes",
+    "probability": 0.9624
+  },
+  {
+    "question": "A coin with 48% chance of heads was flipped 15 times. Were there exactly 4 heads?",
+    "answer": "no",
+    "probability": 0.9455
+  },
+  {
+    "question": "A coin with 48% chance of heads was flipped 12 times. Were there at most 7 heads?",
+    "answer": "yes",
+    "probability": 0.8425
+  },
+  {
+    "question": "A coin with 73% chance of heads was flipped 14 times. Were there at least 6 heads?",
+    "answer": "yes",
+    "probability": 0.9962
+  },
+  {
+    "question": "A coin with 73% chance of heads was flipped 5 times. Were there at least 1 heads?",
+    "answer": "yes",
+    "probability": 0.9986
+  },
+  {
+    "question": "A coin with 79% chance of heads was flipped 11 times. Were there at most 5 heads?",
+    "answer": "no",
+    "probability": 0.9852
+  },
+  {
+    "question": "A coin with 23% chance of heads was flipped 16 times. Were there at most 15 heads?",
+    "answer": "yes",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 51% chance of heads was flipped 16 times. Were there more than 3 heads?",
+    "answer": "yes",
+    "probability": 0.9914
+  },
+  {
+    "question": "A coin with 82% chance of heads was flipped 14 times. Were there fewer than 1 heads?",
+    "answer": "no",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 28% chance of heads was flipped 14 times. Were there exactly 3 heads?",
+    "answer": "no",
+    "probability": 0.7846
+  },
+  {
+    "question": "A coin with 28% chance of heads was flipped 8 times. Were there fewer than 6 heads?",
+    "answer": "yes",
+    "probability": 0.9922
+  },
+  {
+    "question": "A coin with 49% chance of heads was flipped 9 times. Were there fewer than 5 heads?",
+    "answer": "yes",
+    "probability": 0.5246
+  },
+  {
+    "question": "A coin with 57% chance of heads was flipped 11 times. Were there exactly 4 heads?",
+    "answer": "no",
+    "probability": 0.9139
+  },
+  {
+    "question": "A coin with 47% chance of heads was flipped 20 times. Were there at least 2 heads?",
+    "answer": "yes",
+    "probability": 0.9999
+  },
+  {
+    "question": "A coin with 50% chance of heads was flipped 18 times. Were there at least 2 heads?",
+    "answer": "yes",
+    "probability": 0.9999
+  },
+  {
+    "question": "A coin with 31% chance of heads was flipped 15 times. Were there exactly 11 heads?",
+    "answer": "no",
+    "probability": 0.9992
+  },
+  {
+    "question": "A coin with 71% chance of heads was flipped 10 times. Were there more than 9 heads?",
+    "answer": "no",
+    "probability": 0.9674
+  },
+  {
+    "question": "A coin with 28% chance of heads was flipped 5 times. Were there at most 1 heads?",
+    "answer": "yes",
+    "probability": 0.5489
+  },
+  {
+    "question": "A coin with 62% chance of heads was flipped 6 times. Were there fewer than 5 heads?",
+    "answer": "yes",
+    "probability": 0.7343
+  },
+  {
+    "question": "A coin with 70% chance of heads was flipped 9 times. Were there at least 3 heads?",
+    "answer": "yes",
+    "probability": 0.9957
+  },
+  {
+    "question": "A coin with 61% chance of heads was flipped 14 times. Were there at least 13 heads?",
+    "answer": "no",
+    "probability": 0.9902
+  },
+  {
+    "question": "A coin with 41% chance of heads was flipped 16 times. Were there at most 11 heads?",
+    "answer": "yes",
+    "probability": 0.9938
+  },
+  {
+    "question": "A coin with 60% chance of heads was flipped 8 times. Were there fewer than 7 heads?",
+    "answer": "yes",
+    "probability": 0.8936
+  },
+  {
+    "question": "A coin with 34% chance of heads was flipped 18 times. Were there at most 8 heads?",
+    "answer": "yes",
+    "probability": 0.8804
+  },
+  {
+    "question": "A coin with 67% chance of heads was flipped 10 times. Were there at most 1 heads?",
+    "answer": "no",
+    "probability": 0.9997
+  },
+  {
+    "question": "A coin with 67% chance of heads was flipped 15 times. Were there at most 13 heads?",
+    "answer": "yes",
+    "probability": 0.9794
+  },
+  {
+    "question": "A coin with 35% chance of heads was flipped 13 times. Were there at least 12 heads?",
+    "answer": "no",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 19% chance of heads was flipped 17 times. Were there at most 16 heads?",
+    "answer": "yes",
+    "probability": 1.0
+  },
+  {
+    "question": "A coin with 73% chance of heads was flipped 11 times. Were there exactly 6 heads?",
+    "answer": "no",
+    "probability": 0.8997
+  },
+  {
+    "question": "A coin with 43% chance of heads was flipped 12 times. Were there at most 1 heads?",
+    "answer": "no",
+    "probability": 0.9882
+  },
+  {
+    "question": "A coin with 56% chance of heads was flipped 17 times. Were there at least 9 heads?",
+    "answer": "yes",
+    "probability": 0.722
+  }
+]

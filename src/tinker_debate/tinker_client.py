@@ -204,6 +204,74 @@ class TinkerDebateClient:
 
         return results
 
+    async def sample_token_prompts(
+        self,
+        *,
+        prompt_tokens_list: list[list[int]],
+        max_tokens: int | None = None,
+        temperature: float = 0.8,
+    ) -> list[tuple[list[int], list[int], list[float], dict] | None]:
+        """Sample completions from tokenized prompts (async).
+
+        Returns list of:
+          (prompt_tokens, completion_tokens, completion_logprobs, raw_response)
+        """
+        import asyncio
+
+        stop_strings = self.renderer.get_stop_sequences()
+        stop = stop_strings if (stop_strings and isinstance(stop_strings[0], str)) else None
+
+        sample_coros = []
+        for prompt_tokens in prompt_tokens_list:
+            model_input = tinker.ModelInput.from_ints(prompt_tokens)
+            sampling_params = tinker.SamplingParams(
+                temperature=temperature,
+                stop=stop,
+            )
+            if max_tokens is not None:
+                sampling_params.max_tokens = max_tokens
+
+            sample_coros.append(
+                self.sampling_client.sample_async(
+                    prompt=model_input,
+                    num_samples=1,
+                    sampling_params=sampling_params,
+                )
+            )
+
+        responses = []
+        for i, coro in enumerate(sample_coros):
+            try:
+                resp = await coro
+                responses.append(resp)
+            except Exception as e:
+                print(f"\n{'!'*60}")
+                print(f"!!! SAMPLING REQUEST FAILED: {type(e).__name__}: {e}")
+                print(f"!!! Prompt {i+1}/{len(sample_coros)} will be skipped")
+                print(f"{'!'*60}\n")
+                responses.append(None)
+            if i < len(sample_coros) - 1:
+                await asyncio.sleep(1.0)
+
+        results: list[tuple[list[int], list[int], list[float], dict] | None] = []
+        for prompt_tokens, resp in zip(prompt_tokens_list, responses):
+            if resp is None:
+                results.append(None)
+                continue
+
+            seq = resp.sequences[0]
+            completion_tokens = list(seq.tokens)
+            if seq.logprobs is None:
+                raise RuntimeError(
+                    "Tinker sampling did not return completion logprobs (seq.logprobs is None). "
+                    "This codebase requires completion logprobs for importance-sampling / PPO-style training."
+                )
+            completion_logprobs = list(seq.logprobs)
+            raw_response = serialize_response(resp, sequence_idx=0)
+            results.append((prompt_tokens, completion_tokens, completion_logprobs, raw_response))
+
+        return results
+
     # Back-compat alias
     async def generate_with_logprobs(
         self,

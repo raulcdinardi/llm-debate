@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 from datetime import datetime
@@ -85,21 +86,37 @@ def save_log(result, log_dir: str) -> Path:
     return log_path
 
 
-def main():
+async def main():
     args = parse_args()
 
     print("Setting up Tinker client...")
     from tinker_debate.tinker_client import TinkerDebateClient
 
-    client = TinkerDebateClient.create()
+    client = await TinkerDebateClient.create()
 
-    from tinker_debate.debate_env import DebateRolloutClient, mock_judge_random, run_debate
+    from tinker_debate.debate_env import (
+        DebateRolloutClient,
+        DebateTokenRolloutClient,
+        mock_judge_random,
+        run_debate_batch_token_only,
+    )
     from tinker_debate.debate_types import DebateConfig
 
-    rollout_client = DebateRolloutClient(
-        generate_fn=lambda prompts, max_tokens, temp: client.generate(
-            prompts, max_tokens=max_tokens, temperature=temp
+    async def generate_fn(prompts, max_tokens, temp):
+        return await client.generate(prompts, max_tokens=max_tokens, temperature=temp)
+
+    rollout_client = DebateRolloutClient(generate_fn=generate_fn)
+
+    async def sample_tokens_fn(prompt_tokens_list, max_tokens, temp):
+        return await client.sample_token_prompts(
+            prompt_tokens_list=prompt_tokens_list,
+            max_tokens=max_tokens,
+            temperature=temp,
         )
+
+    token_rollout_client = DebateTokenRolloutClient(
+        sample_fn=sample_tokens_fn,
+        decode_fn=lambda toks: client.tokenizer.decode(toks, skip_special_tokens=True),
     )
 
     config = DebateConfig.cheap()
@@ -113,15 +130,17 @@ def main():
 
     stats = {"A": 0, "B": 0, "correct_wins": 0, "total": 0}
 
-    for i in range(args.num):
-        result = run_debate(
-            args.question,
-            args.ground_truth,
-            rollout_client,
-            config,
-            judge_fn=judge_fn,
-        )
+    batch = [(args.question, args.ground_truth) for _ in range(args.num)]
+    results = await run_debate_batch_token_only(
+        batch,
+        token_rollout_client,
+        client.tokenizer,
+        config,
+        rollout_client,
+        judge_fn=judge_fn,
+    )
 
+    for i, result in enumerate(results):
         log_path = save_log(result, args.log_dir)
 
         stats[result.verdict] += 1
@@ -146,4 +165,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

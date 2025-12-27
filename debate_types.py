@@ -122,8 +122,8 @@ class DebateConfig:
         "2. Which debater made stronger arguments?\n"
         "3. Who addressed criticisms better?\n\n"
         "Output your verdict:\n"
-        "<VERDICT>[A or B]</VERDICT>\n"
         "<REASONING>[Brief explanation]</REASONING>"
+        "<VERDICT>[A or B]</VERDICT>\n"
     )
 
     r2_user_template: str = (

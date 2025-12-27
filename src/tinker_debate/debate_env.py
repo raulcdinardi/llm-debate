@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from .debate_types import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
+from .confidence.confidence_env import parse_confidence
 
 
 # === Extraction ===
@@ -129,6 +130,13 @@ FAILED_RESULT: tuple[str, list[int], list[int], list[float], dict] = (
     "[REQUEST FAILED]", [], [], [], {"error": "request_failed"}
 )
 
+FAILED_TOKEN_RESULT: tuple[list[int], list[int], list[float], dict] = (
+    [],
+    [],
+    [],
+    {"error": "request_failed"},
+)
+
 
 @dataclass
 class DebateRolloutClient:
@@ -159,6 +167,356 @@ class DebateRolloutClient:
         return results
 
 
+# === Token-only Rollout Client ===
+
+@dataclass
+class DebateTokenRolloutClient:
+    """Adapter: async token-level sampling interface.
+
+    sample_fn(prompt_tokens_list, max_tokens, temperature)
+      -> awaitable[list[(prompt_tokens, completion_tokens, completion_logprobs, raw_response) | None]]
+    """
+
+    sample_fn: Callable[
+        [list[list[int]], int | None, float],
+        Awaitable[list[tuple[list[int], list[int], list[float], dict] | None]],
+    ]
+    decode_fn: Callable[[list[int]], str]
+
+    async def sample(
+        self, *, prompt_tokens_list: list[list[int]], max_tokens: int | None, temperature: float
+    ) -> list[tuple[list[int], list[int], list[float], dict]]:
+        raw_results = await self.sample_fn(prompt_tokens_list, max_tokens, temperature)
+        results: list[tuple[list[int], list[int], list[float], dict]] = []
+        for i, r in enumerate(raw_results):
+            if r is None:
+                print(f"\n{'!'*60}")
+                print(f"!!! TOKEN SAMPLING REQUEST {i+1}/{len(raw_results)} RETURNED NONE - DEBATE WILL BE INVALID")
+                print(f"{'!'*60}\n")
+                results.append(FAILED_TOKEN_RESULT)
+            else:
+                results.append(r)
+        return results
+
+
+def _split_template(template: str, placeholder: str) -> tuple[str, str]:
+    if template.count(placeholder) != 1:
+        raise ValueError(f"Expected exactly one {placeholder} in templrate, got {template.count(placeholder)}")
+    pre, post = template.split(placeholder)
+    return pre, post
+
+
+def _encode(tokenizer, s: str) -> list[int]:
+    return list(tokenizer.encode(s, add_special_tokens=False))
+
+
+async def run_debate_batch_token_only(
+    questions: list[tuple[str, str | None]],
+    token_client: DebateTokenRolloutClient,
+    tokenizer,
+    config: DebateConfig,
+    judge_client: DebateRolloutClient,
+    judge_fn: JudgeFn | None = None,
+) -> list[DebateResult]:
+    """Batched debate runner that preserves extension property by appending tokens.
+
+    Key guarantee: round-(k+1) prompt tokens are constructed as:
+      prompt_{k+1} = prompt_k + completion_k + continuation_tokens
+
+    so we never re-tokenize the whole history.
+    """
+    if config.num_rounds != 3:
+        raise NotImplementedError("Only num_rounds=3 is currently supported")
+
+    # Pre-split user templates so we can splice opponent tokens without formatting strings.
+    r2_pre, r2_post = _split_template(config.r2_user_template, "{opponent_r1}")
+    r3_pre, r3_post = _split_template(config.r3_user_template, "{opponent_r2}")
+
+    r2_prefix_tokens = _encode(tokenizer, _im_end() + _im_start("user") + r2_pre)
+    r2_suffix_tokens = _encode(tokenizer, r2_post + "\n" + _im_end() + _im_start("assistant"))
+    r3_prefix_tokens = _encode(tokenizer, _im_end() + _im_start("user") + r3_pre)
+    r3_suffix_tokens = _encode(tokenizer, r3_post + "\n" + _im_end() + _im_start("assistant"))
+
+    # Track debates with failed requests
+    failed_debate_indices: set[int] = set()
+
+    # === Round 1 ===
+    base_r1_prompt_tokens: list[list[int]] = [
+        _encode(tokenizer, build_r1_prompt(q, config)) for q, _gt in questions
+    ]
+    r1_prompt_tokens_list: list[list[int]] = []
+    for p in base_r1_prompt_tokens:
+        r1_prompt_tokens_list.extend([p, p])
+
+    r1_results = await token_client.sample(
+        prompt_tokens_list=r1_prompt_tokens_list,
+        max_tokens=config.max_tokens_per_turn,
+        temperature=config.temperature,
+    )
+
+    r1_tokens_a: list[list[int]] = []
+    r1_tokens_b: list[list[int]] = []
+    r1_lps_a: list[list[float]] = []
+    r1_lps_b: list[list[float]] = []
+    r1_raw_a: list[dict] = []
+    r1_raw_b: list[dict] = []
+    r1_text_a: list[str] = []
+    r1_text_b: list[str] = []
+
+    for i in range(0, len(r1_results), 2):
+        a_prompt, a_comp, a_lps, a_raw = r1_results[i]
+        b_prompt, b_comp, b_lps, b_raw = r1_results[i + 1]
+        debate_idx = i // 2
+        if a_raw.get("error") == "request_failed" or b_raw.get("error") == "request_failed":
+            failed_debate_indices.add(debate_idx)
+        r1_tokens_a.append(a_comp)
+        r1_tokens_b.append(b_comp)
+        r1_lps_a.append(a_lps)
+        r1_lps_b.append(b_lps)
+        r1_raw_a.append(a_raw)
+        r1_raw_b.append(b_raw)
+        r1_text_a.append(token_client.decode_fn(a_comp))
+        r1_text_b.append(token_client.decode_fn(b_comp))
+
+    # === Round 2 ===
+    r2_prompt_tokens_list: list[list[int]] = []
+    for idx in range(len(questions)):
+        r2_a_cont = r2_prefix_tokens + r1_tokens_b[idx] + r2_suffix_tokens
+        r2_b_cont = r2_prefix_tokens + r1_tokens_a[idx] + r2_suffix_tokens
+        r2_prompt_tokens_list.append(base_r1_prompt_tokens[idx] + r1_tokens_a[idx] + r2_a_cont)
+        r2_prompt_tokens_list.append(base_r1_prompt_tokens[idx] + r1_tokens_b[idx] + r2_b_cont)
+
+    r2_results = await token_client.sample(
+        prompt_tokens_list=r2_prompt_tokens_list,
+        max_tokens=config.max_tokens_per_turn,
+        temperature=config.temperature,
+    )
+
+    r2_prompt_tokens_a: list[list[int]] = []
+    r2_prompt_tokens_b: list[list[int]] = []
+    r2_tokens_a: list[list[int]] = []
+    r2_tokens_b: list[list[int]] = []
+    r2_lps_a: list[list[float]] = []
+    r2_lps_b: list[list[float]] = []
+    r2_raw_a: list[dict] = []
+    r2_raw_b: list[dict] = []
+    r2_text_a: list[str] = []
+    r2_text_b: list[str] = []
+
+    for i in range(0, len(r2_results), 2):
+        a_prompt, a_comp, a_lps, a_raw = r2_results[i]
+        b_prompt, b_comp, b_lps, b_raw = r2_results[i + 1]
+        debate_idx = i // 2
+        if a_raw.get("error") == "request_failed" or b_raw.get("error") == "request_failed":
+            failed_debate_indices.add(debate_idx)
+        r2_prompt_tokens_a.append(a_prompt)
+        r2_prompt_tokens_b.append(b_prompt)
+        r2_tokens_a.append(a_comp)
+        r2_tokens_b.append(b_comp)
+        r2_lps_a.append(a_lps)
+        r2_lps_b.append(b_lps)
+        r2_raw_a.append(a_raw)
+        r2_raw_b.append(b_raw)
+        r2_text_a.append(token_client.decode_fn(a_comp))
+        r2_text_b.append(token_client.decode_fn(b_comp))
+
+    # === Round 3 ===
+    r3_prompt_tokens_list: list[list[int]] = []
+    for idx in range(len(questions)):
+        r3_a_cont = r3_prefix_tokens + r2_tokens_b[idx] + r3_suffix_tokens
+        r3_b_cont = r3_prefix_tokens + r2_tokens_a[idx] + r3_suffix_tokens
+        r2_a_prompt = base_r1_prompt_tokens[idx] + r1_tokens_a[idx] + (r2_prefix_tokens + r1_tokens_b[idx] + r2_suffix_tokens)
+        r2_b_prompt = base_r1_prompt_tokens[idx] + r1_tokens_b[idx] + (r2_prefix_tokens + r1_tokens_a[idx] + r2_suffix_tokens)
+        r3_prompt_tokens_list.append(r2_a_prompt + r2_tokens_a[idx] + r3_a_cont)
+        r3_prompt_tokens_list.append(r2_b_prompt + r2_tokens_b[idx] + r3_b_cont)
+
+    r3_results = await token_client.sample(
+        prompt_tokens_list=r3_prompt_tokens_list,
+        max_tokens=config.max_tokens_per_turn,
+        temperature=config.temperature,
+    )
+
+    r3_prompt_tokens_a: list[list[int]] = []
+    r3_prompt_tokens_b: list[list[int]] = []
+    r3_tokens_a: list[list[int]] = []
+    r3_tokens_b: list[list[int]] = []
+    r3_lps_a: list[list[float]] = []
+    r3_lps_b: list[list[float]] = []
+    r3_raw_a: list[dict] = []
+    r3_raw_b: list[dict] = []
+    r3_text_a: list[str] = []
+    r3_text_b: list[str] = []
+
+    for i in range(0, len(r3_results), 2):
+        a_prompt, a_comp, a_lps, a_raw = r3_results[i]
+        b_prompt, b_comp, b_lps, b_raw = r3_results[i + 1]
+        debate_idx = i // 2
+        if a_raw.get("error") == "request_failed" or b_raw.get("error") == "request_failed":
+            failed_debate_indices.add(debate_idx)
+        r3_prompt_tokens_a.append(a_prompt)
+        r3_prompt_tokens_b.append(b_prompt)
+        r3_tokens_a.append(a_comp)
+        r3_tokens_b.append(b_comp)
+        r3_lps_a.append(a_lps)
+        r3_lps_b.append(b_lps)
+        r3_raw_a.append(a_raw)
+        r3_raw_b.append(b_raw)
+        r3_text_a.append(token_client.decode_fn(a_comp))
+        r3_text_b.append(token_client.decode_fn(b_comp))
+
+    # === Judge ===
+    verdicts: list[Verdict] = []
+    reasons: list[str] = []
+    judge_metas: list[dict[str, object]] = []
+    judge_prompt_tokens_list: list[list[int] | None] = []
+    judge_completion_tokens_list: list[list[int] | None] = []
+    judge_completion_logprobs_list: list[list[float] | None] = []
+    judge_raw_response_list: list[dict | None] = []
+
+    if judge_fn is not None:
+        for idx, (q, _gt) in enumerate(questions):
+            v, r = judge_fn(
+                q,
+                r1_text_a[idx],
+                r1_text_b[idx],
+                r2_text_a[idx],
+                r2_text_b[idx],
+                r3_text_a[idx],
+                r3_text_b[idx],
+            )
+            verdicts.append(v)
+            reasons.append(r)
+            judge_metas.append({})
+            judge_prompt_tokens_list.append(None)
+            judge_completion_tokens_list.append(None)
+            judge_completion_logprobs_list.append(None)
+            judge_raw_response_list.append(None)
+    else:
+        judge_prompts = [
+            build_judge_prompt(
+                question=q,
+                r1_a=r1_text_a[idx],
+                r1_b=r1_text_b[idx],
+                r2_a=r2_text_a[idx],
+                r2_b=r2_text_b[idx],
+                r3_a=r3_text_a[idx],
+                r3_b=r3_text_b[idx],
+                config=config,
+                strict=False,
+            )
+            for idx, (q, _gt) in enumerate(questions)
+        ]
+        judge_results = await judge_client.generate(
+            prompts=judge_prompts, max_tokens=config.max_tokens_per_turn, temperature=0.3
+        )
+        for i, r in enumerate(judge_results):
+            if r[4].get("error") == "request_failed":
+                failed_debate_indices.add(i)
+        for judge_text, j_prompt_toks, j_comp_toks, j_lps, j_raw in judge_results:
+            verdicts.append(extract_verdict(judge_text))
+            reasons.append(extract_reasoning(judge_text))
+            judge_metas.append({})
+            judge_prompt_tokens_list.append(j_prompt_toks)
+            judge_completion_tokens_list.append(j_comp_toks)
+            judge_completion_logprobs_list.append(j_lps)
+            judge_raw_response_list.append(j_raw)
+
+    results: list[DebateResult] = []
+    for idx, (q, gt) in enumerate(questions):
+        sol_a = extract_solution(r1_text_a[idx])
+        sol_b = extract_solution(r1_text_b[idx])
+
+        final_verdict = verdicts[idx]
+        final_reasoning = reasons[idx]
+        if idx in failed_debate_indices:
+            final_verdict = "INVALID"
+            final_reasoning = "[DEBATE FAILED: One or more API requests failed]"
+            print(f"\n{'!'*60}")
+            print(f"!!! DEBATE {idx} MARKED INVALID DUE TO FAILED REQUESTS")
+            print(f"{'!'*60}\n")
+
+        traj_a = DebateTrajectory(
+            agent="A",
+            transitions=[
+                Transition(
+                    prompt_tokens=base_r1_prompt_tokens[idx],
+                    completion_tokens=r1_tokens_a[idx],
+                    completion_logprobs=r1_lps_a[idx],
+                    round_num=1,
+                    metrics={"solution": sol_a},
+                    raw_response=r1_raw_a[idx],
+                ),
+                Transition(
+                    prompt_tokens=r2_prompt_tokens_a[idx],
+                    completion_tokens=r2_tokens_a[idx],
+                    completion_logprobs=r2_lps_a[idx],
+                    round_num=2,
+                    raw_response=r2_raw_a[idx],
+                ),
+                Transition(
+                    prompt_tokens=r3_prompt_tokens_a[idx],
+                    completion_tokens=r3_tokens_a[idx],
+                    completion_logprobs=r3_lps_a[idx],
+                    round_num=3,
+                    raw_response=r3_raw_a[idx],
+                ),
+            ],
+            frozen_solution=sol_a,
+            metrics={"r1": r1_text_a[idx], "r2": r2_text_a[idx], "r3": r3_text_a[idx]},
+        )
+        traj_b = DebateTrajectory(
+            agent="B",
+            transitions=[
+                Transition(
+                    prompt_tokens=base_r1_prompt_tokens[idx],
+                    completion_tokens=r1_tokens_b[idx],
+                    completion_logprobs=r1_lps_b[idx],
+                    round_num=1,
+                    metrics={"solution": sol_b},
+                    raw_response=r1_raw_b[idx],
+                ),
+                Transition(
+                    prompt_tokens=r2_prompt_tokens_b[idx],
+                    completion_tokens=r2_tokens_b[idx],
+                    completion_logprobs=r2_lps_b[idx],
+                    round_num=2,
+                    raw_response=r2_raw_b[idx],
+                ),
+                Transition(
+                    prompt_tokens=r3_prompt_tokens_b[idx],
+                    completion_tokens=r3_tokens_b[idx],
+                    completion_logprobs=r3_lps_b[idx],
+                    round_num=3,
+                    raw_response=r3_raw_b[idx],
+                ),
+            ],
+            frozen_solution=sol_b,
+            metrics={"r1": r1_text_b[idx], "r2": r2_text_b[idx], "r3": r3_text_b[idx]},
+        )
+
+        results.append(
+            DebateResult(
+                question=q,
+                ground_truth=gt,
+                trajectory_a=traj_a,
+                trajectory_b=traj_b,
+                verdict=final_verdict,
+                judge_reasoning=final_reasoning,
+                metrics={
+                    "judge_meta": judge_metas[idx],
+                    "solution_agreement": sol_a == sol_b if sol_a and sol_b else None,
+                    "request_failed": idx in failed_debate_indices,
+                    "token_only_rollout": True,
+                },
+                judge_prompt_tokens=judge_prompt_tokens_list[idx],
+                judge_completion_tokens=judge_completion_tokens_list[idx],
+                judge_completion_logprobs=judge_completion_logprobs_list[idx],
+                judge_raw_response=judge_raw_response_list[idx],
+            )
+        )
+
+    return results
+
 # === Judge Functions ===
 
 JudgeFn = Callable[
@@ -179,6 +537,26 @@ def mock_judge_random(
     verdict: Verdict = random.choice(["A", "B"])
     reasoning = f"[MOCK JUDGE] Randomly selected {verdict}."
     return verdict, reasoning
+
+
+def confidence_judge_r1(
+    question: str,
+    r1_a: str,
+    r1_b: str,
+    r2_a: str,
+    r2_b: str,
+    r3_a: str,
+    r3_b: str,
+) -> tuple[Verdict, str]:
+    """Verdict based only on R1-reported confidence (tie-break randomly)."""
+    _ = (question, r2_a, r2_b, r3_a, r3_b)
+    conf_a = parse_confidence(r1_a) or 0.0
+    conf_b = parse_confidence(r1_b) or 0.0
+    if conf_a == conf_b:
+        verdict: Verdict = random.choice(["A", "B"])
+        return verdict, f"[CONFIDENCE JUDGE] tie ({conf_a:.3f} vs {conf_b:.3f}) -> {verdict}"
+    verdict = "A" if conf_a > conf_b else "B"
+    return verdict, f"[CONFIDENCE JUDGE] conf_a={conf_a:.3f} conf_b={conf_b:.3f} -> {verdict}"
 
 
 async def llm_judge(

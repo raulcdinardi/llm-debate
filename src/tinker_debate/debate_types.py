@@ -103,8 +103,14 @@ class DebateConfig:
 
     # Prompts / templates (move hardcoding out of env)
     system_propose: str = (
-        "You are solving a problem. Provide your answer in the following format:\n\n"
-        "<SOLUTION>[Your final answer]</SOLUTION>"
+        "You are participating in a 3-round debate.\n"
+        "Round 1 is your INITIAL SOLUTION. You must commit to a solution now.\n"
+        "In later rounds you will argue for your solution and refute your opponent.\n\n"
+        "For Round 1, provide your answer and your confidence in the following format:\n\n"
+        "<SOLUTION>[Your final answer]</SOLUTION>\n"
+        "<CONFIDENCE>[0.0 to 1.0]</CONFIDENCE>\n\n"
+        "The confidence must be your best estimate of the probability that your <SOLUTION> is correct.\n"
+        "Output ONLY these tags."
     )
 
     system_argue: str = (
@@ -132,13 +138,21 @@ class DebateConfig:
     )
 
     r2_user_template: str = (
+        "Round 2 (Argument): Your solution is FIXED and cannot change.\n"
         "Another solver proposed this solution:\n{opponent_r1}\n\n"
-        "Argue why your solution is correct and critique their approach."
+        "Your task:\n"
+        "- Argue why your Round 1 solution is correct\n"
+        "- Refute the opponent's solution\n\n"
+        "Do NOT repeat the <SOLUTION>/<CONFIDENCE> tags. Write an argument."
     )
 
     r3_user_template: str = (
+        "Round 3 (Response): Your solution is still FIXED and cannot change.\n"
         "They responded:\n{opponent_r2}\n\n"
-        "Make your final case."
+        "Your task:\n"
+        "- Respond to their criticisms\n"
+        "- Make your final case for why your solution is correct\n\n"
+        "Do NOT repeat the <SOLUTION>/<CONFIDENCE> tags. Write an argument."
     )
 
     @staticmethod

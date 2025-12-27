@@ -16,13 +16,12 @@ from .debate_types import (
     compute_training_stats,
 )
 from .debate_env import (
-    DebateRolloutClient,
+    DebateTokenRolloutClient,
     extract_reasoning,
     extract_solution,
     extract_verdict,
     mock_judge_random,
-    run_debate,
-    run_debate_batch,
+    run_debate_batch_token_only,
 )
 from .tinker_client import TinkerDebateClient
 
@@ -38,9 +37,8 @@ __all__ = [
     "extract_solution",
     "extract_verdict",
     "extract_reasoning",
-    "DebateRolloutClient",
+    "DebateTokenRolloutClient",
     "mock_judge_random",
-    "run_debate",
-    "run_debate_batch",
+    "run_debate_batch_token_only",
     "TinkerDebateClient",
 ]
