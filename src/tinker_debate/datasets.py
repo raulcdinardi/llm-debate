@@ -12,7 +12,7 @@ from typing import Literal
 
 
 GPQASplit = Literal["gpqa_diamond", "gpqa_extended", "gpqa_main"]
-DatasetName = Literal["gpqa_diamond", "gpqa_extended", "gpqa_main", "test"]
+DatasetName = Literal["gpqa_diamond", "gpqa_extended", "gpqa_main", "cnn_dailymail", "test"]
 
 
 # Simple test dataset - no API calls needed
@@ -105,3 +105,42 @@ def sample_questions(
 
     sampled = random.sample(dataset, min(n, len(dataset)))
     return [(d["question"], d["ground_truth"]) for d in sampled]
+
+
+def load_cnn_dailymail(
+    n_samples: int | None = None,
+    seed: int | None = None,
+    split: str = "train",
+) -> list[dict]:
+    """Load CNN/DailyMail dataset for summarization.
+
+    Args:
+        n_samples: Number of samples to load (None = all)
+        seed: Random seed for shuffling before sampling
+        split: Dataset split ("train", "validation", "test")
+
+    Returns:
+        List of {"article": str, "highlights": str, "id": str} dicts
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset("ccdv/cnn_dailymail", "3.0.0", split=split)
+
+    if seed is not None:
+        random.seed(seed)
+        indices = list(range(len(ds)))
+        random.shuffle(indices)
+        if n_samples is not None:
+            indices = indices[:n_samples]
+        ds = ds.select(indices)
+    elif n_samples is not None:
+        ds = ds.select(range(min(n_samples, len(ds))))
+
+    return [
+        {
+            "article": row["article"],
+            "highlights": row["highlights"],
+            "id": row["id"],
+        }
+        for row in ds
+    ]

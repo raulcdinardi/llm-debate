@@ -38,18 +38,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 load_dotenv()
 
-# Proxy configuration - auto-launch mitmweb (disabled by default due to SSL issues)
+# Proxy configuration - auto-launch mitmweb (enabled by default)
 PROXY_PORT = 8080
 WEB_PORT = 8081
-USE_PROXY = "--proxy" in sys.argv  # Enable with --proxy flag
+USE_PROXY = "--no-proxy" not in sys.argv  # Disable with --no-proxy flag
+
+if "--no-proxy" in sys.argv:
+    sys.argv.remove("--no-proxy")
 
 if USE_PROXY:
-    sys.argv.remove("--proxy")
     PROXY_URL = f"http://127.0.0.1:{PROXY_PORT}"
 
     print(f"\n[mitmproxy] Starting mitmweb on port {PROXY_PORT}...")
+    mitmweb_path = Path(sys.executable).parent / "mitmweb"
+    assert mitmweb_path.exists(), f"mitmweb not found at {mitmweb_path}. Install with: pip install mitmproxy"
     mitm_proc = subprocess.Popen(
-        ["mitmweb", "--listen-port", str(PROXY_PORT), "--web-port", str(WEB_PORT), "--set", "ssl_insecure=true"],
+        [str(mitmweb_path), "--listen-port", str(PROXY_PORT), "--web-port", str(WEB_PORT), "--set", "ssl_insecure=true"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -67,7 +71,7 @@ if USE_PROXY:
 
     print(f"[mitmproxy] Web UI: http://127.0.0.1:{WEB_PORT}\n")
 else:
-    print("\n[mitmproxy] Disabled. Use --proxy flag to enable live HTTP inspection.\n")
+    print("\n[mitmproxy] Disabled via --no-proxy flag.\n")
 
 from rich import box  # noqa: E402
 from rich.console import Console  # noqa: E402
@@ -87,13 +91,20 @@ vcr_config = vcr.VCR(
 def parse_args():
     parser = argparse.ArgumentParser(description="Minimal debate training")
     parser.add_argument(
-        "--task",
+        "--mode",
         type=str,
         default="debate",
-        choices=["debate", "confidence"],
-        help="Training task/env to run. 'debate' is multi-turn; 'confidence' is single-turn.",
+        choices=["debate", "single_turn"],
+        help="Training paradigm. 'debate' = multi-turn with judge; 'single_turn' = simple rollout.",
     )
-    parser.add_argument("-n", "--num-debates", type=int, default=2, help="Debates per step")
+    parser.add_argument(
+        "--env",
+        type=str,
+        default=None,
+        choices=["confidence", "summary"],
+        help="Environment/domain for single_turn mode. Required if --mode=single_turn.",
+    )
+    parser.add_argument("-n", "--num-rollouts", type=int, default=16, help="Total rollouts per step")
     parser.add_argument("-s", "--steps", type=int, default=1, help="Training steps")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--dry-run", action="store_true", help="Run debates but don't train")
@@ -107,19 +118,18 @@ def parse_args():
         "--accept-min-reward",
         type=float,
         default=0.0,
-        help="(confidence only) Keep rollouts with reward >= this threshold.",
+        help="(baseline only) Keep rollouts with reward >= this threshold.",
     )
     parser.add_argument(
         "--accept-require-parse",
         action="store_true",
-        help="(confidence only) Only keep rollouts where confidence parsing succeeded.",
+        help="(baseline only) Only keep rollouts where confidence parsing succeeded.",
     )
     parser.add_argument(
-        "--experiment",
-        "-e",
+        "--name",
         type=str,
-        default=None,
-        help="Experiment name (logs to logs/experiments/<name>/)",
+        required=True,
+        help="Run name (required). Logs to logs/<timestamp>_<params>_<name>/",
     )
     parser.add_argument("--question", "-q", default="What is 7 * 8?", help="Question (ignored if --dataset)")
     parser.add_argument("--ground-truth", "-g", default="56", help="Ground truth (ignored if --dataset)")
@@ -128,21 +138,48 @@ def parse_args():
         "-d",
         type=str,
         default=None,
-        choices=["gpqa_diamond", "gpqa_extended", "gpqa_main", "test"],
+        choices=["gpqa_diamond", "gpqa_extended", "gpqa_main", "cnn_dailymail", "test"],
         help="Dataset to sample questions from (overrides --question). 'test' = simple arithmetic.",
     )
+    parser.add_argument(
+        "--reward-fn",
+        type=str,
+        default="compression",
+        choices=["compression", "rouge", "tfidf", "embedding", "length_penalty", "fluency"],
+        help="(summary only) Reward function for training. Can also use comma-sep weights like 'compression:0.5,rouge:0.3'.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument(
+        "--num-groups",
+        type=int,
+        default=2,
+        help="Number of unique questions (groups) per step.",
+    )
     return parser.parse_args()
 
 
-def get_log_dir(experiment_name: str | None, dataset: str | None = None) -> Path:
+def get_log_dir(
+    *,
+    name: str,
+    mode: str,
+    env: str | None,
+    num_rollouts: int,
+    num_groups: int,
+    dataset: str | None = None,
+) -> Path:
+    """Build log directory with params in name for easy identification."""
     base = Path("logs")
-    if experiment_name:
-        return base / "experiments" / experiment_name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if dataset:
-        return base / "gpqa_runs" / dataset / timestamp
-    return base / "test_runs" / timestamp
+    
+    # Build descriptive name: timestamp_params_mode_env_name
+    # e.g., 20250106_1930_n16_g2_debate_gpqa_my_experiment
+    # or    20250106_1930_n16_g2_single_turn_summary_cnn_my_experiment
+    dataset_tag = dataset if dataset else "custom"
+    env_tag = env if env else ""
+    mode_env = f"{mode}_{env_tag}" if env_tag else mode
+    dir_name = f"{timestamp}_n{num_rollouts}_g{num_groups}_{mode_env}_{dataset_tag}_{name}"
+    
+    return base / dir_name
 
 
 def save_debate_log(result, log_dir: Path, config=None, model_name: str | None = None) -> Path:
@@ -268,10 +305,10 @@ def save_training_step_log(
     return log_path
 
 
-def save_confidence_log(*, record: dict, log_dir: Path, model_name: str | None = None) -> Path:
+def save_baseline_log(*, record: dict, log_dir: Path, model_name: str | None = None) -> Path:
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    log_path = log_dir / f"confidence_{timestamp}.json"
+    log_path = log_dir / f"baseline_{timestamp}.json"
     record_with_meta = {
         "timestamp": timestamp,
         "model": model_name,
@@ -282,13 +319,38 @@ def save_confidence_log(*, record: dict, log_dir: Path, model_name: str | None =
     return log_path
 
 
+def save_summary_log(*, record: dict, log_dir: Path, model_name: str | None = None) -> Path:
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    log_path = log_dir / f"summary_{timestamp}.json"
+    record_with_meta = {
+        "timestamp": timestamp,
+        "model": model_name,
+        **record,
+    }
+    with open(log_path, "w") as f:
+        json.dump(record_with_meta, f, indent=2)
+    return log_path
+
 async def main():
     args = parse_args()
+
+    # Validate mode/env combination
+    if args.mode == "single_turn" and args.env is None:
+        console.print("[red]Error: --env is required when --mode=single_turn[/red]")
+        sys.exit(1)
 
     if args.seed is not None:
         random.seed(args.seed)
 
-    log_dir = get_log_dir(args.experiment, args.dataset)
+    log_dir = get_log_dir(
+        name=args.name,
+        mode=args.mode,
+        env=args.env,
+        num_rollouts=args.num_rollouts,
+        num_groups=args.num_groups,
+        dataset=args.dataset,
+    )
     os.makedirs(log_dir, exist_ok=True)
 
     # VCR cassette for recording all HTTP traffic
@@ -308,15 +370,36 @@ async def main():
         console.print(f"[dim]Loaded {len(dataset)} questions[/dim]")
 
     console.print("\n[bold cyan]TINKER TRAINING[/bold cyan]")
-    console.print(f"Task: {args.task}")
-    if args.task == "debate":
+    mode_desc = f"{args.mode}" + (f" ({args.env})" if args.env else "")
+    console.print(f"Mode: {mode_desc}")
+    if args.mode == "debate":
         if args.dataset:
             console.print(f"Dataset: {args.dataset}")
         else:
             console.print(f"Question: {args.question}")
-    else:
+    elif args.env == "confidence":
         console.print("Dataset: confidence/questions.json")
-    console.print(f"Debates per step: {args.num_debates}")
+    elif args.env == "summary":
+        console.print(f"Dataset: cnn_dailymail, reward_fn: {args.reward_fn}")
+
+    # Derive GRPO parameters
+    if args.num_rollouts % args.num_groups != 0:
+        console.print(f"[red]Error: --num-rollouts ({args.num_rollouts}) must be divisible by --num-groups ({args.num_groups})[/red]")
+        sys.exit(1)
+    group_size = args.num_rollouts // args.num_groups
+
+    if args.mode == "debate":
+        if group_size % 2 != 0:
+            console.print(f"[red]Error: group_size ({group_size}) must be even for debate (2 rollouts per debate)[/red]")
+            sys.exit(1)
+        debates_per_question = group_size // 2
+        num_debates = args.num_groups * debates_per_question
+        console.print(f"Rollouts: {args.num_rollouts} total, {args.num_groups} groups of {group_size}")
+        console.print(f"Debates: {num_debates} total ({debates_per_question} per question)")
+    else:
+        num_debates = args.num_rollouts  # baseline env: 1 rollout = 1 "datum"
+        console.print(f"Rollouts: {args.num_rollouts}")
+
     console.print(f"Training steps: {args.steps}")
     console.print(f"Learning rate: {args.lr}")
     console.print(f"Seed: {args.seed}")
@@ -333,7 +416,7 @@ async def main():
 
         from tinker_debate.debate_types import TrainingDatum
 
-        if args.task == "debate":
+        if args.mode == "debate":
             from tinker_debate.debate_env import (
                 DebateRolloutClient,
                 DebateTokenRolloutClient,
@@ -341,9 +424,14 @@ async def main():
                 mock_judge_random,
                 run_debate_batch_token_only,
             )
-            from tinker_debate.debate_types import DebateConfig, assemble_training_data, compute_training_stats
-        else:
+            from tinker_debate.debate_types import DebateConfig, assemble_training_data_grpo, compute_training_stats
+        elif args.env == "confidence":
             from tinker_debate.confidence.confidence_env import ConfidenceDataset, load_questions
+            from tinker_cookbook import renderers
+            import tinker
+        elif args.env == "summary":
+            from tinker_debate.summary import SummaryDataset, REWARD_FUNCTIONS
+            from tinker_debate.datasets import load_cnn_dailymail
             from tinker_cookbook import renderers
             import tinker
 
@@ -354,10 +442,12 @@ async def main():
         token_rollout_client = None
         config = None
         judge_fn = None
-        confidence_dataset = None
-        confidence_renderer = None
+        baseline_dataset = None
+        baseline_renderer = None
+        summary_dataset = None
+        summary_renderer = None
 
-        if args.task == "debate":
+        if args.mode == "debate":
             rollout_client = DebateRolloutClient(generate_fn=generate_fn)
 
             async def sample_tokens_fn(prompt_tokens_list, max_tokens, temp):
@@ -377,16 +467,31 @@ async def main():
                 judge_fn = confidence_judge_r1
             else:
                 judge_fn = mock_judge_random if args.mock_judge else None
-        else:
-            questions_confidence = load_questions()
-            if len(questions_confidence) == 0:
+        elif args.env == "confidence":
+            questions_baseline = load_questions()
+            if len(questions_baseline) == 0:
                 raise ValueError("confidence/questions.json is empty")
-            confidence_renderer = renderers.get_renderer("qwen3_instruct", client.tokenizer)
-            confidence_dataset = ConfidenceDataset(
-                questions_confidence,
-                batch_size=args.num_debates,
+            baseline_renderer = renderers.get_renderer("qwen3_instruct", client.tokenizer)
+            baseline_dataset = ConfidenceDataset(
+                questions_baseline,
+                batch_size=args.num_rollouts,
                 group_size=1,
-                renderer=confidence_renderer,
+                renderer=baseline_renderer,
+            )
+        elif args.env == "summary":
+            # Load CNN/DailyMail - use seed for reproducibility
+            n_samples = 1000 if args.dataset == "cnn_dailymail" else None  # limit for speed
+            articles = load_cnn_dailymail(n_samples=n_samples, seed=args.seed)
+            console.print(f"[dim]Loaded {len(articles)} articles from CNN/DailyMail[/dim]")
+            
+            summary_renderer = renderers.get_renderer("qwen3_instruct", client.tokenizer)
+            reward_fn = REWARD_FUNCTIONS[args.reward_fn]
+            summary_dataset = SummaryDataset(
+                articles=articles,
+                batch_size=args.num_rollouts,
+                group_size=1,
+                renderer=summary_renderer,
+                reward_fn=reward_fn,
             )
 
         all_losses: list[float] = []
@@ -394,22 +499,26 @@ async def main():
         for step in range(1, args.steps + 1):
             console.rule(f"[bold]Step {step}/{args.steps}[/bold]")
 
-            if args.task == "debate":
-                console.print(f"[dim]Running {args.num_debates} debates (batched per-round, token-only)...[/dim]")
-            else:
-                console.print(f"[dim]Running {args.num_debates} rollouts (single-turn confidence env)...[/dim]")
+            if args.mode == "debate":
+                console.print(f"[dim]Running {num_debates} debates (batched per-round, token-only)...[/dim]")
+            elif args.env == "confidence":
+                console.print(f"[dim]Running {args.num_rollouts} rollouts (single-turn confidence env)...[/dim]")
+            elif args.env == "summary":
+                console.print(f"[dim]Running {args.num_rollouts} rollouts (single-turn summary env, reward={args.reward_fn})...[/dim]")
             t0 = time.time()
 
             training_data: list[TrainingDatum] = []
             rollout_time = 0.0
 
-            if args.task == "debate":
+            if args.mode == "debate":
                 if dataset:
                     from tinker_debate.datasets import sample_questions
                     step_seed = args.seed + step if args.seed is not None else None
-                    batch = sample_questions(dataset, args.num_debates, seed=step_seed)
+                    # Sample num_groups unique questions, repeat each group_size times
+                    unique_questions = sample_questions(dataset, args.num_groups, seed=step_seed)
+                    batch = [q for q in unique_questions for _ in range(group_size)]
                 else:
-                    batch = [(args.question, args.ground_truth) for _ in range(args.num_debates)]
+                    batch = [(args.question, args.ground_truth) for _ in range(args.num_rollouts)]
 
                 debates = await run_debate_batch_token_only(
                     batch,
@@ -429,14 +538,14 @@ async def main():
                     f"[dim]Rollout time: {rollout_time:.1f}s | A:{stats['a_wins']} B:{stats['b_wins']} Invalid:{stats['invalid']}[/dim]"
                 )
 
-                training_data = assemble_training_data(debates)
+                training_data = assemble_training_data_grpo(debates)
                 console.print(f"Training data: {len(training_data)} datums from {len(debates)} debates")
-            else:
-                assert confidence_dataset is not None
-                assert confidence_renderer is not None
+            elif args.env == "confidence":
+                assert baseline_dataset is not None
+                assert baseline_renderer is not None
 
-                batch_idx = (step - 1) % len(confidence_dataset)
-                env_group_builders = confidence_dataset.get_batch(batch_idx)
+                batch_idx = (step - 1) % len(baseline_dataset)
+                env_group_builders = baseline_dataset.get_batch(batch_idx)
                 num_rollouts = len(env_group_builders)
 
                 for builder in env_group_builders:
@@ -471,7 +580,7 @@ async def main():
                         "reward": step_result.reward,
                         "metrics": step_result.metrics,
                     }
-                    save_confidence_log(record=record, log_dir=log_dir, model_name=client.model_name)
+                    save_baseline_log(record=record, log_dir=log_dir, model_name=client.model_name)
 
                     if args.accept_require_parse and float(step_result.metrics["parse_success"]) != 1.0:
                         continue
@@ -488,10 +597,78 @@ async def main():
                             completion_logprobs=completion_logprobs,
                             completion_advantages=[advantage] * len(completion_tokens),
                             metadata={
-                                "task": "confidence",
+                                "mode": "single_turn",
+                                "env": "confidence",
                                 "tags": builder.logging_tags(),
                                 "parse_success": float(step_result.metrics["parse_success"]),
                                 "reward": float(step_result.reward),
+                            },
+                        )
+                    )
+
+                rollout_time = time.time() - t0
+                console.print(f"[dim]Rollout time: {rollout_time:.1f}s[/dim]")
+                console.print(f"Training data: {len(training_data)} datums (accepted) from {num_rollouts} rollouts")
+            elif args.env == "summary":
+                assert summary_dataset is not None
+                assert summary_renderer is not None
+
+                batch_idx = (step - 1) % len(summary_dataset)
+                env_group_builders = summary_dataset.get_batch(batch_idx)
+                num_rollouts = len(env_group_builders)
+
+                for builder in env_group_builders:
+                    envs = await builder.make_envs()
+                    if len(envs) != 1:
+                        raise ValueError(f"Expected group_size=1, got {len(envs)}")
+                    env = envs[0]
+                    ob, stop = await env.initial_observation()
+                    sampling_params = tinker.SamplingParams(
+                        temperature=0.7,
+                        stop=stop,
+                        max_tokens=256,  # summaries can be longer than confidence answers
+                    )
+                    resp = await client.sampling_client.sample_async(
+                        prompt=ob,
+                        num_samples=1,
+                        sampling_params=sampling_params,
+                    )
+                    seq = resp.sequences[0]
+                    if seq.logprobs is None:
+                        raise RuntimeError("Tinker sampling did not return completion logprobs (seq.logprobs is None)")
+                    completion_tokens = list(seq.tokens)
+                    completion_logprobs = list(seq.logprobs)
+
+                    step_result = await env.step(completion_tokens)
+
+                    record = {
+                        "tags": builder.logging_tags(),
+                        "prompt_tokens": ob.to_ints(),
+                        "completion_tokens": completion_tokens,
+                        "completion_logprobs": completion_logprobs,
+                        "reward": step_result.reward,
+                        "metrics": step_result.metrics,
+                    }
+                    save_summary_log(record=record, log_dir=log_dir, model_name=client.model_name)
+
+                    if float(step_result.reward) < args.accept_min_reward:
+                        continue
+                    if len(completion_tokens) == 0:
+                        continue
+
+                    advantage = float(step_result.reward) / len(completion_tokens)
+                    training_data.append(
+                        TrainingDatum(
+                            prompt_tokens=ob.to_ints(),
+                            completion_tokens=completion_tokens,
+                            completion_logprobs=completion_logprobs,
+                            completion_advantages=[advantage] * len(completion_tokens),
+                            metadata={
+                                "mode": "single_turn",
+                                "env": "summary",
+                                "tags": builder.logging_tags(),
+                                "reward": float(step_result.reward),
+                                "compression_ratio": step_result.metrics.get("compression_ratio", 0.0),
                             },
                         )
                     )
