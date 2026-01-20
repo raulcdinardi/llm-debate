@@ -64,6 +64,7 @@ class OrthogonalDriver(RolloutDriver):
                 sample_token_prompts=client.sample_token_prompts,
                 save_record=save_record,
                 accept_min_reward=float(args.accept_min_reward),
+                accept_require_parse=bool(args.accept_require_parse),
             )
             out = await normal.rollout(
                 step=step,

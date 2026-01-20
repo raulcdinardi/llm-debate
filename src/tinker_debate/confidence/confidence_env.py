@@ -37,12 +37,20 @@ def parse_confidence(text: str) -> float | None:
     # Preferred: tag format (mirrors debate R1 output schema)
     tag = re.search(r"<CONFIDENCE>(.*?)</CONFIDENCE>", text, re.DOTALL | re.IGNORECASE)
     if tag:
-        return max(0.0, min(1.0, float(tag.group(1).strip())))
+        value_text = tag.group(1).strip()
+        if re.fullmatch(r"[+-]?(\d+(\.\d*)?|\.\d+)", value_text):
+            value = float(value_text)
+            return max(0.0, min(1.0, value))
+        return None
 
     # Back-compat: "Confidence: 0.73"
     line = re.search(r"[Cc]onfidence[:\s]+([0-9.]+)", text)
     if line:
-        return max(0.0, min(1.0, float(line.group(1))))
+        value_text = line.group(1)
+        if re.fullmatch(r"[+-]?(\d+(\.\d*)?|\.\d+)", value_text):
+            value = float(value_text)
+            return max(0.0, min(1.0, value))
+        return None
 
     return None
 

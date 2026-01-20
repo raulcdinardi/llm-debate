@@ -24,6 +24,7 @@ class NormalParadigm:
     sample_token_prompts: Any
     save_record: Any
     accept_min_reward: float
+    accept_require_parse: bool
 
     async def rollout(
         self,
@@ -74,6 +75,9 @@ class NormalParadigm:
                 raise RuntimeError("prompt_tokens mismatch in local sampling result.")
 
             reward = self.task.compute_reward(inst=inst, completion_tokens=completion_tokens, tokenizer=self.tokenizer)
+            parse_success = None
+            if "parse_success" in reward.metrics:
+                parse_success = reward.metrics["parse_success"]
 
             record = {
                 "tags": tags,
@@ -88,6 +92,11 @@ class NormalParadigm:
             }
             self.save_record(record)
 
+            if self.accept_require_parse:
+                if parse_success is None:
+                    continue
+                if float(parse_success) != 1.0:
+                    continue
             if float(reward.reward) < float(self.accept_min_reward):
                 continue
             if len(completion_tokens) == 0:

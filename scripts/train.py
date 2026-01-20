@@ -40,11 +40,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 load_dotenv()
 
-# Proxy configuration - auto-launch mitmweb (enabled by default)
+# Proxy configuration - opt-in only via --proxy
 PROXY_PORT = 8080
 WEB_PORT = 8081
-USE_PROXY = "--no-proxy" not in sys.argv  # Disable with --no-proxy flag
+USE_PROXY = "--proxy" in sys.argv
 
+if "--proxy" in sys.argv:
+    sys.argv.remove("--proxy")
 if "--no-proxy" in sys.argv:
     sys.argv.remove("--no-proxy")
 
@@ -73,7 +75,7 @@ if USE_PROXY:
 
     print(f"[mitmproxy] Web UI: http://127.0.0.1:{WEB_PORT}\n")
 else:
-    print("\n[mitmproxy] Disabled via --no-proxy flag.\n")
+    print("\n[mitmproxy] Disabled (use --proxy to enable).\n")
 
 from rich import box  # noqa: E402
 from rich.console import Console  # noqa: E402

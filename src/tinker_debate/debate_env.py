@@ -17,7 +17,19 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from .debate_types import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
-from .confidence.confidence_env import parse_confidence
+
+
+def parse_confidence(text: str) -> float | None:
+    tag = re.search(r"<CONFIDENCE>(.*?)</CONFIDENCE>", text, re.DOTALL | re.IGNORECASE)
+    if not tag:
+        return None
+    value_text = tag.group(1).strip()
+    if not re.fullmatch(r"[+-]?(\d+(\.\d*)?|\.\d+)", value_text):
+        return None
+    value = float(value_text)
+    if not (0.0 <= value <= 1.0):
+        return None
+    return value
 
 
 # === Extraction ===
@@ -228,6 +240,9 @@ async def run_debate_batch_token_only(
     if config.num_rounds != 3:
         raise NotImplementedError("Only num_rounds=3 is currently supported")
 
+    import time
+    t0 = time.time()
+
     # Pre-split user templates so we can splice opponent tokens without formatting strings.
     r2_pre, r2_post = _split_template(config.r2_user_template, "{opponent_r1}")
     r3_pre, r3_post = _split_template(config.r3_user_template, "{opponent_r2}")
@@ -241,6 +256,7 @@ async def run_debate_batch_token_only(
     failed_debate_indices: set[int] = set()
 
     # === Round 1 ===
+    print(f"[debate] Round 1: sampling {len(questions) * 2} completions...")
     base_r1_prompt_tokens: list[list[int]] = [
         _encode(tokenizer, build_r1_prompt(q, config)) for q, _gt in questions
     ]
@@ -279,6 +295,7 @@ async def run_debate_batch_token_only(
         r1_text_b.append(token_client.decode_fn(b_comp))
 
     # === Round 2 ===
+    print(f"[debate] Round 2: sampling {len(questions) * 2} completions...")
     r2_prompt_tokens_list: list[list[int]] = []
     for idx in range(len(questions)):
         r2_a_cont = r2_prefix_tokens + r1_tokens_b[idx] + r2_suffix_tokens
@@ -321,6 +338,7 @@ async def run_debate_batch_token_only(
         r2_text_b.append(token_client.decode_fn(b_comp))
 
     # === Round 3 ===
+    print(f"[debate] Round 3: sampling {len(questions) * 2} completions...")
     r3_prompt_tokens_list: list[list[int]] = []
     for idx in range(len(questions)):
         r3_a_cont = r3_prefix_tokens + r2_tokens_b[idx] + r3_suffix_tokens
@@ -365,6 +383,7 @@ async def run_debate_batch_token_only(
         r3_text_b.append(token_client.decode_fn(b_comp))
 
     # === Judge ===
+    print(f"[debate] Judge: {'mock' if judge_fn is not None else 'llm'}")
     verdicts: list[Verdict] = []
     reasons: list[str] = []
     judge_metas: list[dict[str, object]] = []
@@ -391,6 +410,7 @@ async def run_debate_batch_token_only(
             judge_completion_tokens_list.append(None)
             judge_completion_logprobs_list.append(None)
             judge_raw_response_list.append(None)
+
     else:
         judge_prompts = [
             build_judge_prompt(
@@ -420,6 +440,8 @@ async def run_debate_batch_token_only(
             judge_completion_tokens_list.append(j_comp_toks)
             judge_completion_logprobs_list.append(j_lps)
             judge_raw_response_list.append(j_raw)
+
+    print(f"[debate] Done: {time.time() - t0:.1f}s total")
 
     results: list[DebateResult] = []
     for idx, (q, gt) in enumerate(questions):
@@ -550,8 +572,10 @@ def confidence_judge_r1(
 ) -> tuple[Verdict, str]:
     """Verdict based only on R1-reported confidence (tie-break randomly)."""
     _ = (question, r2_a, r2_b, r3_a, r3_b)
-    conf_a = parse_confidence(r1_a) or 0.0
-    conf_b = parse_confidence(r1_b) or 0.0
+    conf_a = parse_confidence(r1_a)
+    conf_b = parse_confidence(r1_b)
+    if conf_a is None or conf_b is None:
+        return "INVALID", "[CONFIDENCE JUDGE] parse failure"
     if conf_a == conf_b:
         verdict: Verdict = random.choice(["A", "B"])
         return verdict, f"[CONFIDENCE JUDGE] tie ({conf_a:.3f} vs {conf_b:.3f}) -> {verdict}"
@@ -704,7 +728,15 @@ async def run_debate(
     judge_completion_logprobs: list[float] | None = None
     judge_raw_response: dict | None = None
 
-    if judge_fn is not None:
+    request_failed = any(
+        r.get("error") == "request_failed"
+        for r in [r1_a_raw, r1_b_raw, r2_a_raw, r2_b_raw, r3_a_raw, r3_b_raw]
+    )
+
+    if request_failed:
+        verdict = "INVALID"
+        reasoning = "[REQUEST FAILED]"
+    elif judge_fn is not None:
         verdict, reasoning = judge_fn(question, r1_a, r1_b, r2_a, r2_b, r3_a, r3_b)
     else:
         verdict, reasoning, judge_meta, judge_prompt_tokens, judge_completion_tokens, judge_completion_logprobs, judge_raw_response = await llm_judge(
@@ -742,6 +774,7 @@ async def run_debate(
         metrics={
             "judge_meta": judge_meta,
             "solution_agreement": solution_a == solution_b if solution_a and solution_b else None,
+            "request_failed": request_failed,
         },
         judge_prompt_tokens=judge_prompt_tokens,
         judge_completion_tokens=judge_completion_tokens,
