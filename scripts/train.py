@@ -22,8 +22,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+from contextlib import nullcontext
 import json
 import os
+import platform
 import random
 import subprocess
 import time
@@ -76,16 +78,8 @@ else:
 from rich import box  # noqa: E402
 from rich.console import Console  # noqa: E402
 from rich.table import Table  # noqa: E402
-import vcr  # noqa: E402
 
 console = Console()
-
-# VCR configuration for recording HTTP traffic
-vcr_config = vcr.VCR(
-    record_mode="new_episodes",  # Record new requests, replay existing
-    match_on=["method", "scheme", "host", "port", "path"],
-    serializer="yaml",
-)
 
 
 def parse_args():
@@ -101,8 +95,8 @@ def parse_args():
         "--env",
         type=str,
         default=None,
-        choices=["confidence", "summary"],
-        help="Environment/domain for single_turn mode. Required if --mode=single_turn.",
+        choices=["qa", "confidence", "summary"],
+        help="Task/env. Required if --mode=single_turn. Optional if --mode=debate (default: qa).",
     )
     parser.add_argument("-n", "--num-rollouts", type=int, default=16, help="Total rollouts per step")
     parser.add_argument("-s", "--steps", type=int, default=1, help="Training steps")
@@ -155,7 +149,76 @@ def parse_args():
         default=2,
         help="Number of unique questions (groups) per step.",
     )
+    parser.add_argument(
+        "--debate-train",
+        type=str,
+        default="rejection",
+        choices=["rejection", "rs_grpo"],
+        help="(debate only) Training data construction. 'rejection' trains only on winners. 'rs_grpo' does rejection sampling first, then GRPO over the surviving winners using a task reward.",
+    )
+    parser.add_argument(
+        "--debate-grpo-reward",
+        type=str,
+        default=None,
+        choices=["task"],
+        help="(debate only, rs_grpo) Reward definition for GRPO. Must be set when --debate-train=rs_grpo.",
+    )
     return parser.parse_args()
+
+
+def write_run_metadata(*, log_dir: Path, args: argparse.Namespace) -> None:
+    import sys
+
+    env_keys = [
+        "TINKER_LOCAL_BACKEND",
+        "TINKER_LOCAL_SEED",
+        "TINKER_LOCAL_MICROBATCH",
+        "TINKER_LOCAL_DEVICE",
+        "TINKER_LOCAL_LOAD_IN_4BIT",
+        "TINKER_LOCAL_MAX_SEQ_LENGTH",
+        "TINKER_DEBATE_BASE_MODEL",
+        "USE_TF",
+        "TRANSFORMERS_NO_TF",
+        "TRANSFORMERS_NO_FLAX",
+        "PYTHONUNBUFFERED",
+        "PYTORCH_CUDA_ALLOC_CONF",
+    ]
+
+    env: dict[str, str] = {}
+    for k in env_keys:
+        if k in os.environ:
+            env[k] = os.environ[k]
+
+    versions: dict[str, str] = {"python": sys.version.replace("\n", " ")}
+    if "TINKER_LOCAL_BACKEND" in os.environ:
+        import torch
+
+        versions["torch"] = torch.__version__
+        versions["torch_cuda_available"] = str(torch.cuda.is_available())
+        versions["torch_cuda"] = str(torch.version.cuda)
+
+        import transformers
+
+        versions["transformers"] = transformers.__version__
+
+        if os.environ["TINKER_LOCAL_BACKEND"] == "unsloth":
+            import unsloth
+
+            if hasattr(unsloth, "__version__"):
+                versions["unsloth"] = str(unsloth.__version__)
+
+    meta = {
+        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+        "platform": platform.platform(),
+        "argv": list(sys.argv),
+        "args": vars(args),
+        "env": env,
+        "versions": versions,
+    }
+
+    path = log_dir / "run_metadata.json"
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
 
 
 def get_log_dir(
@@ -168,7 +231,7 @@ def get_log_dir(
     dataset: str | None = None,
 ) -> Path:
     """Build log directory with params in name for easy identification."""
-    base = Path("logs")
+    base = Path(os.environ.get("TINKER_DEBATE_LOG_ROOT", "logs"))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Build descriptive name: timestamp_params_mode_env_name
@@ -352,43 +415,31 @@ async def main():
         dataset=args.dataset,
     )
     os.makedirs(log_dir, exist_ok=True)
+    write_run_metadata(log_dir=log_dir, args=args)
 
     # VCR cassette for recording all HTTP traffic
     cassette_path = log_dir / "http_traffic.yaml"
-    console.print(f"[dim]Recording HTTP traffic to {cassette_path}[/dim]")
-
-    # Load dataset if specified
-    dataset = None
-    if args.dataset:
-        console.print(f"[dim]Loading {args.dataset}...[/dim]")
-        if args.dataset == "test":
-            from tinker_debate.datasets import load_test_dataset
-            dataset = load_test_dataset()
-        else:
-            from tinker_debate.datasets import load_gpqa
-            dataset = load_gpqa(args.dataset, seed=args.seed)
-        console.print(f"[dim]Loaded {len(dataset)} questions[/dim]")
+    is_local = ("TINKER_LOCAL_BACKEND" in os.environ) or (os.environ.get("TINKER_BACKEND") == "local")
+    if is_local:
+        console.print("[dim]Local backend detected; skipping HTTP traffic recording.[/dim]")
+    else:
+        console.print(f"[dim]Recording HTTP traffic to {cassette_path}[/dim]")
 
     console.print("\n[bold cyan]TINKER TRAINING[/bold cyan]")
     mode_desc = f"{args.mode}" + (f" ({args.env})" if args.env else "")
     console.print(f"Mode: {mode_desc}")
     if args.mode == "debate":
-        if args.dataset:
-            console.print(f"Dataset: {args.dataset}")
-        else:
-            console.print(f"Question: {args.question}")
+        console.print(f"Dataset: {args.dataset}" if args.dataset else f"Question: {args.question}")
     elif args.env == "confidence":
         console.print("Dataset: confidence/questions.json")
     elif args.env == "summary":
         console.print(f"Dataset: cnn_dailymail, reward_fn: {args.reward_fn}")
 
-    # Derive GRPO parameters
-    if args.num_rollouts % args.num_groups != 0:
-        console.print(f"[red]Error: --num-rollouts ({args.num_rollouts}) must be divisible by --num-groups ({args.num_groups})[/red]")
-        sys.exit(1)
-    group_size = args.num_rollouts // args.num_groups
-
     if args.mode == "debate":
+        if args.num_rollouts % args.num_groups != 0:
+            console.print(f"[red]Error: --num-rollouts ({args.num_rollouts}) must be divisible by --num-groups ({args.num_groups})[/red]")
+            sys.exit(1)
+        group_size = args.num_rollouts // args.num_groups
         if group_size % 2 != 0:
             console.print(f"[red]Error: group_size ({group_size}) must be even for debate (2 rollouts per debate)[/red]")
             sys.exit(1)
@@ -407,275 +458,54 @@ async def main():
     console.print(f"Run dir → {log_dir}")
     console.print()
 
-    # Record all HTTP traffic with VCR
-    with vcr_config.use_cassette(str(cassette_path)):
+    cassette_ctx = nullcontext()
+    if not is_local:
+        import vcr
+
+        vcr_config = vcr.VCR(
+            record_mode="new_episodes",  # Record new requests, replay existing
+            match_on=["method", "scheme", "host", "port", "path"],
+            serializer="yaml",
+        )
+        cassette_ctx = vcr_config.use_cassette(str(cassette_path))
+
+    # Record HTTP traffic only in API mode (local backend has no HTTP calls).
+    with cassette_ctx:
         console.print("[dim]Setting up Tinker client...[/dim]")
         from tinker_debate.tinker_client import TinkerDebateClient
 
         client = await TinkerDebateClient.create()
 
         from tinker_debate.debate_types import TrainingDatum
+        from tinker_debate.train.driver_context import DriverContext
+        from tinker_debate.train.driver_factory import build_driver
+        from tinker_debate.train.driver_types import TrainLogFns
 
-        if args.mode == "debate":
-            from tinker_debate.debate_env import (
-                DebateRolloutClient,
-                DebateTokenRolloutClient,
-                confidence_judge_r1,
-                mock_judge_random,
-                run_debate_batch_token_only,
+        log_fns = TrainLogFns(
+            save_debate_log=save_debate_log,
+            save_baseline_log=save_baseline_log,
+            save_summary_log=save_summary_log,
+        )
+        driver = build_driver(
+            ctx=DriverContext(
+                args=args,
+                client=client,
+                console=console,
+                log_dir=log_dir,
+                log_fns=log_fns,
             )
-            from tinker_debate.debate_types import DebateConfig, assemble_training_data_grpo, compute_training_stats
-        elif args.env == "confidence":
-            from tinker_debate.confidence.confidence_env import ConfidenceDataset, load_questions
-            from tinker_cookbook import renderers
-            import tinker
-        elif args.env == "summary":
-            from tinker_debate.summary import SummaryDataset, REWARD_FUNCTIONS
-            from tinker_debate.datasets import load_cnn_dailymail
-            from tinker_cookbook import renderers
-            import tinker
-
-        async def generate_fn(prompts, max_tokens, temp):
-            return await client.generate(prompts, max_tokens=max_tokens, temperature=temp)
-
-        rollout_client = None
-        token_rollout_client = None
-        config = None
-        judge_fn = None
-        baseline_dataset = None
-        baseline_renderer = None
-        summary_dataset = None
-        summary_renderer = None
-
-        if args.mode == "debate":
-            rollout_client = DebateRolloutClient(generate_fn=generate_fn)
-
-            async def sample_tokens_fn(prompt_tokens_list, max_tokens, temp):
-                return await client.sample_token_prompts(
-                    prompt_tokens_list=prompt_tokens_list,
-                    max_tokens=max_tokens,
-                    temperature=temp,
-                )
-
-            token_rollout_client = DebateTokenRolloutClient(
-                sample_fn=sample_tokens_fn,
-                decode_fn=lambda toks: client.tokenizer.decode(toks, skip_special_tokens=True),
-            )
-
-            config = DebateConfig.cheap()
-            if args.confidence_judge:
-                judge_fn = confidence_judge_r1
-            else:
-                judge_fn = mock_judge_random if args.mock_judge else None
-        elif args.env == "confidence":
-            questions_baseline = load_questions()
-            if len(questions_baseline) == 0:
-                raise ValueError("confidence/questions.json is empty")
-            baseline_renderer = renderers.get_renderer("qwen3_instruct", client.tokenizer)
-            baseline_dataset = ConfidenceDataset(
-                questions_baseline,
-                batch_size=args.num_rollouts,
-                group_size=1,
-                renderer=baseline_renderer,
-            )
-        elif args.env == "summary":
-            # Load CNN/DailyMail - use seed for reproducibility
-            n_samples = 1000 if args.dataset == "cnn_dailymail" else None  # limit for speed
-            articles = load_cnn_dailymail(n_samples=n_samples, seed=args.seed)
-            console.print(f"[dim]Loaded {len(articles)} articles from CNN/DailyMail[/dim]")
-            
-            summary_renderer = renderers.get_renderer("qwen3_instruct", client.tokenizer)
-            reward_fn = REWARD_FUNCTIONS[args.reward_fn]
-            summary_dataset = SummaryDataset(
-                articles=articles,
-                batch_size=args.num_rollouts,
-                group_size=1,
-                renderer=summary_renderer,
-                reward_fn=reward_fn,
-            )
+        )
 
         all_losses: list[float] = []
 
         for step in range(1, args.steps + 1):
             console.rule(f"[bold]Step {step}/{args.steps}[/bold]")
+            rollout_out = await driver.rollout_step(step=step)
+            for line in rollout_out.info_lines:
+                console.print(f"[dim]{line}[/dim]")
 
-            if args.mode == "debate":
-                console.print(f"[dim]Running {num_debates} debates (batched per-round, token-only)...[/dim]")
-            elif args.env == "confidence":
-                console.print(f"[dim]Running {args.num_rollouts} rollouts (single-turn confidence env)...[/dim]")
-            elif args.env == "summary":
-                console.print(f"[dim]Running {args.num_rollouts} rollouts (single-turn summary env, reward={args.reward_fn})...[/dim]")
-            t0 = time.time()
-
-            training_data: list[TrainingDatum] = []
-            rollout_time = 0.0
-
-            if args.mode == "debate":
-                if dataset:
-                    from tinker_debate.datasets import sample_questions
-                    step_seed = args.seed + step if args.seed is not None else None
-                    # Sample num_groups unique questions, repeat each group_size times
-                    unique_questions = sample_questions(dataset, args.num_groups, seed=step_seed)
-                    batch = [q for q in unique_questions for _ in range(group_size)]
-                else:
-                    batch = [(args.question, args.ground_truth) for _ in range(args.num_rollouts)]
-
-                debates = await run_debate_batch_token_only(
-                    batch,
-                    token_rollout_client,
-                    client.tokenizer,
-                    config,
-                    rollout_client,
-                    judge_fn=judge_fn,
-                )
-
-                for r in debates:
-                    save_debate_log(r, log_dir, config=config, model_name=client.model_name)
-
-                rollout_time = time.time() - t0
-                stats = compute_training_stats(debates)
-                console.print(
-                    f"[dim]Rollout time: {rollout_time:.1f}s | A:{stats['a_wins']} B:{stats['b_wins']} Invalid:{stats['invalid']}[/dim]"
-                )
-
-                training_data = assemble_training_data_grpo(debates)
-                console.print(f"Training data: {len(training_data)} datums from {len(debates)} debates")
-            elif args.env == "confidence":
-                assert baseline_dataset is not None
-                assert baseline_renderer is not None
-
-                batch_idx = (step - 1) % len(baseline_dataset)
-                env_group_builders = baseline_dataset.get_batch(batch_idx)
-                num_rollouts = len(env_group_builders)
-
-                for builder in env_group_builders:
-                    envs = await builder.make_envs()
-                    if len(envs) != 1:
-                        raise ValueError(f"Expected group_size=1, got {len(envs)}")
-                    env = envs[0]
-                    ob, stop = await env.initial_observation()
-                    sampling_params = tinker.SamplingParams(
-                        temperature=0.7,
-                        stop=stop,
-                        max_tokens=128,
-                    )
-                    resp = await client.sampling_client.sample_async(
-                        prompt=ob,
-                        num_samples=1,
-                        sampling_params=sampling_params,
-                    )
-                    seq = resp.sequences[0]
-                    if seq.logprobs is None:
-                        raise RuntimeError("Tinker sampling did not return completion logprobs (seq.logprobs is None)")
-                    completion_tokens = list(seq.tokens)
-                    completion_logprobs = list(seq.logprobs)
-
-                    step_result = await env.step(completion_tokens)
-
-                    record = {
-                        "tags": builder.logging_tags(),
-                        "prompt_tokens": ob.to_ints(),
-                        "completion_tokens": completion_tokens,
-                        "completion_logprobs": completion_logprobs,
-                        "reward": step_result.reward,
-                        "metrics": step_result.metrics,
-                    }
-                    save_baseline_log(record=record, log_dir=log_dir, model_name=client.model_name)
-
-                    if args.accept_require_parse and float(step_result.metrics["parse_success"]) != 1.0:
-                        continue
-                    if float(step_result.reward) < args.accept_min_reward:
-                        continue
-                    if len(completion_tokens) == 0:
-                        continue
-
-                    advantage = float(step_result.reward) / len(completion_tokens)
-                    training_data.append(
-                        TrainingDatum(
-                            prompt_tokens=ob.to_ints(),
-                            completion_tokens=completion_tokens,
-                            completion_logprobs=completion_logprobs,
-                            completion_advantages=[advantage] * len(completion_tokens),
-                            metadata={
-                                "mode": "single_turn",
-                                "env": "confidence",
-                                "tags": builder.logging_tags(),
-                                "parse_success": float(step_result.metrics["parse_success"]),
-                                "reward": float(step_result.reward),
-                            },
-                        )
-                    )
-
-                rollout_time = time.time() - t0
-                console.print(f"[dim]Rollout time: {rollout_time:.1f}s[/dim]")
-                console.print(f"Training data: {len(training_data)} datums (accepted) from {num_rollouts} rollouts")
-            elif args.env == "summary":
-                assert summary_dataset is not None
-                assert summary_renderer is not None
-
-                batch_idx = (step - 1) % len(summary_dataset)
-                env_group_builders = summary_dataset.get_batch(batch_idx)
-                num_rollouts = len(env_group_builders)
-
-                for builder in env_group_builders:
-                    envs = await builder.make_envs()
-                    if len(envs) != 1:
-                        raise ValueError(f"Expected group_size=1, got {len(envs)}")
-                    env = envs[0]
-                    ob, stop = await env.initial_observation()
-                    sampling_params = tinker.SamplingParams(
-                        temperature=0.7,
-                        stop=stop,
-                        max_tokens=256,  # summaries can be longer than confidence answers
-                    )
-                    resp = await client.sampling_client.sample_async(
-                        prompt=ob,
-                        num_samples=1,
-                        sampling_params=sampling_params,
-                    )
-                    seq = resp.sequences[0]
-                    if seq.logprobs is None:
-                        raise RuntimeError("Tinker sampling did not return completion logprobs (seq.logprobs is None)")
-                    completion_tokens = list(seq.tokens)
-                    completion_logprobs = list(seq.logprobs)
-
-                    step_result = await env.step(completion_tokens)
-
-                    record = {
-                        "tags": builder.logging_tags(),
-                        "prompt_tokens": ob.to_ints(),
-                        "completion_tokens": completion_tokens,
-                        "completion_logprobs": completion_logprobs,
-                        "reward": step_result.reward,
-                        "metrics": step_result.metrics,
-                    }
-                    save_summary_log(record=record, log_dir=log_dir, model_name=client.model_name)
-
-                    if float(step_result.reward) < args.accept_min_reward:
-                        continue
-                    if len(completion_tokens) == 0:
-                        continue
-
-                    advantage = float(step_result.reward) / len(completion_tokens)
-                    training_data.append(
-                        TrainingDatum(
-                            prompt_tokens=ob.to_ints(),
-                            completion_tokens=completion_tokens,
-                            completion_logprobs=completion_logprobs,
-                            completion_advantages=[advantage] * len(completion_tokens),
-                            metadata={
-                                "mode": "single_turn",
-                                "env": "summary",
-                                "tags": builder.logging_tags(),
-                                "reward": float(step_result.reward),
-                                "compression_ratio": step_result.metrics.get("compression_ratio", 0.0),
-                            },
-                        )
-                    )
-
-                rollout_time = time.time() - t0
-                console.print(f"[dim]Rollout time: {rollout_time:.1f}s[/dim]")
-                console.print(f"Training data: {len(training_data)} datums (accepted) from {num_rollouts} rollouts")
+            training_data: list[TrainingDatum] = rollout_out.training_data
+            rollout_time = float(rollout_out.rollout_time_s)
 
             if args.dry_run:
                 console.print("[yellow]DRY RUN - skipping training[/yellow]")
