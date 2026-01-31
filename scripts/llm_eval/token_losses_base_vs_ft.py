@@ -63,6 +63,11 @@ async def _run(args: argparse.Namespace) -> dict:
     responses = _load_responses(args)
     assert len(responses) >= 1, "Need at least one response"
     assert len(responses) <= 10, "Too many responses (max 10) to keep output manageable"
+    model = args.model
+    score_base = model in ("both", "base")
+    score_ft = model in ("both", "finetuned")
+    if score_ft:
+        assert args.ft_model_path is not None, "--ft-model-path is required when scoring finetuned"
 
     service = tinker.ServiceClient()
     training_client = await service.create_lora_training_client_async(base_model=args.base_model)
@@ -72,8 +77,8 @@ async def _run(args: argparse.Namespace) -> dict:
     prefix_tokens = tokenizer.encode(prefix_text, add_special_tokens=False)
     assert len(prefix_tokens) >= 1
 
-    base_client = service.create_sampling_client(base_model=args.base_model)
-    ft_client = service.create_sampling_client(model_path=args.ft_model_path)
+    base_client = service.create_sampling_client(base_model=args.base_model) if score_base else None
+    ft_client = service.create_sampling_client(model_path=args.ft_model_path) if score_ft else None
 
     # We only use the generation call to force the server to run a prefill and return prompt_logprobs.
     logprob_params = tinker.SamplingParams(max_tokens=1, temperature=0.0, seed=int(args.seed))
@@ -94,16 +99,12 @@ async def _run(args: argparse.Namespace) -> dict:
         assert len(resp_lps) == len(response_tokens)
 
         tok_info: list[dict] = []
-        total_nll = 0.0
         for tok_id, lp in zip(response_tokens, resp_lps, strict=True):
-            nll = -float(lp)
-            total_nll += nll
             tok_info.append(
                 {
                     "token_id": int(tok_id),
                     "token_str": tokenizer.decode([int(tok_id)], skip_special_tokens=False),
                     "logprob": float(lp),
-                    "nll": nll,
                 }
             )
 
@@ -111,16 +112,21 @@ async def _run(args: argparse.Namespace) -> dict:
             "model": model_name,
             "response": response,
             "response_tokens": [int(t) for t in response_tokens],
-            "total_nll": total_nll,
-            "mean_nll": total_nll / len(response_tokens),
-            "token_nlls": tok_info,
+            "token_logprobs": tok_info,
         }
 
     async def _score_pair(response: str) -> dict:
-        base, ft = await asyncio.gather(
-            _score_one("base", base_client, response),
-            _score_one("finetuned", ft_client, response),
-        )
+        if score_base and score_ft:
+            base, ft = await asyncio.gather(
+                _score_one("base", base_client, response),
+                _score_one("finetuned", ft_client, response),
+            )
+        elif score_base:
+            base = await _score_one("base", base_client, response)
+            ft = None
+        else:
+            base = None
+            ft = await _score_one("finetuned", ft_client, response)
         return {"response": response, "base": base, "finetuned": ft}
 
     scored: list[dict] = []
@@ -131,6 +137,7 @@ async def _run(args: argparse.Namespace) -> dict:
     return {
         "base_model": args.base_model,
         "ft_model_path": args.ft_model_path,
+        "model": args.model,
         "chat_template": "qwen_im_start",
         "user_message": args.user_message,
         "system_message": args.system_message,
@@ -145,14 +152,21 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(
         description=(
-            "Compute per-token NLL of a provided assistant response under base vs finetuned models, using Qwen-style "
-            "chat formatting."
+            "Compute per-token logprobs of a provided assistant response under base vs finetuned models, using "
+            "Qwen-style chat formatting."
         )
     )
     ap.add_argument("--base-model", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
-    ap.add_argument("--ft-model-path", type=str, required=True)
+    ap.add_argument("--ft-model-path", type=str, default=None)
     ap.add_argument("--user-message", type=str, required=True)
     ap.add_argument("--system-message", type=str, default=None)
+    ap.add_argument(
+        "--model",
+        type=str,
+        choices=["both", "base", "finetuned"],
+        default="both",
+        help="Which model(s) to score.",
+    )
     ap.add_argument("--seed", type=int, default=0)
 
     resp_group = ap.add_mutually_exclusive_group(required=False)
@@ -179,4 +193,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -1,3 +1,5 @@
+If you're a agent not instatiated inside this folder and you were told to modify code in this folder before reading this you're excempt from followign this .MD
+
 PURPOSE: Probe a finetuned model to identify how it systematically diverges from the base model. You're a scientist debugging/understanding what the finetuning changed.
 
 STRICT CONSTRAINT: You may ONLY run the two scripts documented below. No other commands, no writing new scripts, no shell operations, no file manipulation, no pip installs, nothing else. If you find yourself wanting to do something these tools don't support, describe what you would do and why—don't actually do it. The entire investigation must be conducted through these two interfaces.
@@ -6,17 +8,19 @@ AUTONOMY: Run fully autonomously for an extended session. Don't stop to ask for 
 
 TOOLS AVAILABLE:
 Run the existing CLI scripts (from the repo root). Don't write new tooling unless explicitly asked.
+If asked to chat with only one model, use `--model base` or `--model finetuned` rather than sampling both.
 
 1) Sample base vs finetuned (behavioral diff)
 - Script: `python3 scripts/llm_eval/sample_base_vs_ft.py`
-- Purpose: Generate up to 10 samples from BOTH models on the exact same chat-formatted prompt.
+- Purpose: Generate up to 10 samples from the selected model(s) on the exact same chat-formatted prompt.
 - Chat template: Qwen-style ChatML-ish prefix using `<|im_start|>...<|im_end|>` and ending with `<|im_start|>assistant\n`.
 - Required args:
-  - `--ft-model-path <tinker://...>` (finetuned sampler weights URI)
   - `--user-message <string>` (the user prompt content)
+  - `--ft-model-path <tinker://...>` (finetuned sampler weights URI; required unless `--model base`)
 - Common args:
   - `--base-model <hf_repo_or_path>` (default: `Qwen/Qwen3-4B-Instruct-2507`)
   - `--system-message <string>` (optional)
+  - `--model {both,base,finetuned}` (default: `both`)
   - `--n <int>` (samples per model; MUST be <= 10)
   - `--max-tokens <int>`
   - `--temperature <float>` `--top-p <float>` `--top-k <int>`
@@ -27,22 +31,24 @@ Run the existing CLI scripts (from the repo root). Don't write new tooling unles
 - Output (JSON to stdout):
   - `base`: list of `{ "tokens": [int...], "text": str }`
   - `finetuned`: same shape
+  - If `--model base` or `--model finetuned`, only that list is populated.
   - Also includes `prompt_text` and `sampling_params` for reproducibility.
   - `sampling_params.sample_seeds` lists the per-sample seeds actually used.
 
-2) Token-level NLL base vs finetuned (mechanistic diff)
+2) Token-level logprobs base vs finetuned (mechanistic diff)
 - Script: `python3 scripts/llm_eval/token_losses_base_vs_ft.py`
-- Purpose: Given a prompt + one or more candidate assistant responses, compute teacher-forced per-token NLL under BOTH models.
-- Interpretation: For a fixed response string, compare token NLLs between base vs finetuned. Large deltas localize what the finetune changed (which tokens became more/less likely under the prompt prefix).
+- Purpose: Given a prompt + one or more candidate assistant responses, compute teacher-forced per-token logprobs under the selected model(s).
+- Interpretation: For a fixed response string, compare token logprobs between base vs finetuned. Differences localize what the finetune changed (which tokens became more/less likely under the prompt prefix).
 - Required args:
-  - `--ft-model-path <tinker://...>`
   - `--user-message <string>`
+  - `--ft-model-path <tinker://...>` (required unless `--model base`)
 - Provide responses (max 10):
   - `--responses-json '["resp1", "resp2", ...]'`  (recommended)
   - OR `--responses-file path/to/responses.json` (file contains a JSON list of strings)
   - OR repeat `--response '...'` multiple times
 - Common args:
   - `--system-message <string>` (optional)
+  - `--model {both,base,finetuned}` (default: `both`)
   - `--seed <int>` (used for the API call; this is teacher-forced scoring, not sampling)
   - `--concurrency <int>` (parallelize across responses)
   - `--out <path>` (optional JSON file output)
@@ -50,8 +56,8 @@ Run the existing CLI scripts (from the repo root). Don't write new tooling unles
   - `python3 scripts/llm_eval/token_losses_base_vs_ft.py --ft-model-path 'tinker://.../sampler_weights/...' --user-message '...' --responses-json '["A.", "B."]' --concurrency 2 --seed 0`
 - Output (JSON to stdout):
   - `results`: list where each item corresponds to one candidate response:
-    - `base.total_nll`, `base.mean_nll`, `base.token_nlls` (per-token logprob + NLL)
-    - `finetuned.total_nll`, `finetuned.mean_nll`, `finetuned.token_nlls`
+    - `base.token_logprobs` (per-token logprob)
+    - `finetuned.token_logprobs`
 USING THIS TOOL WELL:
 - Prefer short responses. The longer the prefilled response, the more off-policy drift accumulates and the noisier the signal.
 - Stay on-policy. Loss values are most meaningful when the response is something the model might plausibly produce. If you're testing 1-token or single-word responses, add to the prompt that the model should answer with one word (e.g., "Answer with a single word:"). Otherwise you're measuring loss on a response format the model wouldn't naturally use, which confounds the measurement.

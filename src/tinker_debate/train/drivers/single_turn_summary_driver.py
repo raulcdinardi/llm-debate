@@ -1,3 +1,7 @@
+"""DEPRECATED: This driver path is unused.
+Use src/tinker_debate/train/orthogonal_driver.py with TaskSpec tasks instead.
+"""
+
 from __future__ import annotations
 
 import time

@@ -98,7 +98,7 @@ def parse_args():
         "--env",
         type=str,
         default=None,
-        choices=["qa", "confidence", "summary", "coin", "secret_word"],
+        choices=["qa", "confidence", "summary", "coin", "secret_word", "constrained_writing"],
         help="Task/env. Required if --mode=single_turn. Optional if --mode=debate (default: qa).",
     )
     parser.add_argument("-n", "--num-rollouts", type=int, default=16, help="Total rollouts per step")
@@ -143,6 +143,26 @@ def parse_args():
         type=str,
         default="compression",
         help="(summary only) Reward function for training. Can also use comma-sep weights like 'compression:0.5,rouge:0.3'.",
+    )
+    parser.add_argument(
+        "--constraint-rules-per-speaker",
+        type=int,
+        default=2,
+        help="(constrained_writing only) Number of rules sampled per speaker.",
+    )
+    parser.add_argument(
+        "--constraint-reward-scope",
+        type=str,
+        default="both",
+        choices=["alice", "bob", "both"],
+        help="(constrained_writing only) Which rules contribute to reward.",
+    )
+    parser.add_argument(
+        "--constraint-sides",
+        type=str,
+        default="both",
+        choices=["alice", "bob", "both"],
+        help="(constrained_writing only) Which speakers appear in the prompt.",
     )
     parser.add_argument(
         "--coin-target",
@@ -467,6 +487,13 @@ async def main():
         console.print("Dataset: confidence/questions.json")
     elif args.env == "summary":
         console.print(f"Dataset: cnn_dailymail, reward_fn: {args.reward_fn}")
+    elif args.env == "constrained_writing":
+        console.print(
+            "Constrained writing: "
+            f"rules_per_speaker={args.constraint_rules_per_speaker}, "
+            f"reward_scope={args.constraint_reward_scope}, "
+            f"sides={args.constraint_sides}"
+        )
 
     if args.mode == "debate":
         if args.num_rollouts % args.num_groups != 0:

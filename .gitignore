@@ -36,6 +36,7 @@ venv/
 
 # Misc
 .train.py.kate-swp
+*.kate-swp
 
 # Vendored upstream (kept locally, not tracked here)
 tinker-cookbook/

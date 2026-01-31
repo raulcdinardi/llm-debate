@@ -7,6 +7,7 @@ from tinker_debate.paradigms.debate import DebateParadigm
 from tinker_debate.paradigms.normal import NormalParadigm
 from tinker_debate.summary.rewards import RewardConfig
 from tinker_debate.tasks.coin_task import CoinTask
+from tinker_debate.tasks.constrained_writing_task import ConstrainedWritingTask
 from tinker_debate.tasks.confidence_task import ConfidenceTask
 from tinker_debate.tasks.qa_task import QATask
 from tinker_debate.tasks.secret_word_debate_task import SecretWordDebateTask
@@ -61,6 +62,14 @@ class OrthogonalDriver(RolloutDriver):
             if args.dataset == "cnn_dailymail":
                 raise ValueError("--dataset=cnn_dailymail is not a QA dataset")
             self.task = QATask.from_args(dataset_name=args.dataset, seed=args.seed)
+            self.normal_max_tokens = int(args.max_tokens)
+            self.normal_temperature = float(args.temperature)
+        elif task_name == "constrained_writing":
+            self.task = ConstrainedWritingTask.from_args(
+                rules_per_speaker=int(args.constraint_rules_per_speaker),
+                reward_scope=str(args.constraint_reward_scope),
+                sides=str(args.constraint_sides),
+            )
             self.normal_max_tokens = int(args.max_tokens)
             self.normal_temperature = float(args.temperature)
         elif task_name == "secret_word":
