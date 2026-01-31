@@ -52,11 +52,11 @@ class ConfidenceDriver:
                 raise ValueError(f"Expected group_size=1, got {len(envs)}")
             env = envs[0]
             ob, stop = await env.initial_observation()
-        sampling_params = tinker.SamplingParams(
-            temperature=float(args.temperature),
-            stop=stop,
-            max_tokens=int(args.max_tokens),
-        )
+            sampling_params = tinker.SamplingParams(
+                temperature=float(args.temperature),
+                stop=stop,
+                max_tokens=int(args.max_tokens),
+            )
             resp = await self.ctx.client.sampling_client.sample_async(
                 prompt=ob,
                 num_samples=1,
