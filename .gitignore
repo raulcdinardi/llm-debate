@@ -10,6 +10,22 @@ __pycache__/
 outputs/
 logs/
 logs_test/
+logs_remote/
+tinker_logs/
+logs_*.tgz
+tinker_logs_*.tgz
+tinker_logs_*/
+
+# Local artifacts
+data/
+models/
+results/
+squashfs-root/
+.tinker-local/
+tinker-local/
+.serena/
+20260121_*/
+outcodex.txt
 
 # IDE
 .vscode/

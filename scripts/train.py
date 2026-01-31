@@ -20,6 +20,7 @@ HTTP Recording:
 from __future__ import annotations
 
 import argparse
+import math
 import asyncio
 import atexit
 from contextlib import nullcontext
@@ -97,7 +98,7 @@ def parse_args():
         "--env",
         type=str,
         default=None,
-        choices=["qa", "confidence", "summary"],
+        choices=["qa", "confidence", "summary", "coin", "secret_word"],
         help="Task/env. Required if --mode=single_turn. Optional if --mode=debate (default: qa).",
     )
     parser.add_argument("-n", "--num-rollouts", type=int, default=16, help="Total rollouts per step")
@@ -141,8 +142,38 @@ def parse_args():
         "--reward-fn",
         type=str,
         default="compression",
-        choices=["compression", "rouge", "tfidf", "embedding", "length_penalty", "fluency"],
         help="(summary only) Reward function for training. Can also use comma-sep weights like 'compression:0.5,rouge:0.3'.",
+    )
+    parser.add_argument(
+        "--coin-target",
+        type=str,
+        default="Blue",
+        choices=["Red", "Blue"],
+        help="(coin env) Color treated as reward=1.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for rollouts.",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=1024,
+        help="Max new tokens for rollouts.",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        default=0.0,
+        help="Sampling min_p (local backend only; 0 disables).",
+    )
+    parser.add_argument(
+        "--replay-dir",
+        type=str,
+        default=None,
+        help="(single_turn only) Replay cached rollouts from summary_/baseline_ logs in this directory.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument(
@@ -152,18 +183,11 @@ def parse_args():
         help="Number of unique questions (groups) per step.",
     )
     parser.add_argument(
-        "--debate-train",
+        "--debate-reward",
         type=str,
-        default="rejection",
-        choices=["rejection", "rs_grpo"],
-        help="(debate only) Training data construction. 'rejection' trains only on winners. 'rs_grpo' does rejection sampling first, then GRPO over the surviving winners using a task reward.",
-    )
-    parser.add_argument(
-        "--debate-grpo-reward",
-        type=str,
-        default=None,
+        default="task",
         choices=["task"],
-        help="(debate only, rs_grpo) Reward definition for GRPO. Must be set when --debate-train=rs_grpo.",
+        help="(debate only) Reward definition for debate training data (centered across winners).",
     )
     return parser.parse_args()
 
@@ -174,7 +198,7 @@ def write_run_metadata(*, log_dir: Path, args: argparse.Namespace) -> None:
     env_keys = [
         "TINKER_LOCAL_BACKEND",
         "TINKER_LOCAL_SEED",
-        "TINKER_LOCAL_MICROBATCH",
+        "TINKER_LOCAL_GRAD_ACCUM_STEPS",
         "TINKER_LOCAL_DEVICE",
         "TINKER_LOCAL_LOAD_IN_4BIT",
         "TINKER_LOCAL_MAX_SEQ_LENGTH",
@@ -203,11 +227,6 @@ def write_run_metadata(*, log_dir: Path, args: argparse.Namespace) -> None:
 
         versions["transformers"] = transformers.__version__
 
-        if os.environ["TINKER_LOCAL_BACKEND"] == "unsloth":
-            import unsloth
-
-            if hasattr(unsloth, "__version__"):
-                versions["unsloth"] = str(unsloth.__version__)
 
     meta = {
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
@@ -260,6 +279,7 @@ def save_debate_log(result, log_dir: Path, config=None, model_name: str | None =
             "r1": traj.metrics.get("r1", ""),
             "r2": traj.metrics.get("r2", ""),
             "r3": traj.metrics.get("r3", ""),
+            "metrics": traj.metrics,
             "transitions": [
                 {
                     "round": t.round_num,
@@ -322,6 +342,7 @@ def save_training_step_log(
     fwd_bwd_result: dict,
     learning_rate: float,
     log_dir: Path,
+    debug_metrics: dict | None = None,
 ) -> Path:
     """Save training step log with exact data sent to API."""
 
@@ -363,6 +384,8 @@ def save_training_step_log(
         "results": fwd_bwd_result,
         "learning_rate": learning_rate,
     }
+    if debug_metrics is not None:
+        log_data["replay_debug"] = debug_metrics
 
     with open(log_path, "w") as f:
         json.dump(log_data, f, indent=2)
@@ -404,6 +427,14 @@ async def main():
     if args.mode == "single_turn" and args.env is None:
         console.print("[red]Error: --env is required when --mode=single_turn[/red]")
         sys.exit(1)
+    if args.replay_dir is not None and args.mode != "single_turn":
+        console.print("[red]Error: --replay-dir is only supported for --mode=single_turn[/red]")
+        sys.exit(1)
+    if args.replay_dir is not None:
+        replay_path = Path(args.replay_dir)
+        if not replay_path.exists():
+            console.print(f"[red]Error: --replay-dir not found: {replay_path}[/red]")
+            sys.exit(1)
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -500,6 +531,100 @@ async def main():
 
         all_losses: list[float] = []
 
+        def compute_stop_token_id():
+            stop = client.renderer.get_stop_sequences()
+            if stop is None:
+                return None
+            if isinstance(stop, list):
+                if len(stop) != 1:
+                    return None
+                stop = stop[0]
+            if isinstance(stop, int):
+                return int(stop)
+            if not isinstance(stop, str):
+                return None
+            tokens = client.tokenizer.encode(stop, add_special_tokens=False)
+            if len(tokens) != 1:
+                return None
+            return int(tokens[0])
+
+        async def compute_replay_debug_metrics(training_data: list[TrainingDatum]) -> dict:
+            prompt_tokens_batch = [d.prompt_tokens for d in training_data]
+            completion_tokens_batch = [d.completion_tokens for d in training_data]
+            completion_logprobs_batch = [d.completion_logprobs for d in training_data]
+
+            new_logprobs_batch = await client.compute_completion_logprobs(
+                prompt_tokens_batch=prompt_tokens_batch,
+                completion_tokens_batch=completion_tokens_batch,
+                completion_logprobs_batch=completion_logprobs_batch,
+            )
+
+            total_tokens = 0
+            sum_old = 0.0
+            sum_new = 0.0
+            sum_delta = 0.0
+            sum_ratio = 0.0
+
+            stop_token_id = compute_stop_token_id()
+            stop_old = []
+            stop_new = []
+            stop_token_logprobs_batch = None
+            if stop_token_id is not None:
+                stop_token_logprobs_batch = await client.compute_token_logprobs(
+                    prompt_tokens_batch=prompt_tokens_batch,
+                    completion_tokens_batch=completion_tokens_batch,
+                    token_id=stop_token_id,
+                )
+            stop_token_logprob_sum = 0.0
+            stop_token_logprob_count = 0
+
+            for idx, (comp_tokens, old_lps, new_lps) in enumerate(
+                zip(completion_tokens_batch, completion_logprobs_batch, new_logprobs_batch)
+            ):
+                if len(comp_tokens) != len(old_lps) or len(comp_tokens) != len(new_lps):
+                    raise ValueError("Completion length mismatch in replay debug metrics")
+
+                for o, n in zip(old_lps, new_lps):
+                    total_tokens += 1
+                    sum_old += float(o)
+                    sum_new += float(n)
+                    sum_delta += float(n - o)
+                    sum_ratio += float(math.exp(n - o))
+
+                if stop_token_id is not None and comp_tokens and comp_tokens[-1] == stop_token_id:
+                    stop_old.append(float(old_lps[-1]))
+                    stop_new.append(float(new_lps[-1]))
+
+                if stop_token_logprobs_batch is not None:
+                    stop_lps = stop_token_logprobs_batch[idx]
+                    if len(stop_lps) != len(comp_tokens):
+                        raise ValueError("Stop-token logprobs length mismatch in replay debug metrics")
+                    for lp in stop_lps:
+                        stop_token_logprob_sum += float(lp)
+                        stop_token_logprob_count += 1
+
+            metrics = {
+                "mean_old_logprob": sum_old / total_tokens if total_tokens else 0.0,
+                "mean_new_logprob": sum_new / total_tokens if total_tokens else 0.0,
+                "mean_delta_logprob": sum_delta / total_tokens if total_tokens else 0.0,
+                "mean_ratio": sum_ratio / total_tokens if total_tokens else 0.0,
+                "stop_token_id": stop_token_id,
+                "stop_count": len(stop_old),
+                "stop_old_logprob_mean": sum(stop_old) / len(stop_old) if stop_old else None,
+                "stop_new_logprob_mean": sum(stop_new) / len(stop_new) if stop_new else None,
+                "stop_delta_logprob_mean": (
+                    (sum(stop_new) / len(stop_new)) - (sum(stop_old) / len(stop_old))
+                    if stop_old
+                    else None
+                ),
+                "stop_token_logprob_mean": (
+                    stop_token_logprob_sum / stop_token_logprob_count
+                    if stop_token_logprob_count
+                    else None
+                ),
+            }
+            return metrics
+
         for step in range(1, args.steps + 1):
             console.rule(f"[bold]Step {step}/{args.steps}[/bold]")
             rollout_out = await driver.rollout_step(step=step)
@@ -524,6 +649,16 @@ async def main():
                 learning_rate=args.lr,
             )
 
+            debug_metrics = None
+            if args.replay_dir is not None:
+                debug_metrics = await compute_replay_debug_metrics(training_data)
+                console.print(
+                    f"[dim]Replay debug: mean_delta_logprob={debug_metrics['mean_delta_logprob']:.6g} "
+                    f"mean_ratio={debug_metrics['mean_ratio']:.6g} "
+                    f"stop_delta_logprob_mean={debug_metrics['stop_delta_logprob_mean']} "
+                    f"stop_token_logprob_mean={debug_metrics['stop_token_logprob_mean']}[/dim]"
+                )
+
             train_time = time.time() - t0
             loss = float(train_result.get("loss", 0.0))
             num_tokens = int(train_result.get("num_tokens", 0))
@@ -534,6 +669,7 @@ async def main():
                 fwd_bwd_result=train_result,
                 learning_rate=args.lr,
                 log_dir=log_dir,
+                debug_metrics=debug_metrics,
             )
             console.print(f"[dim]Logged: {step_log_path.name}[/dim]")
 

@@ -85,7 +85,7 @@ def load_gpqa(split: GPQASplit = "gpqa_diamond", seed: int | None = None) -> lis
     if seed is not None:
         random.seed(seed)
 
-    ds = load_dataset("Idavidrein/gpqa", split, split="train")
+    ds = load_dataset("Idavidrein/gpqa", split, split="train", trust_remote_code=True)
 
     formatted = [format_gpqa_question(row) for row in ds]
     return formatted
@@ -124,7 +124,7 @@ def load_cnn_dailymail(
     """
     from datasets import load_dataset
 
-    ds = load_dataset("ccdv/cnn_dailymail", "3.0.0", split=split)
+    ds = load_dataset("cnn_dailymail", "3.0.0", split=split)
 
     if seed is not None:
         random.seed(seed)

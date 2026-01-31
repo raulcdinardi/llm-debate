@@ -11,14 +11,32 @@ Uses async Tinker API throughout for better performance.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any, Literal
 
-import tinker
-from tinker import types as tinker_types
+from tinker_debate.tinker_sdk import tinker
 
-from tinker_cookbook.renderers import Qwen3InstructRenderer
+import importlib
+
+tinker_types = importlib.import_module(f"{tinker.__name__}.types")
+
+from .local_renderers import Qwen3InstructStopRenderer
 
 LossFn = Literal["cross_entropy", "importance_sampling", "ppo", "cispo", "dro"]
+
+
+@dataclass(frozen=True)
+class BackendConfig:
+    """Backend invariants resolved once per client."""
+
+    is_local: bool
+    stop_sequences: list[int] | None
+
+    @staticmethod
+    def resolve(tokenizer: Any) -> "BackendConfig":
+        is_local = os.environ.get("TINKER_BACKEND") == "local" or "TINKER_LOCAL_BACKEND" in os.environ
+        stop = Qwen3InstructStopRenderer(tokenizer).get_stop_sequences()
+        return BackendConfig(is_local=is_local, stop_sequences=stop)
 
 
 def serialize_response(response: Any, sequence_idx: int = 0) -> dict:
@@ -91,17 +109,33 @@ class TinkerDebateClient:
     training_client: tinker.TrainingClient
     sampling_client: tinker.SamplingClient
     tokenizer: Any  # HuggingFace tokenizer
-    renderer: Qwen3InstructRenderer
+    renderer: Qwen3InstructStopRenderer
     model_name: str
+    backend: BackendConfig
+
+    def _build_sampling_params(
+        self, *, max_tokens: int | None, temperature: float, stop: list[int] | None
+    ) -> tinker.SamplingParams:
+        """Use explicit params so text/token paths are identical."""
+        return tinker.SamplingParams(
+            temperature=float(temperature),
+            stop=stop,
+            max_tokens=max_tokens,
+            top_k=-1,
+            top_p=1.0,
+        )
 
     @classmethod
     async def create(
         cls, model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
     ) -> "TinkerDebateClient":
+        if "TINKER_DEBATE_BASE_MODEL" in os.environ:
+            model_name = os.environ["TINKER_DEBATE_BASE_MODEL"]
         service = tinker.ServiceClient()
         training_client = await service.create_lora_training_client_async(base_model=model_name)
         tokenizer = training_client.get_tokenizer()
-        renderer = Qwen3InstructRenderer(tokenizer)
+        renderer = Qwen3InstructStopRenderer(tokenizer)
+        backend = BackendConfig.resolve(tokenizer)
         sampling_client = await training_client.save_weights_and_get_sampling_client_async("debate_init")
 
         return cls(
@@ -111,6 +145,7 @@ class TinkerDebateClient:
             tokenizer=tokenizer,
             renderer=renderer,
             model_name=model_name,
+            backend=backend,
         )
 
     async def generate(
@@ -131,8 +166,7 @@ class TinkerDebateClient:
         """
         import asyncio
 
-        stop_strings = self.renderer.get_stop_sequences()
-        stop = stop_strings if (stop_strings and isinstance(stop_strings[0], str)) else None
+        stop = self.backend.stop_sequences
 
         prompt_tokens_list: list[list[int]] = []
         sample_coros = []
@@ -143,12 +177,7 @@ class TinkerDebateClient:
             prompt_tokens_list.append(prompt_tokens)
 
             model_input = tinker.ModelInput.from_ints(prompt_tokens)
-            sampling_params = tinker.SamplingParams(
-                temperature=temperature,
-                stop=stop,
-            )
-            if max_tokens is not None:
-                sampling_params.max_tokens = max_tokens
+            sampling_params = self._build_sampling_params(max_tokens=max_tokens, temperature=temperature, stop=stop)
 
             # Don't await yet - just create the coroutine
             sample_coros.append(
@@ -210,6 +239,8 @@ class TinkerDebateClient:
         prompt_tokens_list: list[list[int]],
         max_tokens: int | None = None,
         temperature: float = 0.8,
+        min_p: float = 0.0,
+        strict_sampling: bool = False,
     ) -> list[tuple[list[int], list[int], list[float], dict] | None]:
         """Sample completions from tokenized prompts (async).
 
@@ -218,40 +249,50 @@ class TinkerDebateClient:
         """
         import asyncio
 
-        stop_strings = self.renderer.get_stop_sequences()
-        stop = stop_strings if (stop_strings and isinstance(stop_strings[0], str)) else None
+        stop = self.backend.stop_sequences
 
-        sample_coros = []
-        for prompt_tokens in prompt_tokens_list:
-            model_input = tinker.ModelInput.from_ints(prompt_tokens)
-            sampling_params = tinker.SamplingParams(
-                temperature=temperature,
-                stop=stop,
+        min_p = float(min_p)
+        if not (0.0 <= min_p <= 1.0):
+            raise ValueError(f"min_p must be in [0,1], got {min_p}")
+        if min_p > 0.0:
+            if not self.backend.is_local:
+                raise ValueError("min_p is only supported in the local backend.")
+
+        sampling_params = self._build_sampling_params(max_tokens=max_tokens, temperature=temperature, stop=stop)
+
+        if self.backend.is_local:
+            responses = await self.sampling_client.sample_token_batch_async(
+                prompt_tokens_list=prompt_tokens_list,
+                sampling_params=sampling_params,
             )
-            if max_tokens is not None:
-                sampling_params.max_tokens = max_tokens
-
-            sample_coros.append(
-                self.sampling_client.sample_async(
-                    prompt=model_input,
-                    num_samples=1,
-                    sampling_params=sampling_params,
+        else:
+            sample_coros = []
+            for prompt_tokens in prompt_tokens_list:
+                model_input = tinker.ModelInput.from_ints(prompt_tokens)
+                sample_coros.append(
+                    self.sampling_client.sample_async(
+                        prompt=model_input,
+                        num_samples=1,
+                        sampling_params=sampling_params,
+                    )
                 )
-            )
 
-        responses = []
-        for i, coro in enumerate(sample_coros):
-            try:
-                resp = await coro
-                responses.append(resp)
-            except Exception as e:
-                print(f"\n{'!'*60}")
-                print(f"!!! SAMPLING REQUEST FAILED: {type(e).__name__}: {e}")
-                print(f"!!! Prompt {i+1}/{len(sample_coros)} will be skipped")
-                print(f"{'!'*60}\n")
-                responses.append(None)
-            if i < len(sample_coros) - 1:
-                await asyncio.sleep(1.0)
+            responses = []
+            for i, coro in enumerate(sample_coros):
+                try:
+                    resp = await coro
+                    responses.append(resp)
+                except Exception as e:
+                    print(f"\n{'!'*60}")
+                    print(f"!!! SAMPLING REQUEST FAILED: {type(e).__name__}: {e}")
+                    print(f"!!! Prompt {i+1}/{len(sample_coros)} will be skipped")
+                    print(f"{'!'*60}\n")
+                    # strict_sampling=True is for failure-intolerant call sites (e.g., judge); otherwise we keep alignment by inserting None.
+                    if strict_sampling:
+                        raise
+                    responses.append(None)
+                if i < len(sample_coros) - 1:
+                    await asyncio.sleep(1.0)
 
         results: list[tuple[list[int], list[int], list[float], dict] | None] = []
         for prompt_tokens, resp in zip(prompt_tokens_list, responses):
@@ -364,7 +405,7 @@ class TinkerDebateClient:
                 new_lp = new_lps[j]
                 adv = comp_advs[j - completion_start]
 
-                if adv > 0:
+                if adv != 0:
                     ratio = torch.exp(torch.tensor(new_lp - old_lp))
                     total_loss += float((-ratio * adv).item())
                     num_trained_tokens += 1
@@ -381,6 +422,109 @@ class TinkerDebateClient:
             "num_trained_tokens": num_trained_tokens,
             "metrics": metrics,
         }
+
+    async def compute_completion_logprobs(
+        self,
+        *,
+        prompt_tokens_batch: list[list[int]],
+        completion_tokens_batch: list[list[int]],
+        completion_logprobs_batch: list[list[float]],
+        loss_fn: LossFn = "cross_entropy",
+    ) -> list[list[float]]:
+        """Compute model logprobs for given completions (no optim step)."""
+
+        import torch
+
+        data: list[tinker_types.Datum] = []
+
+        for prompt_toks, comp_toks, comp_lps in zip(
+            prompt_tokens_batch,
+            completion_tokens_batch,
+            completion_logprobs_batch,
+        ):
+            if len(comp_toks) != len(comp_lps):
+                raise ValueError(
+                    f"Length mismatch: tokens={len(comp_toks)}, logprobs={len(comp_lps)}"
+                )
+
+            full_tokens = prompt_toks + comp_toks
+            input_tokens = full_tokens[:-1]
+            target_tokens = full_tokens[1:]
+
+            prompt_len = len(prompt_toks)
+            adv_tensor = [0.0] * (prompt_len - 1) + [0.0] * len(comp_toks)
+            sampling_logprobs = [0.0] * (prompt_len - 1) + list(comp_lps)
+
+            data.append(
+                tinker_types.Datum(
+                    model_input=tinker.ModelInput.from_ints(input_tokens),
+                    loss_fn_inputs={
+                        "target_tokens": tinker_types.TensorData.from_torch(
+                            torch.tensor(target_tokens)
+                        ),
+                        "logprobs": tinker_types.TensorData.from_torch(
+                            torch.tensor(sampling_logprobs, dtype=torch.float32)
+                        ),
+                        "advantages": tinker_types.TensorData.from_torch(
+                            torch.tensor(adv_tensor, dtype=torch.float32)
+                        ),
+                    },
+                )
+            )
+
+        fwd_bwd_future = await self.training_client.forward_backward_async(data, loss_fn)
+        fwd_bwd_out = await fwd_bwd_future
+
+        out_logprobs: list[list[float]] = []
+        for i, out in enumerate(fwd_bwd_out.loss_fn_outputs):
+            if "logprobs" not in out:
+                raise RuntimeError("forward_backward output missing 'logprobs'")
+            new_lps = out["logprobs"].data
+            prompt_len = len(prompt_tokens_batch[i])
+            completion_start = prompt_len - 1
+            out_logprobs.append(list(new_lps[completion_start:]))
+
+        return out_logprobs
+
+    async def compute_token_logprobs(
+        self,
+        *,
+        prompt_tokens_batch: list[list[int]],
+        completion_tokens_batch: list[list[int]],
+        token_id: int,
+    ) -> list[list[float]]:
+        """Compute logprob of a fixed token at each completion position (local-only)."""
+
+        if "TINKER_LOCAL_BACKEND" not in os.environ:
+            raise RuntimeError("compute_token_logprobs is local-only; set TINKER_LOCAL_BACKEND.")
+
+        input_tokens_batch: list[list[int]] = []
+        completion_slices: list[tuple[int, int]] = []
+
+        for prompt_toks, comp_toks in zip(prompt_tokens_batch, completion_tokens_batch):
+            full_tokens = prompt_toks + comp_toks
+            if len(full_tokens) < 2:
+                raise ValueError("Need at least 2 tokens to compute per-position logprobs.")
+            input_tokens_batch.append(full_tokens[:-1])
+            completion_start = len(prompt_toks) - 1
+            completion_slices.append((completion_start, len(comp_toks)))
+
+        fut = await self.training_client.score_token_logprobs_async(
+            input_tokens_list=input_tokens_batch,
+            token_id=int(token_id),
+        )
+        logprobs_batch = await fut
+
+        out: list[list[float]] = []
+        for logprobs, (start, n) in zip(logprobs_batch, completion_slices):
+            if n == 0:
+                out.append([])
+                continue
+            if len(logprobs) < start + n:
+                raise ValueError("Token logprobs shorter than expected completion slice.")
+            out.append(list(logprobs[start : start + n]))
+
+        return out
 
     async def optim_step(self, learning_rate: float = 1e-5) -> None:
         fut = await self.training_client.optim_step_async(
@@ -481,7 +625,7 @@ class TinkerDebateClient:
                 old_lp = old_lps[j]
                 new_lp = new_lps[j]
                 adv = comp_advs[j - completion_start]
-                if adv > 0:
+                if adv != 0:
                     ratio = torch.exp(torch.tensor(new_lp - old_lp))
                     total_loss += float((-ratio * adv).item())
                     num_trained_tokens += 1

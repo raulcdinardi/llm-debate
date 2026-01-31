@@ -15,8 +15,11 @@ import random
 import re
 from dataclasses import dataclass
 from typing import Awaitable, Callable
+import logging
 
 from .debate_types import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
+
+logger = logging.getLogger(__name__)
 
 
 def parse_confidence(text: str) -> float | None:
@@ -69,7 +72,8 @@ def _im_end() -> str:
 
 def build_r1_prompt(question: str, config: DebateConfig) -> str:
     return (
-        _im_start("system")
+        config.chat_preamble
+        + _im_start("system")
         + config.system_propose
         + "\n"
         + _im_end()
@@ -104,11 +108,18 @@ def build_judge_prompt(
     config: DebateConfig,
     strict: bool = False,
 ) -> str:
-    extra = "\n\nIMPORTANT: Output ONLY the tags. No extra text." if strict else ""
+    extra = (
+        "\n\nIMPORTANT: Output ONLY the tags. "
+        "VERDICT must be A or B (agent labels), never answer options like C/D. "
+        "If tied, choose A."
+        if strict
+        else ""
+    )
     system = config.system_judge + extra
 
     return (
-        _im_start("system")
+        config.chat_preamble
+        + _im_start("system")
         + system
         + "\n"
         + _im_end()
@@ -130,6 +141,8 @@ def build_judge_prompt(
         + f"{r3_b}\n\n"
         + "Based on the debate above, which agent made a more convincing case?\n"
         + "Consider: solution correctness, argument quality, rebuttal effectiveness.\n"
+        + "VERDICT must be exactly A or B (agent labels), not an answer option.\n"
+        + "If tied, choose A.\n"
         + _im_end()
         + _im_start("assistant")
     )
@@ -170,9 +183,9 @@ class DebateRolloutClient:
         results = []
         for i, r in enumerate(raw_results):
             if r is None:
-                print(f"\n{'!'*60}")
-                print(f"!!! REQUEST {i+1}/{len(raw_results)} RETURNED NONE - DEBATE WILL BE INVALID")
-                print(f"{'!'*60}\n")
+                msg = f"REQUEST {i+1}/{len(raw_results)} RETURNED NONE - DEBATE WILL BE INVALID"
+                print(f"\n{'!'*60}\n!!! {msg}\n{'!'*60}\n")
+                logger.warning(msg)
                 results.append(FAILED_RESULT)
             else:
                 results.append(r)
@@ -202,9 +215,9 @@ class DebateTokenRolloutClient:
         results: list[tuple[list[int], list[int], list[float], dict]] = []
         for i, r in enumerate(raw_results):
             if r is None:
-                print(f"\n{'!'*60}")
-                print(f"!!! TOKEN SAMPLING REQUEST {i+1}/{len(raw_results)} RETURNED NONE - DEBATE WILL BE INVALID")
-                print(f"{'!'*60}\n")
+                msg = f"TOKEN SAMPLING REQUEST {i+1}/{len(raw_results)} RETURNED NONE - DEBATE WILL BE INVALID"
+                print(f"\n{'!'*60}\n!!! {msg}\n{'!'*60}\n")
+                logger.warning(msg)
                 results.append(FAILED_TOKEN_RESULT)
             else:
                 results.append(r)
@@ -405,7 +418,7 @@ async def run_debate_batch_token_only(
             )
             verdicts.append(v)
             reasons.append(r)
-            judge_metas.append({})
+            judge_metas.append({"retry": False})
             judge_prompt_tokens_list.append(None)
             judge_completion_tokens_list.append(None)
             judge_completion_logprobs_list.append(None)
@@ -435,11 +448,26 @@ async def run_debate_batch_token_only(
         for judge_text, j_prompt_toks, j_comp_toks, j_lps, j_raw in judge_results:
             verdicts.append(extract_verdict(judge_text))
             reasons.append(extract_reasoning(judge_text))
-            judge_metas.append({})
+            judge_metas.append({"retry": False})
             judge_prompt_tokens_list.append(j_prompt_toks)
             judge_completion_tokens_list.append(j_comp_toks)
             judge_completion_logprobs_list.append(j_lps)
             judge_raw_response_list.append(j_raw)
+
+        invalid_indices = [
+            i
+            for i, v in enumerate(verdicts)
+            if v == "INVALID"
+            and judge_raw_response_list[i] is not None
+            and judge_raw_response_list[i].get("error") != "request_failed"
+        ]
+        for idx in invalid_indices:
+            failed_debate_indices.add(idx)
+            print(f"\n{'!'*60}")
+            print(f"!!! JUDGE INVALID VERDICT at debate {idx} - dropping rollout")
+            print(f"{'!'*60}\n")
+            # Keep alignment but drop learning signal for this debate.
+            reasons[idx] = "[JUDGE INVALID]"
 
     print(f"[debate] Done: {time.time() - t0:.1f}s total")
 
@@ -595,14 +623,12 @@ async def llm_judge(
     r3_b: str,
     config: DebateConfig,
 ) -> tuple[Verdict, str, dict, list[int], list[int], list[float], dict]:
-    """LLM judge (single-pass, no retry, async).
-
-    If parsing fails, we raise to avoid silently corrupting training / analysis.
+    """LLM judge with one retry on invalid verdicts.
 
     Returns: (verdict, reasoning, meta, prompt_tokens, completion_tokens, completion_logprobs, raw_response)
     """
 
-    meta: dict[str, object] = {}
+    meta: dict[str, object] = {"retry": False}
 
     prompt = build_judge_prompt(
         question=question,
@@ -622,6 +648,11 @@ async def llm_judge(
 
     verdict = extract_verdict(judge_text)
     reasoning = extract_reasoning(judge_text)
+    if verdict == "INVALID" and raw_response.get("error") != "request_failed":
+        print(f"\n{'!'*60}")
+        print("!!! JUDGE INVALID VERDICT - dropping rollout")
+        print(f"{'!'*60}\n")
+
     return verdict, reasoning, meta, prompt_tokens, completion_tokens, completion_logprobs, raw_response
 
 
@@ -947,7 +978,7 @@ async def run_debate_batch(
             v, r = judge_fn(q, r1_text_a[idx], r1_text_b[idx], r2_text_a[idx], r2_text_b[idx], r3_text_a[idx], r3_text_b[idx])
             verdicts.append(v)
             reasons.append(r)
-            judge_metas.append({})
+            judge_metas.append({"retry": False})
             judge_prompt_tokens_list.append(None)
             judge_completion_tokens_list.append(None)
             judge_completion_logprobs_list.append(None)
@@ -975,18 +1006,35 @@ async def run_debate_batch(
         for i, r in enumerate(judge_results):
             if r[4].get("error") == "request_failed":
                 failed_debate_indices.add(i)
-                print(f"!!! Judge result {i} failed -> debate {i} marked INVALID")
+                msg = f"Judge result {i} failed -> debate {i} marked INVALID"
+                print(f"{msg}")
+                logger.warning(msg)
 
         for judge_text, j_prompt_toks, j_comp_toks, j_lps, j_raw in judge_results:
             v = extract_verdict(judge_text)
             reason = extract_reasoning(judge_text)
             verdicts.append(v)
             reasons.append(reason)
-            judge_metas.append({})
+            judge_metas.append({"retry": False})
             judge_prompt_tokens_list.append(j_prompt_toks)
             judge_completion_tokens_list.append(j_comp_toks)
             judge_completion_logprobs_list.append(j_lps)
             judge_raw_response_list.append(j_raw)
+
+        invalid_indices = [
+            i
+            for i, v in enumerate(verdicts)
+            if v == "INVALID"
+            and judge_raw_response_list[i] is not None
+            and judge_raw_response_list[i].get("error") != "request_failed"
+        ]
+        for idx in invalid_indices:
+            failed_debate_indices.add(idx)
+            print(f"\n{'!'*60}")
+            print(f"!!! JUDGE INVALID VERDICT at debate {idx} - dropping rollout")
+            print(f"{'!'*60}\n")
+            # Preserve ordering but mark debate unusable for training.
+            reasons[idx] = "[JUDGE INVALID]"
 
     results: list[DebateResult] = []
     for idx, (q, gt) in enumerate(questions):

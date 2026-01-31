@@ -11,8 +11,9 @@ Key design:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
+from tinker_debate.prompts import load_prompt
 
 Verdict = Literal["A", "B", "INVALID"]
 
@@ -102,62 +103,16 @@ class DebateConfig:
     learning_rate: float = 1e-5
 
     # Prompts / templates (move hardcoding out of env)
-    system_propose: str = (
-        "You are participating in a 3-round debate.\n"
-        "Round 1 is your INITIAL SOLUTION. You must commit to a solution now.\n"
-        "In later rounds you will argue for your solution and refute your opponent.\n\n"
-        "For Round 1, provide your answer and your confidence in the following format:\n\n"
-        "<SOLUTION>[Your final answer]</SOLUTION>\n"
-        "<CONFIDENCE>[0.0 to 1.0]</CONFIDENCE>\n\n"
-        "The confidence must be your best estimate of the probability that your <SOLUTION> is correct.\n"
-        "Output ONLY these tags."
-    )
-
-    system_argue: str = (
-        "You are in a debate. Your solution is FIXED and cannot change.\n"
-        "Your goal: convince the judge your solution is correct.\n\n"
-        "- Defend your reasoning\n"
-        "- Point out flaws in opponent's approach\n"
-        "- Be persuasive but accurate\n\n"
-        "Do NOT change your solution. Only argue for it."
-    )
-
-    system_judge: str = (
-        "You are a judge evaluating a debate between two solvers.\n\n"
-        "Read the full transcript:\n"
-        "- Round 1: Both solvers propose solutions\n"
-        "- Round 2: Both argue for their solutions\n"
-        "- Round 3: Both respond to criticism\n\n"
-        "Evaluate:\n"
-        "1. Which solution is more likely correct?\n"
-        "2. Which debater made stronger arguments?\n"
-        "3. Who addressed criticisms better?\n\n"
-        "Output your verdict:\n"
-        "<VERDICT>[A or B]</VERDICT>\n"
-        "<REASONING>[Brief explanation]</REASONING>"
-    )
-
-    r2_user_template: str = (
-        "Round 2 (Argument): Your solution is FIXED and cannot change.\n"
-        "Another solver proposed this solution:\n{opponent_r1}\n\n"
-        "Your task:\n"
-        "- Argue why your Round 1 solution is correct\n"
-        "- Refute the opponent's solution\n\n"
-        "Do NOT repeat the <SOLUTION>/<CONFIDENCE> tags. Write an argument."
-    )
-
-    r3_user_template: str = (
-        "Round 3 (Response): Your solution is still FIXED and cannot change.\n"
-        "They responded:\n{opponent_r2}\n\n"
-        "Your task:\n"
-        "- Respond to their criticisms\n"
-        "- Make your final case for why your solution is correct\n\n"
-        "Do NOT repeat the <SOLUTION>/<CONFIDENCE> tags. Write an argument."
-    )
+    system_propose: str = load_prompt("debate/system_propose.md")
+    system_argue: str = load_prompt("debate/system_argue.md")
+    system_judge: str = load_prompt("debate/system_judge.md")
+    r2_user_template: str = load_prompt("debate/r2_user_template.md")
+    r3_user_template: str = load_prompt("debate/r3_user_template.md")
+    chat_preamble: str = ""
 
     @staticmethod
-    def cheap() -> "DebateConfig":
-        return DebateConfig(max_tokens_per_turn=None, temperature=0.7)
+    def cheap(*, chat_preamble: str = "") -> "DebateConfig":
+        return DebateConfig(max_tokens_per_turn=None, temperature=0.7, chat_preamble=chat_preamble)
 
 
 @dataclass
@@ -171,81 +126,128 @@ class TrainingDatum:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def assemble_training_data(debates: list[DebateResult]) -> list[TrainingDatum]:
-    """Convert debate results into training data.
+def _merge_rounds_with_centered_reward(
+    *,
+    debate: DebateResult,
+    winner: DebateTrajectory,
+    reward: float,
+    mean_reward: float,
+    group_size: int | None,
+) -> TrainingDatum:
+    """Merge a 3-round trajectory into one TrainingDatum using centered rewards."""
 
-    Winner-only (rejection sampling). Merges all rounds into a single datum per winner using
-    the extension property:
+    if len(winner.transitions) != 3:
+        raise ValueError(f"Expected 3 rounds, got {len(winner.transitions)}")
 
-      r1_comp + r2_cont + r2_comp + r3_cont + r3_comp
+    t1, t2, t3 = winner.transitions
 
-    Continuation tokens get advantage=0 and logprob=0.
+    for t in (t1, t2, t3):
+        if len(t.completion_tokens) != len(t.completion_logprobs):
+            raise ValueError(
+                f"Completion/logprob length mismatch in round {t.round_num}: "
+                f"{len(t.completion_tokens)} vs {len(t.completion_logprobs)}"
+            )
+
+    # Extension property checks + continuation slices
+    r1_full_len = len(t1.prompt_tokens) + len(t1.completion_tokens)
+    if len(t2.prompt_tokens) < r1_full_len:
+        raise ValueError("R2 prompt shorter than R1 history; extension property violated.")
+    r2_continuation_tokens = t2.prompt_tokens[r1_full_len:]
+
+    r2_full_len = len(t2.prompt_tokens) + len(t2.completion_tokens)
+    if len(t3.prompt_tokens) < r2_full_len:
+        raise ValueError("R3 prompt shorter than R2 history; extension property violated.")
+    r3_continuation_tokens = t3.prompt_tokens[r2_full_len:]
+
+    merged_completion = (
+        t1.completion_tokens
+        + r2_continuation_tokens
+        + t2.completion_tokens
+        + r3_continuation_tokens
+        + t3.completion_tokens
+    )
+
+    merged_logprobs = (
+        list(t1.completion_logprobs)
+        + [0.0] * len(r2_continuation_tokens)
+        + list(t2.completion_logprobs)
+        + [0.0] * len(r3_continuation_tokens)
+        + list(t3.completion_logprobs)
+    )
+
+    total_generated_tokens = (
+        len(t1.completion_tokens) + len(t2.completion_tokens) + len(t3.completion_tokens)
+    )
+    if total_generated_tokens <= 0:
+        raise ValueError("Winner trajectory has zero generated tokens.")
+
+    centered_reward = reward - mean_reward
+    advantage_value = centered_reward / total_generated_tokens
+
+    merged_advantages = (
+        [advantage_value] * len(t1.completion_tokens)
+        + [0.0] * len(r2_continuation_tokens)
+        + [advantage_value] * len(t2.completion_tokens)
+        + [0.0] * len(r3_continuation_tokens)
+        + [advantage_value] * len(t3.completion_tokens)
+    )
+
+    return TrainingDatum(
+        prompt_tokens=t1.prompt_tokens,
+        completion_tokens=merged_completion,
+        completion_logprobs=merged_logprobs,
+        completion_advantages=merged_advantages,
+        metadata={
+            "question": debate.question[:100],
+            "agent": winner.agent,
+            "verdict": debate.verdict,
+            "reward": reward,
+            "centered_reward": centered_reward,
+            "group_mean_reward": mean_reward,
+            "group_size": group_size,
+            "rounds_merged": 3,
+        },
+    )
+
+
+def assemble_training_data_grpo(
+    debates: list[DebateResult],
+    reward_fn: Callable[[DebateTrajectory, DebateResult], float],
+) -> list[TrainingDatum]:
+    """Winner-only assembly with reward centering per question (GRPO-style).
+
+    Args:
+        debates: List of debate results (should contain multiple debates per question for grouping)
+        reward_fn: Reward function (trajectory, debate) -> float. Must be explicit.
     """
 
-    data: list[TrainingDatum] = []
-
+    # Group winners by question.
+    groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
     for debate in debates:
-        # Safety: only accept A/B
         if debate.verdict not in ("A", "B"):
             continue
-
         winner = debate.get_winner_trajectory()
+        reward = reward_fn(winner, debate)
+        groups.setdefault(debate.question, []).append((winner, debate, reward))
 
-        total_model_tokens = winner.total_completion_tokens
-        if total_model_tokens <= 0:
+    data: list[TrainingDatum] = []
+    for question, group in groups.items():
+        if len(group) == 0:
             continue
 
-        advantage = 1.0 / total_model_tokens
+        rewards = [r for _, _, r in group]
+        mean_reward = sum(rewards) / len(rewards)
+        group_size = len(group)
 
-        if len(winner.transitions) != 3:
-            raise ValueError(f"Expected 3 rounds, got {len(winner.transitions)}")
-        t1, t2, t3 = winner.transitions
-
-        # Extract continuation tokens via extension property.
-        r1_full_len = len(t1.prompt_tokens) + len(t1.completion_tokens)
-        r2_continuation_tokens = t2.prompt_tokens[r1_full_len:]
-
-        r2_full_len = len(t2.prompt_tokens) + len(t2.completion_tokens)
-        r3_continuation_tokens = t3.prompt_tokens[r2_full_len:]
-
-        merged_completion = (
-            t1.completion_tokens
-            + r2_continuation_tokens
-            + t2.completion_tokens
-            + r3_continuation_tokens
-            + t3.completion_tokens
-        )
-
-        merged_logprobs = (
-            list(t1.completion_logprobs)
-            + [0.0] * len(r2_continuation_tokens)
-            + list(t2.completion_logprobs)
-            + [0.0] * len(r3_continuation_tokens)
-            + list(t3.completion_logprobs)
-        )
-
-        merged_advantages = (
-            [advantage] * len(t1.completion_tokens)
-            + [0.0] * len(r2_continuation_tokens)
-            + [advantage] * len(t2.completion_tokens)
-            + [0.0] * len(r3_continuation_tokens)
-            + [advantage] * len(t3.completion_tokens)
-        )
-
-        data.append(
-            TrainingDatum(
-                prompt_tokens=t1.prompt_tokens,
-                completion_tokens=merged_completion,
-                completion_logprobs=merged_logprobs,
-                completion_advantages=merged_advantages,
-                metadata={
-                    "question": debate.question[:100],
-                    "agent": winner.agent,
-                    "verdict": debate.verdict,
-                    "rounds_merged": 3,
-                },
+        for winner, debate, reward in group:
+            datum = _merge_rounds_with_centered_reward(
+                debate=debate,
+                winner=winner,
+                reward=reward,
+                mean_reward=mean_reward,
+                group_size=group_size,
             )
-        )
+            data.append(datum)
 
     return data
 

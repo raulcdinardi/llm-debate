@@ -12,7 +12,6 @@ from .debate_types import (
     TrainingDatum,
     Transition,
     Verdict,
-    assemble_training_data,
     compute_training_stats,
 )
 from .debate_env import (
@@ -32,7 +31,6 @@ __all__ = [
     "DebateTrajectory",
     "DebateResult",
     "TrainingDatum",
-    "assemble_training_data",
     "compute_training_stats",
     "extract_solution",
     "extract_verdict",

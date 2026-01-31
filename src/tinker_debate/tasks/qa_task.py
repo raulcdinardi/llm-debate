@@ -7,6 +7,9 @@ from typing import Any
 
 from tinker_debate.datasets import load_gpqa, load_test_dataset
 
+from tinker_debate.prompts import format_prompt, load_prompt
+from tinker_debate.local_renderers import infer_chat_preamble
+
 from .task_types import TaskInstance, TaskReward, TaskSpec
 
 
@@ -63,13 +66,10 @@ class QATask(TaskSpec):
 
     def build_r1_prompt_tokens(self, *, inst: TaskInstance, tokenizer: Any) -> list[int]:
         q = inst.payload["question"]
-        prompt = (
-            f"{q}\n\n"
-            "Provide your final answer as tags:\n"
-            "<SOLUTION>...</SOLUTION>\n\n"
-            "Output ONLY the <SOLUTION> tag."
-        )
-        full = _im_start("user") + prompt + "\n" + _im_end() + _im_start("assistant")
+        template = load_prompt("tasks/qa_user.md")
+        prompt = format_prompt(template, question=str(q))
+        preamble = infer_chat_preamble(tokenizer)
+        full = preamble + _im_start("user") + prompt + "\n" + _im_end() + _im_start("assistant")
         return tokenizer.encode(full, add_special_tokens=False)
 
     def compute_reward(self, *, inst: TaskInstance, completion_tokens: list[int], tokenizer: Any) -> TaskReward:

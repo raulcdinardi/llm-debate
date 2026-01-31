@@ -7,6 +7,9 @@ from typing import Any
 from tinker_debate.datasets import load_cnn_dailymail
 from tinker_debate.summary.rewards import RewardConfig
 
+from tinker_debate.prompts import format_prompt, load_prompt
+from tinker_debate.local_renderers import infer_chat_preamble
+
 from .task_types import TaskInstance, TaskReward, TaskSpec
 
 
@@ -58,13 +61,10 @@ class SummaryTask(TaskSpec):
 
     def build_r1_prompt_tokens(self, *, inst: TaskInstance, tokenizer: Any) -> list[int]:
         article = inst.payload["article"]
-        prompt = (
-            "Capture the core aspects of the following article in a well-written summary of 2-3 sentences. "
-            "Maintain the essential information while being concise. Output only the summary text and nothing else.\n\n"
-            "Article:\n"
-            f"{article}"
-        )
-        full = _im_start("user") + prompt + "\n" + _im_end() + _im_start("assistant")
+        template = load_prompt("tasks/summary_user.md")
+        prompt = format_prompt(template, article=str(article))
+        preamble = infer_chat_preamble(tokenizer)
+        full = preamble + _im_start("user") + prompt + "\n" + _im_end() + _im_start("assistant")
         return tokenizer.encode(full, add_special_tokens=False)
 
     def compute_reward(self, *, inst: TaskInstance, completion_tokens: list[int], tokenizer: Any) -> TaskReward:

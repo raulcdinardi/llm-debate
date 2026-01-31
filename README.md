@@ -56,6 +56,42 @@ python scripts/train.py --dataset gpqa_diamond
 
 # Live HTTP inspection
 python scripts/train.py --proxy
+
+# Adjust sampling parameters
+python scripts/train.py --temperature 1.2 --max-tokens 512
+```
+
+## Local (Transformers) backend
+
+This repo can also run against `tinker-local/` (a local, fail-fast subset of the Tinker SDK) without changing the training code. The local backend supports transformers only.
+
+Assumptions:
+- You run from the repo root so relative paths stay stable.
+- You use `tinker-local/bin/with_local_tinker` to shadow `import tinker` per-run (so you can still use the real SDK in other runs).
+
+Example (local model directory):
+
+```bash
+export TINKER_LOCAL_BACKEND=transformers
+export TINKER_DEBATE_BASE_MODEL=/absolute/path/to/model_dir
+chmod +x tinker-local/bin/with_local_tinker
+tinker-local/bin/with_local_tinker python3 scripts/train.py --dry-run -n 2 -s 1
+```
+
+To download a model snapshot into `./models/`:
+
+```bash
+python3 scripts/download_hf_model.py --repo-id Qwen/Qwen3-4B-Instruct-2507
+export TINKER_DEBATE_BASE_MODEL="$(pwd)/models/Qwen__Qwen3-4B-Instruct-2507"
+```
+
+Example (LiquidAI LFM2.5 1.2B Instruct, CPU):
+
+```bash
+python3 scripts/download_hf_model.py --repo-id LiquidAI/LFM2.5-1.2B-Instruct
+export TINKER_DEBATE_BASE_MODEL="$(pwd)/models/LiquidAI__LFM2.5-1.2B-Instruct"
+export TINKER_LOCAL_DEVICE=cpu
+tinker-local/bin/with_local_tinker python3 scripts/train.py --dry-run -n 2 -s 1 --max-tokens 16 --name lfm25_local_smoke
 ```
 
 ## Logs

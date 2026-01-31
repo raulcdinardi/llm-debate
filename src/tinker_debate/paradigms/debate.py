@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from tinker_debate.debate_env import build_judge_prompt, extract_reasoning, extract_solution, extract_verdict
 from tinker_debate.debate_types import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
+from tinker_debate.prompts import load_prompt
 from tinker_debate.tasks.task_types import TaskInstance, TaskSpec
 
 
@@ -65,17 +66,8 @@ class DebateParadigm:
             instances_repeated.extend([inst] * group_size)
 
         # Pre-encode debate user templates (generic across tasks).
-        r2_template = (
-            "Round 2 (Argument): Your answer is FIXED and cannot change.\n"
-            "The other solver answered:\n{opponent_r1}\n\n"
-            "Argue why your answer is correct and why theirs is wrong.\n"
-            "Be concise and specific."
-        )
-        r3_template = (
-            "Round 3 (Response): Your answer is still FIXED and cannot change.\n"
-            "They responded:\n{opponent_r2}\n\n"
-            "Respond to their criticisms and make your final case."
-        )
+        r2_template = self.task.debate_r2_user_template() or load_prompt("debate/r2_token_template.md")
+        r3_template = self.task.debate_r3_user_template() or load_prompt("debate/r3_token_template.md")
 
         r2_pre, r2_post = _split_template(r2_template, "{opponent_r1}")
         r3_pre, r3_post = _split_template(r3_template, "{opponent_r2}")
@@ -194,6 +186,7 @@ class DebateParadigm:
         judge_completion_tokens_list: list[list[int] | None] = []
         judge_completion_logprobs_list: list[list[float] | None] = []
         judge_raw_response_list: list[dict | None] = []
+        judge_retry_flags: list[bool] = []
 
         if self.judge_fn is not None:
             for i in range(n_debates):
@@ -215,6 +208,7 @@ class DebateParadigm:
                 judge_completion_tokens_list.append(None)
                 judge_completion_logprobs_list.append(None)
                 judge_raw_response_list.append(None)
+                judge_retry_flags.append(False)
         else:
             for i in range(n_debates):
                 a_idx = 2 * i
@@ -253,6 +247,20 @@ class DebateParadigm:
                 judge_completion_tokens_list.append(completion_tokens)
                 judge_completion_logprobs_list.append(_lps)
                 judge_raw_response_list.append(_raw)
+                judge_retry_flags.append(False)
+
+            invalid_indices = [
+                i
+                for i, v in enumerate(verdicts)
+                if v == "INVALID"
+                and judge_raw_response_list[i] is not None
+                and judge_raw_response_list[i].get("error") != "request_failed"
+            ]
+            for idx in invalid_indices:
+                print(f"\n{'!'*60}")
+                print(f"!!! JUDGE INVALID VERDICT at debate {idx} - dropping rollout")
+                print(f"{'!'*60}\n")
+                judge_reasonings[idx] = "[JUDGE INVALID]"
 
         judge_time = time.time() - judge_t0
 
@@ -349,6 +357,7 @@ class DebateParadigm:
                         "judge_time_s": judge_time,
                         "token_only_rollout": True,
                         "task": self.task.name,
+                        "judge_retry": judge_retry_flags[i],
                     },
                     judge_prompt_tokens=judge_prompt_tokens_list[i],
                     judge_completion_tokens=judge_completion_tokens_list[i],

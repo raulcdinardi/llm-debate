@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>tinker_debate – Code Interfaces Diagram</title>
+    <style>
+      :root {
+        --bg: #0b0f17;
+        --panel: #0f172a;
+        --border: #26324a;
+        --text: #e5e7eb;
+        --muted: #a7b0c0;
+        --accent: #60a5fa;
+        --arrow: #9ca3af;
+        --box: #0b1220;
+        --box2: #0c1a2e;
+        --shadow: rgba(0, 0, 0, 0.35);
+      }
+
+      html,
+      body {
+        height: 100%;
+        background: var(--bg);
+        color: var(--text);
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
+          "Segoe UI Emoji";
+      }
+
+      .wrap {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 24px 16px 40px;
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: 20px;
+        font-weight: 650;
+        letter-spacing: 0.2px;
+      }
+
+      p {
+        margin: 0 0 14px;
+        color: var(--muted);
+        line-height: 1.4;
+        font-size: 13px;
+      }
+
+      .card {
+        background: linear-gradient(180deg, rgba(15, 23, 42, 0.9), rgba(15, 23, 42, 0.65));
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        box-shadow: 0 10px 30px var(--shadow);
+        padding: 12px;
+        overflow: auto;
+      }
+
+      .legend {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin: 12px 0 0;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+        display: inline-block;
+        margin-right: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        vertical-align: -1px;
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 12px;
+        color: #d1e7ff;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>tinker_debate – Code Interfaces Diagram</h1>
+      <p>
+        Token-first dataflow: env/task builds <code>prompt_tokens</code> and computes reward from <code>completion_tokens</code>;
+        paradigms (normal/debate) orchestrate sampling and shape training data; the client bridges to remote Tinker or local
+        <code>tinker-local</code>.
+      </p>
+
+      <div class="card" role="img" aria-label="Code interfaces and how components interact">
+        <svg width="1120" height="720" viewBox="0 0 1120 720" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="g1" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#0b1220" />
+              <stop offset="100%" stop-color="#0a1020" />
+            </linearGradient>
+            <linearGradient id="g2" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#0c1a2e" />
+              <stop offset="100%" stop-color="#0b1730" />
+            </linearGradient>
+            <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+              <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="rgba(0,0,0,0.35)" />
+            </filter>
+            <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#9ca3af" />
+            </marker>
+          </defs>
+
+          <rect x="0" y="0" width="1120" height="720" rx="12" fill="transparent" />
+
+          <!-- Left column: entry + driver -->
+          <g filter="url(#shadow)">
+            <rect x="40" y="40" width="260" height="80" rx="10" fill="url(#g2)" stroke="#26324a" />
+            <text x="60" y="70" fill="#e5e7eb" font-size="14" font-weight="650">scripts/train.py</text>
+            <text x="60" y="94" fill="#a7b0c0" font-size="12">Builds args + DriverContext, runs loop</text>
+          </g>
+
+          <g filter="url(#shadow)">
+            <rect x="40" y="160" width="260" height="100" rx="10" fill="url(#g1)" stroke="#26324a" />
+            <text x="60" y="190" fill="#e5e7eb" font-size="14" font-weight="650">OrthogonalDriver</text>
+            <text x="60" y="214" fill="#a7b0c0" font-size="12">Selects TaskSpec (env) + Paradigm (mode)</text>
+            <text x="60" y="236" fill="#a7b0c0" font-size="12">rollout_step(step) → TrainingDatum[]</text>
+          </g>
+
+          <!-- Middle column: env/task + paradigms -->
+          <g filter="url(#shadow)">
+            <rect x="360" y="40" width="330" height="130" rx="10" fill="url(#g1)" stroke="#26324a" />
+            <text x="380" y="70" fill="#e5e7eb" font-size="14" font-weight="650">TaskSpec (env interface)</text>
+            <text x="380" y="94" fill="#a7b0c0" font-size="12">sample_instances(n, seed) → TaskInstance[]</text>
+            <text x="380" y="114" fill="#a7b0c0" font-size="12">build_r1_prompt_tokens(inst, tok) → int[]</text>
+            <text x="380" y="134" fill="#a7b0c0" font-size="12">compute_reward(inst, completion_tokens, tok) → (reward, metrics)</text>
+            <text x="380" y="154" fill="#a7b0c0" font-size="12">judge_context_text(inst) → str</text>
+          </g>
+
+          <g filter="url(#shadow)">
+            <rect x="360" y="215" width="330" height="110" rx="10" fill="url(#g2)" stroke="#26324a" />
+            <text x="380" y="245" fill="#e5e7eb" font-size="14" font-weight="650">NormalParadigm</text>
+            <text x="380" y="269" fill="#a7b0c0" font-size="12">R1 only: prompt_tokens → completion_tokens</text>
+            <text x="380" y="289" fill="#a7b0c0" font-size="12">reward = task.compute_reward(...)</text>
+            <text x="380" y="309" fill="#a7b0c0" font-size="12">emit TrainingDatum (accepted rollouts)</text>
+          </g>
+
+          <g filter="url(#shadow)">
+            <rect x="360" y="360" width="330" height="150" rx="10" fill="url(#g2)" stroke="#26324a" />
+            <text x="380" y="390" fill="#e5e7eb" font-size="14" font-weight="650">DebateParadigm</text>
+            <text x="380" y="414" fill="#a7b0c0" font-size="12">R1 sampled for A and B (same prompt tokens)</text>
+            <text x="380" y="434" fill="#a7b0c0" font-size="12">R2/R3 prompts = token concat + debate templates</text>
+            <text x="380" y="454" fill="#a7b0c0" font-size="12">judge prompt includes task.judge_context_text(inst)</text>
+            <text x="380" y="474" fill="#a7b0c0" font-size="12">task reward computed on R1 for winners (GRPO uses it)</text>
+            <text x="380" y="494" fill="#a7b0c0" font-size="12">emit DebateResult[] → assemble TrainingDatum[]</text>
+          </g>
+
+          <!-- Right column: client + sampling/training -->
+          <g filter="url(#shadow)">
+            <rect x="760" y="40" width="320" height="140" rx="10" fill="url(#g1)" stroke="#26324a" />
+            <text x="780" y="70" fill="#e5e7eb" font-size="14" font-weight="650">TinkerDebateClient</text>
+            <text x="780" y="94" fill="#a7b0c0" font-size="12">sample_token_prompts(prompt_tokens_list, ...)</text>
+            <text x="780" y="114" fill="#a7b0c0" font-size="12">train_step(...), sync_weights(lora_name)</text>
+            <text x="780" y="134" fill="#a7b0c0" font-size="12">Holds tokenizer + renderer stop tokens</text>
+            <text x="780" y="154" fill="#a7b0c0" font-size="12">Backend: remote Tinker or local tinker-local</text>
+          </g>
+
+          <g filter="url(#shadow)">
+            <rect x="760" y="220" width="320" height="110" rx="10" fill="url(#g2)" stroke="#26324a" />
+            <text x="780" y="250" fill="#e5e7eb" font-size="14" font-weight="650">SamplingClient</text>
+            <text x="780" y="274" fill="#a7b0c0" font-size="12">Input: prompt token IDs</text>
+            <text x="780" y="294" fill="#a7b0c0" font-size="12">Output: completion token IDs + token logprobs</text>
+            <text x="780" y="314" fill="#a7b0c0" font-size="12">Local: HF generate or vLLM worker process</text>
+          </g>
+
+          <g filter="url(#shadow)">
+            <rect x="760" y="370" width="320" height="110" rx="10" fill="url(#g2)" stroke="#26324a" />
+            <text x="780" y="400" fill="#e5e7eb" font-size="14" font-weight="650">TrainingClient</text>
+            <text x="780" y="424" fill="#a7b0c0" font-size="12">forward_backward(prompt, completion, logprobs, advantages)</text>
+            <text x="780" y="444" fill="#a7b0c0" font-size="12">optim_step(lr)</text>
+            <text x="780" y="464" fill="#a7b0c0" font-size="12">save_weights_and_get_sampling_client(lora_name)</text>
+          </g>
+
+          <!-- Bottom: stop tokens note -->
+          <g filter="url(#shadow)">
+            <rect x="40" y="560" width="1040" height="120" rx="10" fill="url(#g1)" stroke="#26324a" />
+            <text x="60" y="590" fill="#e5e7eb" font-size="14" font-weight="650">Stop tokens (current)</text>
+            <text x="60" y="614" fill="#a7b0c0" font-size="12">
+              client.sample_token_prompts uses renderer.get_stop_sequences() (token IDs for &lt;|im_end|&gt;)
+            </text>
+            <text x="60" y="634" fill="#a7b0c0" font-size="12">
+              TaskSpec.stop_token_ids exists but is not currently threaded into sampling (easy to change if desired).
+            </text>
+            <text x="60" y="654" fill="#a7b0c0" font-size="12">
+              Token-first invariant: reward/metrics may decode, but the source of truth is always token IDs.
+            </text>
+          </g>
+
+          <!-- Arrows -->
+          <path d="M 300 80 C 330 80, 330 210, 40 210" stroke="transparent" fill="none" />
+
+          <path d="M 170 120 L 170 160" stroke="#9ca3af" stroke-width="2.2" fill="none" marker-end="url(#arrow)" />
+          <path d="M 300 210 L 360 105" stroke="#9ca3af" stroke-width="2.2" fill="none" marker-end="url(#arrow)" />
+
+          <path d="M 300 210 L 360 270" stroke="#9ca3af" stroke-width="2.2" fill="none" marker-end="url(#arrow)" />
+          <path d="M 300 210 L 360 430" stroke="#9ca3af" stroke-width="2.2" fill="none" marker-end="url(#arrow)" />
+
+          <path d="M 690 270 L 760 110" stroke="#9ca3af" stroke-width="2.2" fill="none" marker-end="url(#arrow)" />
+          <path d="M 690 430 L 760 110" stroke="#9ca3af" stroke-width="2.2" fill="none" marker-end="url(#arrow)" />
+
+          <path d="M 920 180 L 920 220" stroke="#9ca3af" stroke-width="2.2" fill="none" marker-end="url(#arrow)" />
+          <path d="M 920 330 L 920 370" stroke="#9ca3af" stroke-width="2.2" fill="none" marker-end="url(#arrow)" />
+        </svg>
+      </div>
+
+      <div class="legend">
+        <span><span class="dot" style="background: #0c1a2e"></span>Orchestration / paradigms</span>
+        <span><span class="dot" style="background: #0b1220"></span>Interfaces / core types</span>
+        <span><span class="dot" style="background: #60a5fa"></span>Token-first boundary</span>
+      </div>
+
+      <p style="margin-top: 10px">
+        Open this file directly in a browser: <code>docs/code_interfaces_diagram.html</code>
+      </p>
+    </div>
+  </body>
+</html>

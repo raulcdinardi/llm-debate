@@ -892,7 +892,7 @@ def watch_logs(log_dir: str, interval: float, show_tokens: bool) -> None:
     last_mtime = 0
 
     while True:
-        files = get_log_files(log_dir)
+        files = get_log_files(log_dir, file_type="all")
 
         if files:
             newest = files[0]
@@ -905,7 +905,10 @@ def watch_logs(log_dir: str, interval: float, show_tokens: bool) -> None:
                 with open(newest) as f:
                     data = json.load(f)
 
-                render_log(data, show_tokens)
+                if "training_step" in newest.name or "datums" in data:
+                    render_training_step(data, show_tokens)
+                else:
+                    render_log(data, show_tokens)
                 console.print(f"\n[dim]Watching... (last update: {newest.name})[/dim]")
         else:
             console.print(f"[yellow]No logs yet in {log_dir}/[/yellow]")
@@ -915,6 +918,12 @@ def watch_logs(log_dir: str, interval: float, show_tokens: bool) -> None:
 
 def main():
     args = parse_args()
+
+    if os.environ.get("VIRTUAL_ENV") is None:
+        console.print(
+            "[yellow]Warning: not running inside a virtualenv. "
+            "Activate one (e.g., `source venv/bin/activate`) to ensure dependencies are available.[/yellow]"
+        )
 
     if args.list:
         list_logs(args.log_dir)

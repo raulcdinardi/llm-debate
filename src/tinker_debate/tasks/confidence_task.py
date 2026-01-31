@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tinker_debate.prompts import format_prompt, load_prompt
+from tinker_debate.local_renderers import infer_chat_preamble
+
 from .task_types import TaskInstance, TaskReward, TaskSpec
 
 
@@ -74,14 +77,10 @@ class ConfidenceTask(TaskSpec):
 
     def build_r1_prompt_tokens(self, *, inst: TaskInstance, tokenizer: Any) -> list[int]:
         q = inst.payload["question"]
-        prompt = (
-            f"{q}\n\n"
-            "Provide your answer and your confidence as tags:\n"
-            "<SOLUTION>...</SOLUTION>\n"
-            "<CONFIDENCE>0.0 to 1.0</CONFIDENCE>\n\n"
-            "Output ONLY these tags."
-        )
-        full = _im_start("user") + prompt + "\n" + _im_end() + _im_start("assistant")
+        template = load_prompt("tasks/confidence_user.md")
+        prompt = format_prompt(template, question=str(q))
+        preamble = infer_chat_preamble(tokenizer)
+        full = preamble + _im_start("user") + prompt + "\n" + _im_end() + _im_start("assistant")
         return tokenizer.encode(full, add_special_tokens=False)
 
     def compute_reward(self, *, inst: TaskInstance, completion_tokens: list[int], tokenizer: Any) -> TaskReward:
