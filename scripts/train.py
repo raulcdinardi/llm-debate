@@ -797,6 +797,8 @@ async def main():
             train_time = time.time() - t0
             loss = float(train_result.get("loss", 0.0))
             num_tokens = int(train_result.get("num_tokens", 0))
+            analysis = train_result["analysis"]
+            metrics = train_result["metrics"]
 
             step_log_path = save_training_step_log(
                 step=step,
@@ -819,6 +821,39 @@ async def main():
             console.print(
                 f"  Time: rollout={rollout_time:.1f}s train={train_time:.1f}s"
             )
+            console.print(
+                "  Train stats: "
+                f"trained_tokens={analysis['trained_token_count']} "
+                f"ratio_mean={analysis['mean_ratio']:.4g} "
+                f"ratio_min={analysis['ratio_min']:.4g} "
+                f"ratio_max={analysis['ratio_max']:.4g}"
+            )
+            console.print(
+                "  Adv stats: "
+                f"count={analysis['adv_count']} mean={analysis['adv_mean']:.4g} std={analysis['adv_std']:.4g} "
+                f"nz_count={analysis['adv_nonzero_count']} nz_mean={analysis['adv_nonzero_mean']:.4g} "
+                f"nz_std={analysis['adv_nonzero_std']:.4g}"
+            )
+            if isinstance(metrics, dict) and "grad:global_norm" in metrics:
+                console.print(
+                    "  Grad stats: "
+                    f"global={metrics['grad:global_norm']:.4g} "
+                    f"mean_abs={metrics['grad:mean_abs']:.4g} "
+                    f"max_abs={metrics['grad:max_abs']:.4g} "
+                    f"nonzero_frac={metrics['grad:nonzero_frac']:.4g}"
+                )
+                console.print(
+                    "  Param stats: "
+                    f"global={metrics['param:global_norm']:.4g} "
+                    f"mean_abs={metrics['param:mean_abs']:.4g} "
+                    f"max_abs={metrics['param:max_abs']:.4g}"
+                )
+                console.print(
+                    "  LoRA stats: "
+                    f"grad_global={metrics['lora_grad:global_norm']:.4g} "
+                    f"grad_mean_abs={metrics['lora_grad:mean_abs']:.4g} "
+                    f"param_global={metrics['lora_param:global_norm']:.4g}"
+                )
 
         console.rule("[bold]Training Summary[/bold]")
 

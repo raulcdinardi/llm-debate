@@ -11,6 +11,7 @@ Uses async Tinker API throughout for better performance.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from typing import Any, Literal
 
@@ -609,6 +610,12 @@ class TinkerDebateClient:
         # Fallback compute (client-side) if metrics doesn't include a loss.
         total_loss = 0.0
         num_trained_tokens = 0
+        sum_old = 0.0
+        sum_new = 0.0
+        sum_delta = 0.0
+        sum_ratio = 0.0
+        ratio_min = None
+        ratio_max = None
 
         for i, (out, old_lps, comp_advs) in enumerate(
             zip(fwd_bwd_out.loss_fn_outputs, sampling_logprobs_list, completion_advantages_batch)
@@ -630,12 +637,75 @@ class TinkerDebateClient:
                     ratio = torch.exp(torch.tensor(new_lp - old_lp))
                     total_loss += float((-ratio * adv).item())
                     num_trained_tokens += 1
+                    sum_old += float(old_lp)
+                    sum_new += float(new_lp)
+                    sum_delta += float(new_lp - old_lp)
+                    ratio_val = float(ratio.item())
+                    sum_ratio += ratio_val
+                    ratio_min = ratio_val if ratio_min is None else min(ratio_min, ratio_val)
+                    ratio_max = ratio_val if ratio_max is None else max(ratio_max, ratio_val)
+
+        adv_count = 0
+        adv_sum = 0.0
+        adv_sq_sum = 0.0
+        adv_min = None
+        adv_max = None
+        adv_nz_count = 0
+        adv_nz_sum = 0.0
+        adv_nz_sq_sum = 0.0
+        adv_nz_min = None
+        adv_nz_max = None
+        for comp_advs in completion_advantages_batch:
+            for adv in comp_advs:
+                adv_count += 1
+                adv_sum += float(adv)
+                adv_sq_sum += float(adv * adv)
+                adv_min = adv if adv_min is None else min(adv_min, adv)
+                adv_max = adv if adv_max is None else max(adv_max, adv)
+                if adv != 0:
+                    adv_nz_count += 1
+                    adv_nz_sum += float(adv)
+                    adv_nz_sq_sum += float(adv * adv)
+                    adv_nz_min = adv if adv_nz_min is None else min(adv_nz_min, adv)
+                    adv_nz_max = adv if adv_nz_max is None else max(adv_nz_max, adv)
+
+        adv_mean = adv_sum / adv_count if adv_count else 0.0
+        adv_var = (adv_sq_sum / adv_count) - (adv_mean * adv_mean) if adv_count else 0.0
+        adv_std = float(math.sqrt(adv_var)) if adv_var > 0 else 0.0
+
+        adv_nz_mean = adv_nz_sum / adv_nz_count if adv_nz_count else 0.0
+        adv_nz_var = (adv_nz_sq_sum / adv_nz_count) - (adv_nz_mean * adv_nz_mean) if adv_nz_count else 0.0
+        adv_nz_std = float(math.sqrt(adv_nz_var)) if adv_nz_var > 0 else 0.0
+
+        mean_old = sum_old / num_trained_tokens if num_trained_tokens else 0.0
+        mean_new = sum_new / num_trained_tokens if num_trained_tokens else 0.0
+        mean_delta = sum_delta / num_trained_tokens if num_trained_tokens else 0.0
+        mean_ratio = sum_ratio / num_trained_tokens if num_trained_tokens else 0.0
 
         return {
             "loss": float(loss_from_metrics) if loss_from_metrics is not None else float(total_loss),
             "num_tokens": sum(len(d.model_input.to_ints()) for d in data),
             "num_trained_tokens": num_trained_tokens,
             "metrics": metrics,
+            "analysis": {
+                "trained_token_count": num_trained_tokens,
+                "mean_old_logprob": float(mean_old),
+                "mean_new_logprob": float(mean_new),
+                "mean_delta_logprob": float(mean_delta),
+                "mean_ratio": float(mean_ratio),
+                "ratio_min": float(ratio_min) if ratio_min is not None else 0.0,
+                "ratio_max": float(ratio_max) if ratio_max is not None else 0.0,
+                "adv_count": adv_count,
+                "adv_mean": float(adv_mean),
+                "adv_std": float(adv_std),
+                "adv_min": float(adv_min) if adv_min is not None else 0.0,
+                "adv_max": float(adv_max) if adv_max is not None else 0.0,
+                "adv_nonzero_count": adv_nz_count,
+                "adv_nonzero_mean": float(adv_nz_mean),
+                "adv_nonzero_std": float(adv_nz_std),
+                "adv_nonzero_min": float(adv_nz_min) if adv_nz_min is not None else 0.0,
+                "adv_nonzero_max": float(adv_nz_max) if adv_nz_max is not None else 0.0,
+            },
         }
 
     async def sync_weights(self, name: str = "step") -> None:

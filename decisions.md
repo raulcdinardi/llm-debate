@@ -43,3 +43,7 @@
 2026-02-03T10:56:25-03:00 | SID-20260203-1043 | OBSERVED: constrained_writing debate dry-run failed using HF repo LiquidAI/LFM2.5-1.2B (repo not found)
 2026-02-03T10:56:55-03:00 | SID-20260203-1043 | test: local constrained_writing debate dry-run ok with local model models/LiquidAI__LFM2.5-1.2B-Instruct (mock judge) using /dev/shm logs/ckpts; rollout_time 364.0s; training_data 2
 2026-02-03T12:28:55-03:00 | SID-20260203-1228 | comment: explained token-exact continuity rationale + tradeoff in debate_env run_debate_batch_token_only docstring
+2026-02-03T16:47:15Z | session=20260203-1010-suspend | deleted npm cache (~/.npm/_cacache) and npm logs (~/.npm/_logs); ~/.npm now 143M
+2026-02-03T13:54:40-03:00 | SID-20260203-1354 | init session; add robust training diagnostics (grad/param stats + ratio/adv stats) for local+cloud
+2026-02-03T13:55:10-03:00 | SID-20260203-1354 | code: local training_client now reports grad/param metrics; tinker_client computes ratio/adv stats; train.py prints diagnostics per step
+2026-02-03T13:55:30-03:00 | SID-20260203-1354 | tests: py_compile training_client.py, tinker_client.py, scripts/train.py ok

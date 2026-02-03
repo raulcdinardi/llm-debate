@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -175,6 +176,100 @@ class TrainingClient:
 
         return results
 
+    def _collect_param_and_grad_metrics(self) -> dict[str, float]:
+        model = self._model
+
+        grad_sq_sum = 0.0
+        grad_abs_sum = 0.0
+        grad_max = 0.0
+        grad_numel = 0
+        grad_nonzero = 0
+
+        param_sq_sum = 0.0
+        param_abs_sum = 0.0
+        param_max = 0.0
+        param_numel = 0
+
+        lora_grad_sq_sum = 0.0
+        lora_grad_abs_sum = 0.0
+        lora_grad_max = 0.0
+        lora_grad_numel = 0
+        lora_grad_nonzero = 0
+
+        lora_param_sq_sum = 0.0
+        lora_param_abs_sum = 0.0
+        lora_param_max = 0.0
+        lora_param_numel = 0
+
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            p_det = p.detach()
+            p_abs = p_det.abs()
+            param_numel += p_det.numel()
+            param_abs_sum += float(p_abs.sum().item())
+            param_sq_sum += float((p_det * p_det).sum().item())
+            param_max = max(param_max, float(p_abs.max().item()))
+
+            is_lora = "lora_" in name
+            if is_lora:
+                lora_param_numel += p_det.numel()
+                lora_param_abs_sum += float(p_abs.sum().item())
+                lora_param_sq_sum += float((p_det * p_det).sum().item())
+                lora_param_max = max(lora_param_max, float(p_abs.max().item()))
+
+            g = p.grad
+            if g is None:
+                continue
+            g_det = g.detach()
+            g_abs = g_det.abs()
+            grad_numel += g_det.numel()
+            grad_abs_sum += float(g_abs.sum().item())
+            grad_sq_sum += float((g_det * g_det).sum().item())
+            grad_max = max(grad_max, float(g_abs.max().item()))
+            grad_nonzero += int((g_det != 0).sum().item())
+
+            if is_lora:
+                lora_grad_numel += g_det.numel()
+                lora_grad_abs_sum += float(g_abs.sum().item())
+                lora_grad_sq_sum += float((g_det * g_det).sum().item())
+                lora_grad_max = max(lora_grad_max, float(g_abs.max().item()))
+                lora_grad_nonzero += int((g_det != 0).sum().item())
+
+        grad_global_norm = math.sqrt(grad_sq_sum)
+        param_global_norm = math.sqrt(param_sq_sum)
+        lora_grad_global_norm = math.sqrt(lora_grad_sq_sum)
+        lora_param_global_norm = math.sqrt(lora_param_sq_sum)
+
+        grad_mean_abs = grad_abs_sum / grad_numel if grad_numel else 0.0
+        param_mean_abs = param_abs_sum / param_numel if param_numel else 0.0
+        grad_nonzero_frac = grad_nonzero / grad_numel if grad_numel else 0.0
+
+        lora_grad_mean_abs = lora_grad_abs_sum / lora_grad_numel if lora_grad_numel else 0.0
+        lora_param_mean_abs = lora_param_abs_sum / lora_param_numel if lora_param_numel else 0.0
+        lora_grad_nonzero_frac = lora_grad_nonzero / lora_grad_numel if lora_grad_numel else 0.0
+
+        return {
+            "grad:global_norm": float(grad_global_norm),
+            "grad:mean_abs": float(grad_mean_abs),
+            "grad:max_abs": float(grad_max),
+            "grad:nonzero_frac": float(grad_nonzero_frac),
+            "grad:numel": float(grad_numel),
+            "param:global_norm": float(param_global_norm),
+            "param:mean_abs": float(param_mean_abs),
+            "param:max_abs": float(param_max),
+            "param:numel": float(param_numel),
+            "lora_grad:global_norm": float(lora_grad_global_norm),
+            "lora_grad:mean_abs": float(lora_grad_mean_abs),
+            "lora_grad:max_abs": float(lora_grad_max),
+            "lora_grad:nonzero_frac": float(lora_grad_nonzero_frac),
+            "lora_grad:numel": float(lora_grad_numel),
+            "lora_param:global_norm": float(lora_param_global_norm),
+            "lora_param:mean_abs": float(lora_param_mean_abs),
+            "lora_param:max_abs": float(lora_param_max),
+            "lora_param:numel": float(lora_param_numel),
+        }
+
     def _forward_backward_importance_sampling(self, data: list[Datum]) -> ForwardBackwardResult:
         if len(data) == 0:
             return ForwardBackwardResult(loss_fn_outputs=[], metrics={"loss:sum": 0.0})
@@ -199,7 +294,9 @@ class TrainingClient:
             loss_fn_outputs.extend(out.loss_fn_outputs)
             loss_sum += float(out.metrics["loss:sum"])
 
-        return ForwardBackwardResult(loss_fn_outputs=loss_fn_outputs, metrics={"loss:sum": loss_sum})
+        metrics = {"loss:sum": loss_sum, "grad:accum_steps": float(grad_accum_steps)}
+        metrics.update(self._collect_param_and_grad_metrics())
+        return ForwardBackwardResult(loss_fn_outputs=loss_fn_outputs, metrics=metrics)
 
     def _forward_backward_cross_entropy(self, data: list[Datum]) -> ForwardBackwardResult:
         if len(data) == 0:
@@ -225,7 +322,9 @@ class TrainingClient:
             loss_fn_outputs.extend(out.loss_fn_outputs)
             loss_sum += float(out.metrics["loss:sum"])
 
-        return ForwardBackwardResult(loss_fn_outputs=loss_fn_outputs, metrics={"loss:sum": loss_sum})
+        metrics = {"loss:sum": loss_sum, "grad:accum_steps": float(grad_accum_steps)}
+        metrics.update(self._collect_param_and_grad_metrics())
+        return ForwardBackwardResult(loss_fn_outputs=loss_fn_outputs, metrics=metrics)
 
     def _forward_backward_cross_entropy_one_batch(self, data: list[Datum]) -> ForwardBackwardResult:
         import torch
