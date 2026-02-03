@@ -10,3 +10,5 @@
 2026-02-03T01:14:49-03:00 | SID-20260202-2041 | tests: single_turn QA dry-run n2 g1 ok; debate QA dry-run n2 g1 ok after r1/r23 changes; rollout_time 81.3s; adv stats ok
 2026-02-03T01:16:57-03:00 | SID-20260202-2041 | unignored tinker-local in .gitignore; added tinker-local files to git for parity fixes
 2026-02-03T01:17:33-03:00 | SID-20260202-2041 | commit 0013ea1 (GRPO z-score, normal z-score, local parity, tinker-local tracked); pushed to origin/main
+2026-02-03T01:31:21-03:00 | SID-20260202-2041 | local debate dry-run big: LFM2.5 CPU, debate qa test -n8 g2 r1/r23 split; rollout_time 391.4s (~6m31s); training_data 8; adv stats ok
+2026-02-03T01:31:21-03:00 | SID-20260202-2041 | local single_turn replay dry-run: qa test replay from logs/20260126_181535_n4_g2_single_turn_qa_test_api_canary; training_data 4; group z-score path exercised
