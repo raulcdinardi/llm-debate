@@ -53,6 +53,9 @@ def get_tinker() -> ModuleType:
       - env `TINKER_BACKEND=local`, OR
       - env `TINKER_LOCAL_BACKEND` is set (this is already required by the local backend).
     """
+    if "TINKER_LOCAL_BACKEND" in os.environ and "TINKER_BACKEND" not in os.environ:
+        os.environ["TINKER_BACKEND"] = "local"
+
     backend = os.environ.get("TINKER_BACKEND")
     if backend is not None and backend not in ("api", "local"):
         raise ValueError(f"TINKER_BACKEND must be 'api' or 'local', got {backend!r}")

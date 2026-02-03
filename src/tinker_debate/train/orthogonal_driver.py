@@ -171,7 +171,7 @@ class OrthogonalDriver(RolloutDriver):
         r23_label = "none" if args.debate_r23_reward == "none" else f"{args.debate_r23_mode}:{r23_reward}"
         info_lines = [
             *out.info_lines,
-            f"Training data: {len(training_data)} datums (R1 centered winners + R2/R3={r23_label}) from {len(out.debates)} debates",
+            f"Training data: {len(training_data)} datums (R1 z-scored all solutions + R2/R3={r23_label}) from {len(out.debates)} debates",
         ]
 
         if len(training_data) == 0:

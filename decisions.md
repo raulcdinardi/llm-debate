@@ -7,3 +7,5 @@
 2026-02-03T00:41:11-03:00 | SID-20260202-2041 | moved to main with chat-template changes still uncommitted (no merge commit); proceeding on main
 2026-02-03T00:46:12-03:00 | SID-20260202-2041 | local debate dry-run ok: LFM2.5 CPU, debate qa test -n4 g2 r1/r23 split; rollout_time 118.2s; training_data 4 datums; nonzero adv stats reported
 2026-02-03T00:53:30-03:00 | SID-20260202-2041 | local debate dry-run v2 ok: LFM2.5 CPU, debate qa test -n4 g2 r1/r23 split; rollout_time 122.3s; training_data 4 datums; adv stats ok
+2026-02-03T01:14:49-03:00 | SID-20260202-2041 | tests: single_turn QA dry-run n2 g1 ok; debate QA dry-run n2 g1 ok after r1/r23 changes; rollout_time 81.3s; adv stats ok
+2026-02-03T01:16:57-03:00 | SID-20260202-2041 | unignored tinker-local in .gitignore; added tinker-local files to git for parity fixes

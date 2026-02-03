@@ -60,6 +60,9 @@ class NormalParadigm:
             completion_logprobs: list[float],
             reward_value: float,
             reward_metrics: dict,
+            reward_z: float,
+            group_mean: float,
+            group_std: float,
             group_id: int,
             instance_id: str | None,
         ) -> None:
@@ -77,7 +80,7 @@ class NormalParadigm:
             if len(completion_tokens) == 0:
                 return
 
-            advantage = float(reward_value) / len(completion_tokens)
+            advantage = float(reward_z) / len(completion_tokens)
             training_data.append(
                 TrainingDatum(
                     prompt_tokens=prompt_tokens,
@@ -91,6 +94,10 @@ class NormalParadigm:
                         "group_id": group_id,
                         "instance_id": instance_id,
                         "reward": float(reward_value),
+                        "reward_z": float(reward_z),
+                        "advantage_value": float(reward_z),
+                        "group_mean_reward": float(group_mean),
+                        "group_std_reward": float(group_std),
                         "reward_metrics": reward_metrics,
                     },
                 )
@@ -126,6 +133,7 @@ class NormalParadigm:
                     f"Replay group count ({len(set(record_group_ids))}) != num_groups ({num_groups})"
                 )
 
+            rewards_by_group: dict[int, list[float]] = {}
             for r in records:
                 prompt_tokens = r["prompt_tokens"]
                 completion_tokens = r["completion_tokens"]
@@ -134,13 +142,38 @@ class NormalParadigm:
                     raise ValueError("Replay completion_tokens/logprobs length mismatch")
                 reward_value = float(r["reward"])
                 reward_metrics = r.get("metrics", {})
+                gid = int(r["group_id"])
+                rewards_by_group.setdefault(gid, []).append(reward_value)
+
+            group_stats: dict[int, tuple[float, float]] = {}
+            for gid, rs in rewards_by_group.items():
+                mean = sum(rs) / len(rs)
+                var = sum((r - mean) ** 2 for r in rs) / len(rs)
+                std = var ** 0.5
+                group_stats[gid] = (mean, std)
+
+            for r in records:
+                prompt_tokens = r["prompt_tokens"]
+                completion_tokens = r["completion_tokens"]
+                completion_logprobs = r["completion_logprobs"]
+                reward_value = float(r["reward"])
+                reward_metrics = r.get("metrics", {})
+                gid = int(r["group_id"])
+                mean, std = group_stats[gid]
+                if std > 0:
+                    reward_z = (reward_value - mean) / std
+                else:
+                    reward_z = 0.0
                 maybe_add_training_datum(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     completion_logprobs=completion_logprobs,
                     reward_value=reward_value,
                     reward_metrics=reward_metrics,
-                    group_id=int(r["group_id"]),
+                    reward_z=reward_z,
+                    group_mean=mean,
+                    group_std=std,
+                    group_id=gid,
                     instance_id=r.get("instance_id"),
                 )
 
@@ -179,6 +212,7 @@ class NormalParadigm:
         )
         rollout_time = time.time() - t0
 
+        rollouts: list[dict] = []
         for inst, res, prompt_tokens, group_id in zip(inst_by_rollout, results, prompt_tokens_list, group_ids):
             if res is None:
                 continue
@@ -200,15 +234,46 @@ class NormalParadigm:
                 "metrics": reward.metrics,
             }
             self.save_record(record)
+            rollouts.append(
+                {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "completion_logprobs": completion_logprobs,
+                    "reward_value": float(reward.reward),
+                    "reward_metrics": reward.metrics,
+                    "group_id": int(group_id),
+                    "instance_id": inst.instance_id,
+                }
+            )
 
+        rewards_by_group: dict[int, list[float]] = {}
+        for r in rollouts:
+            rewards_by_group.setdefault(r["group_id"], []).append(r["reward_value"])
+
+        group_stats: dict[int, tuple[float, float]] = {}
+        for gid, rs in rewards_by_group.items():
+            mean = sum(rs) / len(rs)
+            var = sum((r - mean) ** 2 for r in rs) / len(rs)
+            std = var ** 0.5
+            group_stats[gid] = (mean, std)
+
+        for r in rollouts:
+            mean, std = group_stats[r["group_id"]]
+            if std > 0:
+                reward_z = (r["reward_value"] - mean) / std
+            else:
+                reward_z = 0.0
             maybe_add_training_datum(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                completion_logprobs=completion_logprobs,
-                reward_value=float(reward.reward),
-                reward_metrics=reward.metrics,
-                group_id=group_id,
-                instance_id=inst.instance_id,
+                prompt_tokens=r["prompt_tokens"],
+                completion_tokens=r["completion_tokens"],
+                completion_logprobs=r["completion_logprobs"],
+                reward_value=r["reward_value"],
+                reward_metrics=r["reward_metrics"],
+                reward_z=reward_z,
+                group_mean=mean,
+                group_std=std,
+                group_id=r["group_id"],
+                instance_id=r["instance_id"],
             )
 
         info_lines = [

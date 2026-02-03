@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
+import math
 
 from tinker_debate.prompts import load_prompt
 
@@ -133,6 +134,7 @@ def _merge_rounds_with_centered_reward(
     reward: float,
     mean_reward: float,
     group_size: int | None,
+    std_reward: float | None = None,
 ) -> TrainingDatum:
     """Merge a 3-round trajectory into one TrainingDatum using centered rewards."""
 
@@ -182,6 +184,11 @@ def _merge_rounds_with_centered_reward(
         raise ValueError("Winner trajectory has zero generated tokens.")
 
     centered_reward = reward - mean_reward
+    if std_reward is not None:
+        if std_reward > 0:
+            centered_reward = centered_reward / std_reward
+        else:
+            centered_reward = 0.0
     advantage_value = centered_reward / total_generated_tokens
 
     merged_advantages = (
@@ -204,6 +211,7 @@ def _merge_rounds_with_centered_reward(
             "reward": reward,
             "centered_reward": centered_reward,
             "group_mean_reward": mean_reward,
+            "group_std_reward": std_reward,
             "group_size": group_size,
             "rounds_merged": 3,
         },
@@ -312,6 +320,8 @@ def assemble_training_data_grpo(
 
         rewards = [r for _, _, r in group]
         mean_reward = sum(rewards) / len(rewards)
+        var = sum((r - mean_reward) ** 2 for r in rewards) / len(rewards)
+        std = math.sqrt(var)
         group_size = len(group)
 
         for winner, debate, reward in group:
@@ -320,6 +330,7 @@ def assemble_training_data_grpo(
                 winner=winner,
                 reward=reward,
                 mean_reward=mean_reward,
+                std_reward=std,
                 group_size=group_size,
             )
             data.append(datum)
@@ -334,18 +345,25 @@ def assemble_training_data_r1_r23(
     r23_reward: float,
     r23_symmetric: bool,
 ) -> list[TrainingDatum]:
-    """Split rewards: R1 gets task reward (winner-only), R2/R3 get constant reward.
+    """Split rewards: R1 gets task reward, R2/R3 get debate win/loss reward.
 
-    - R1: only winner tokens trained; reward centered across winners per question.
+    - R1: both agents trained; reward z-scored across all R1 solutions per question.
     - R2/R3: both winner and loser trained; symmetric by default (winner=+c, loser=-c).
     """
     groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
     for debate in debates:
         if debate.verdict not in ("A", "B"):
             continue
-        winner = debate.get_winner_trajectory()
-        reward = r1_reward_fn(winner, debate)
-        groups.setdefault(debate.question, []).append((winner, debate, reward))
+        traj_a = debate.trajectory_a
+        traj_b = debate.trajectory_b
+        r1_a = r1_reward_fn(traj_a, debate)
+        r1_b = r1_reward_fn(traj_b, debate)
+        groups.setdefault(debate.question, []).extend(
+            [
+                (traj_a, debate, r1_a),
+                (traj_b, debate, r1_b),
+            ]
+        )
 
     data: list[TrainingDatum] = []
     for question, group in groups.items():
@@ -359,59 +377,46 @@ def assemble_training_data_r1_r23(
 
         rewards = [r for _, _, r in group]
         mean_reward = sum(rewards) / len(rewards)
+        var = sum((r - mean_reward) ** 2 for r in rewards) / len(rewards)
+        std = math.sqrt(var)
         group_size = len(group)
 
-        for winner, debate, r1_reward in group:
-            loser = debate.get_loser_trajectory()
+        r23_w = float(r23_reward)
+        r23_l = -float(r23_reward) if r23_symmetric else 0.0
 
-            r1_adv = _per_token_adv(r1_reward - mean_reward, winner.transitions[0].completion_tokens, "R1")
+        for traj, debate, r1_reward in group:
+            if std > 0:
+                r1_centered = (r1_reward - mean_reward) / std
+            else:
+                r1_centered = 0.0
+            r1_adv = _per_token_adv(r1_centered, traj.transitions[0].completion_tokens, "R1")
 
-            r23_w = float(r23_reward)
-            r23_l = -float(r23_reward) if r23_symmetric else 0.0
+            is_winner = debate.get_winner_trajectory().agent == traj.agent
+            r23_reward_signed = r23_w if is_winner else r23_l
 
-            r2_adv_w = _per_token_adv(r23_w, winner.transitions[1].completion_tokens, "R2")
-            r3_adv_w = _per_token_adv(r23_w, winner.transitions[2].completion_tokens, "R3")
-            r2_adv_l = _per_token_adv(r23_l, loser.transitions[1].completion_tokens, "R2")
-            r3_adv_l = _per_token_adv(r23_l, loser.transitions[2].completion_tokens, "R3")
+            r2_adv = _per_token_adv(r23_reward_signed, traj.transitions[1].completion_tokens, "R2")
+            r3_adv = _per_token_adv(r23_reward_signed, traj.transitions[2].completion_tokens, "R3")
 
             data.append(
                 _merge_rounds_with_adv_values(
                     debate=debate,
-                    traj=winner,
+                    traj=traj,
                     r1_adv_value=r1_adv,
-                    r2_adv_value=r2_adv_w,
-                    r3_adv_value=r3_adv_w,
+                    r2_adv_value=r2_adv,
+                    r3_adv_value=r3_adv,
                     metadata={
                         "r1_reward": r1_reward,
-                        "r1_centered_reward": r1_reward - mean_reward,
+                        "r1_centered_reward": r1_centered,
+                        "r1_adv_value": r1_adv,
                         "r1_group_mean_reward": mean_reward,
+                        "r1_group_std_reward": std,
                         "r1_group_size": group_size,
-                        "r23_reward": r23_w,
+                        "r23_reward": r23_reward_signed,
                         "r23_symmetric": r23_symmetric,
+                        "r23_adv_value": r23_reward_signed,
                         "rounds_merged": 3,
                         "r1_trained": True,
-                        "r23_trained": True,
-                    },
-                )
-            )
-
-            data.append(
-                _merge_rounds_with_adv_values(
-                    debate=debate,
-                    traj=loser,
-                    r1_adv_value=0.0,
-                    r2_adv_value=r2_adv_l,
-                    r3_adv_value=r3_adv_l,
-                    metadata={
-                        "r1_reward": 0.0,
-                        "r1_centered_reward": 0.0,
-                        "r1_group_mean_reward": mean_reward,
-                        "r1_group_size": group_size,
-                        "r23_reward": r23_l,
-                        "r23_symmetric": r23_symmetric,
-                        "rounds_merged": 3,
-                        "r1_trained": False,
-                        "r23_trained": True,
+                        "r23_trained": r23_reward_signed != 0.0,
                     },
                 )
             )
