@@ -98,7 +98,7 @@ def parse_args():
         "--env",
         type=str,
         default=None,
-        choices=["qa", "confidence", "summary", "coin", "secret_word", "constrained_writing"],
+        choices=["qa", "confidence", "summary", "coin", "secret_word", "constrained_writing", "graph_path"],
         help="Task/env. Required if --mode=single_turn. Optional if --mode=debate (default: qa).",
     )
     parser.add_argument("-n", "--num-rollouts", type=int, default=16, help="Total rollouts per step")
@@ -163,6 +163,78 @@ def parse_args():
         default="both",
         choices=["alice", "bob", "both"],
         help="(constrained_writing only) Which speakers appear in the prompt.",
+    )
+    parser.add_argument(
+        "--graph-num-nodes",
+        type=int,
+        default=8,
+        help="(graph_path only) Total nodes including S and G.",
+    )
+    parser.add_argument(
+        "--graph-path-length",
+        type=int,
+        default=3,
+        help="(graph_path only) Prefix length K (number of steps to simulate).",
+    )
+    parser.add_argument(
+        "--graph-edge-prob",
+        type=float,
+        default=0.3,
+        help="(graph_path only) Probability of adding a directed edge between nodes.",
+    )
+    parser.add_argument(
+        "--graph-max-edge-cost",
+        type=int,
+        default=9,
+        help="(graph_path only) Maximum edge cost (min is 1).",
+    )
+    parser.add_argument(
+        "--graph-trap-nodes",
+        type=int,
+        default=2,
+        help="(graph_path only) Number of trap nodes with low heuristic and no outgoing edges.",
+    )
+    parser.add_argument(
+        "--graph-budget-factor",
+        type=float,
+        default=1.3,
+        help="(graph_path only) Budget multiplier over optimal S->G cost.",
+    )
+    parser.add_argument(
+        "--graph-proxy-alpha",
+        type=float,
+        default=0.1,
+        help="(graph_path only) Proxy cost weight: reward = -h(last) - alpha*prefix_cost.",
+    )
+    parser.add_argument(
+        "--graph-heuristic-noise",
+        type=float,
+        default=0.0,
+        help="(graph_path only) Additive noise on heuristics (clipped at 0).",
+    )
+    parser.add_argument(
+        "--graph-trap-h-scale",
+        type=float,
+        default=0.3,
+        help="(graph_path only) Multiplier applied to trap node heuristics.",
+    )
+    parser.add_argument(
+        "--graph-strict-sampling",
+        action="store_true",
+        default=True,
+        help="(graph_path only) Resample until output matches schema (default: enabled).",
+    )
+    parser.add_argument(
+        "--graph-no-strict-sampling",
+        action="store_false",
+        dest="graph_strict_sampling",
+        help="(graph_path only) Disable schema-based resampling.",
+    )
+    parser.add_argument(
+        "--graph-strict-max-attempts",
+        type=int,
+        default=4,
+        help="(graph_path only) Max resampling attempts per rollout.",
     )
     parser.add_argument(
         "--coin-target",
@@ -520,6 +592,15 @@ async def main():
             f"rules_per_speaker={args.constraint_rules_per_speaker}, "
             f"reward_scope={args.constraint_reward_scope}, "
             f"sides={args.constraint_sides}"
+        )
+    elif args.env == "graph_path":
+        console.print(
+            "Graph path: "
+            f"nodes={args.graph_num_nodes}, K={args.graph_path_length}, edge_prob={args.graph_edge_prob}, "
+            f"max_cost={args.graph_max_edge_cost}, traps={args.graph_trap_nodes}, "
+            f"budget_factor={args.graph_budget_factor}, proxy_alpha={args.graph_proxy_alpha}, "
+            f"heur_noise={args.graph_heuristic_noise}, trap_h_scale={args.graph_trap_h_scale}, "
+            f"strict_sampling={args.graph_strict_sampling} (max_attempts={args.graph_strict_max_attempts})"
         )
 
     if args.mode == "debate":

@@ -12,3 +12,6 @@
 2026-02-03T01:17:33-03:00 | SID-20260202-2041 | commit 0013ea1 (GRPO z-score, normal z-score, local parity, tinker-local tracked); pushed to origin/main
 2026-02-03T01:31:21-03:00 | SID-20260202-2041 | local debate dry-run big: LFM2.5 CPU, debate qa test -n8 g2 r1/r23 split; rollout_time 391.4s (~6m31s); training_data 8; adv stats ok
 2026-02-03T01:31:21-03:00 | SID-20260202-2041 | local single_turn replay dry-run: qa test replay from logs/20260126_181535_n4_g2_single_turn_qa_test_api_canary; training_data 4; group z-score path exercised
+2026-02-03T01:36:27-03:00 | SID-20260203-0136 | init session; branch feature/spec-gaming-sandbox for graph-spec gaming env
+2026-02-03T01:44:07-03:00 | SID-20260203-0136 | implement graph_path env + strict resampling in NormalParadigm; added prompt + task + train args; graph_path overrides accept_min_reward to allow negative proxy rewards
+2026-02-03T01:44:07-03:00 | SID-20260203-0136 | tests: py_compile graph_path_task/normal/orthogonal_driver ok; local dry-run graph_path n2 g1 max_tokens=32 strict_max_attempts=2 ok (training_data 2)

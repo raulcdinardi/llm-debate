@@ -10,6 +10,7 @@ from tinker_debate.tasks.coin_task import CoinTask
 from tinker_debate.tasks.constrained_writing_task import ConstrainedWritingTask
 from tinker_debate.tasks.confidence_task import ConfidenceTask
 from tinker_debate.tasks.qa_task import QATask
+from tinker_debate.tasks.graph_path_task import GraphPathTask
 from tinker_debate.tasks.secret_word_debate_task import SecretWordDebateTask
 from tinker_debate.tasks.summary_task import SummaryTask
 from tinker_debate.local_renderers import infer_chat_preamble
@@ -64,6 +65,10 @@ class OrthogonalDriver(RolloutDriver):
             self.task = QATask.from_args(dataset_name=args.dataset, seed=args.seed)
             self.normal_max_tokens = int(args.max_tokens)
             self.normal_temperature = float(args.temperature)
+        elif task_name == "graph_path":
+            self.task = GraphPathTask.from_args(args=args)
+            self.normal_max_tokens = int(args.max_tokens)
+            self.normal_temperature = float(args.temperature)
         elif task_name == "constrained_writing":
             self.task = ConstrainedWritingTask.from_args(
                 rules_per_speaker=int(args.constraint_rules_per_speaker),
@@ -85,6 +90,10 @@ class OrthogonalDriver(RolloutDriver):
         console = self.ctx.console
 
         if args.mode == "single_turn":
+            accept_min_reward = float(args.accept_min_reward)
+            if self.task.name == "graph_path" and accept_min_reward == 0.0:
+                accept_min_reward = -1.0e9
+
             def save_record(record: dict) -> None:
                 if self.task.name == "summary":
                     self.ctx.log_fns.save_summary_log(record=record, log_dir=self.ctx.log_dir, model_name=client.model_name)
@@ -96,7 +105,7 @@ class OrthogonalDriver(RolloutDriver):
                 tokenizer=client.tokenizer,
                 sample_token_prompts=client.sample_token_prompts,
                 save_record=save_record,
-                accept_min_reward=float(args.accept_min_reward),
+                accept_min_reward=accept_min_reward,
                 accept_require_parse=bool(args.accept_require_parse),
                 replay_dir=args.replay_dir,
             )

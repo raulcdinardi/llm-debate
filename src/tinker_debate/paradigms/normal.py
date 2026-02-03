@@ -30,6 +30,18 @@ class NormalParadigm:
     replay_dir: str | None = None
     replay_cache: dict[int, list[dict]] | None = None
 
+    def _strict_sampling_enabled(self) -> bool:
+        return bool(getattr(self.task, "strict_sampling", False))
+
+    def _strict_sampling_max_attempts(self) -> int:
+        return int(getattr(self.task, "strict_sampling_max_attempts", 1))
+
+    def _validate_completion(self, *, inst: TaskInstance, completion_tokens: list[int]) -> bool:
+        validate_fn = getattr(self.task, "validate_completion_tokens", None)
+        if validate_fn is None:
+            return True
+        return bool(validate_fn(inst=inst, completion_tokens=completion_tokens, tokenizer=self.tokenizer))
+
     async def rollout(
         self,
         *,
@@ -204,12 +216,38 @@ class NormalParadigm:
                 inst_by_rollout.append(inst)
                 group_ids.append(group_id)
 
-        results = await self.sample_token_prompts(
-            prompt_tokens_list=prompt_tokens_list,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            min_p=min_p,
-        )
+        strict_enabled = self._strict_sampling_enabled()
+        max_attempts = self._strict_sampling_max_attempts()
+        if strict_enabled and max_attempts > 1:
+            results: list[Any] = [None] * len(prompt_tokens_list)
+            remaining = list(range(len(prompt_tokens_list)))
+            attempts = 0
+            while remaining:
+                attempts += 1
+                sub_prompts = [prompt_tokens_list[i] for i in remaining]
+                sub_results = await self.sample_token_prompts(
+                    prompt_tokens_list=sub_prompts,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    min_p=min_p,
+                )
+                next_remaining: list[int] = []
+                for idx, res in zip(remaining, sub_results):
+                    results[idx] = res
+                    if res is None:
+                        continue
+                    _prompt_tokens, completion_tokens, _completion_logprobs, _raw = res
+                    if not self._validate_completion(inst=inst_by_rollout[idx], completion_tokens=completion_tokens):
+                        if attempts < max_attempts:
+                            next_remaining.append(idx)
+                remaining = next_remaining
+        else:
+            results = await self.sample_token_prompts(
+                prompt_tokens_list=prompt_tokens_list,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                min_p=min_p,
+            )
         rollout_time = time.time() - t0
 
         rollouts: list[dict] = []
