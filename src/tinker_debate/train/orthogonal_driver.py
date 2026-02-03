@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tinker_debate.debate_types import assemble_training_data_grpo
+from tinker_debate.debate_types import assemble_training_data_grpo, assemble_training_data_r1_r23
 from tinker_debate.paradigms.debate import DebateParadigm
 from tinker_debate.paradigms.normal import NormalParadigm
 from tinker_debate.summary.rewards import RewardConfig
@@ -160,10 +160,18 @@ class OrthogonalDriver(RolloutDriver):
             # Task reward cached in metrics by rollout: 1 if R1 matched ground truth else 0.
             return float(traj.metrics["task_reward"])
 
-        training_data = assemble_training_data_grpo(out.debates, reward_fn=reward_fn)
+        r1_reward_fn = reward_fn if args.debate_r1_reward == "task" else (lambda _t, _d: 0.0)
+        r23_reward = 0.0 if args.debate_r23_reward == "none" else float(args.debate_r23_constant)
+        training_data = assemble_training_data_r1_r23(
+            out.debates,
+            r1_reward_fn=r1_reward_fn,
+            r23_reward=r23_reward,
+            r23_symmetric=(args.debate_r23_mode == "symmetric"),
+        )
+        r23_label = "none" if args.debate_r23_reward == "none" else f"{args.debate_r23_mode}:{r23_reward}"
         info_lines = [
             *out.info_lines,
-            f"Training data: {len(training_data)} datums (winners, centered reward) from {len(out.debates)} debates",
+            f"Training data: {len(training_data)} datums (R1 centered winners + R2/R3={r23_label}) from {len(out.debates)} debates",
         ]
 
         if len(training_data) == 0:

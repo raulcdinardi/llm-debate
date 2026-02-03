@@ -210,6 +210,81 @@ def _merge_rounds_with_centered_reward(
     )
 
 
+def _merge_rounds_with_adv_values(
+    *,
+    debate: DebateResult,
+    traj: DebateTrajectory,
+    r1_adv_value: float,
+    r2_adv_value: float,
+    r3_adv_value: float,
+    metadata: dict[str, Any],
+) -> TrainingDatum:
+    if len(traj.transitions) != 3:
+        raise ValueError(f"Expected 3 rounds, got {len(traj.transitions)}")
+
+    t1, t2, t3 = traj.transitions
+    for t in (t1, t2, t3):
+        if len(t.completion_tokens) != len(t.completion_logprobs):
+            raise ValueError(
+                f"Completion/logprob length mismatch in round {t.round_num}: "
+                f"{len(t.completion_tokens)} vs {len(t.completion_logprobs)}"
+            )
+
+    if r1_adv_value != 0.0 and len(t1.completion_tokens) == 0:
+        raise ValueError("Non-zero R1 advantage with zero R1 completion tokens.")
+    if r2_adv_value != 0.0 and len(t2.completion_tokens) == 0:
+        raise ValueError("Non-zero R2 advantage with zero R2 completion tokens.")
+    if r3_adv_value != 0.0 and len(t3.completion_tokens) == 0:
+        raise ValueError("Non-zero R3 advantage with zero R3 completion tokens.")
+
+    r1_full_len = len(t1.prompt_tokens) + len(t1.completion_tokens)
+    if len(t2.prompt_tokens) < r1_full_len:
+        raise ValueError("R2 prompt shorter than R1 history; extension property violated.")
+    r2_continuation_tokens = t2.prompt_tokens[r1_full_len:]
+
+    r2_full_len = len(t2.prompt_tokens) + len(t2.completion_tokens)
+    if len(t3.prompt_tokens) < r2_full_len:
+        raise ValueError("R3 prompt shorter than R2 history; extension property violated.")
+    r3_continuation_tokens = t3.prompt_tokens[r2_full_len:]
+
+    merged_completion = (
+        t1.completion_tokens
+        + r2_continuation_tokens
+        + t2.completion_tokens
+        + r3_continuation_tokens
+        + t3.completion_tokens
+    )
+
+    merged_logprobs = (
+        list(t1.completion_logprobs)
+        + [0.0] * len(r2_continuation_tokens)
+        + list(t2.completion_logprobs)
+        + [0.0] * len(r3_continuation_tokens)
+        + list(t3.completion_logprobs)
+    )
+
+    merged_advantages = (
+        [r1_adv_value] * len(t1.completion_tokens)
+        + [0.0] * len(r2_continuation_tokens)
+        + [r2_adv_value] * len(t2.completion_tokens)
+        + [0.0] * len(r3_continuation_tokens)
+        + [r3_adv_value] * len(t3.completion_tokens)
+    )
+
+    return TrainingDatum(
+        prompt_tokens=t1.prompt_tokens,
+        completion_tokens=merged_completion,
+        completion_logprobs=merged_logprobs,
+        completion_advantages=merged_advantages,
+        metadata={
+            "question": debate.question[:100],
+            "agent": traj.agent,
+            "verdict": debate.verdict,
+            **metadata,
+        },
+    )
+
+
 def assemble_training_data_grpo(
     debates: list[DebateResult],
     reward_fn: Callable[[DebateTrajectory, DebateResult], float],
@@ -248,6 +323,98 @@ def assemble_training_data_grpo(
                 group_size=group_size,
             )
             data.append(datum)
+
+    return data
+
+
+def assemble_training_data_r1_r23(
+    debates: list[DebateResult],
+    r1_reward_fn: Callable[[DebateTrajectory, DebateResult], float],
+    *,
+    r23_reward: float,
+    r23_symmetric: bool,
+) -> list[TrainingDatum]:
+    """Split rewards: R1 gets task reward (winner-only), R2/R3 get constant reward.
+
+    - R1: only winner tokens trained; reward centered across winners per question.
+    - R2/R3: both winner and loser trained; symmetric by default (winner=+c, loser=-c).
+    """
+    groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
+    for debate in debates:
+        if debate.verdict not in ("A", "B"):
+            continue
+        winner = debate.get_winner_trajectory()
+        reward = r1_reward_fn(winner, debate)
+        groups.setdefault(debate.question, []).append((winner, debate, reward))
+
+    data: list[TrainingDatum] = []
+    for question, group in groups.items():
+        if len(group) == 0:
+            continue
+
+        def _per_token_adv(reward: float, tokens: list[int], label: str) -> float:
+            if len(tokens) == 0:
+                raise ValueError(f"{label} completion tokens empty; cannot assign reward.")
+            return reward / len(tokens)
+
+        rewards = [r for _, _, r in group]
+        mean_reward = sum(rewards) / len(rewards)
+        group_size = len(group)
+
+        for winner, debate, r1_reward in group:
+            loser = debate.get_loser_trajectory()
+
+            r1_adv = _per_token_adv(r1_reward - mean_reward, winner.transitions[0].completion_tokens, "R1")
+
+            r23_w = float(r23_reward)
+            r23_l = -float(r23_reward) if r23_symmetric else 0.0
+
+            r2_adv_w = _per_token_adv(r23_w, winner.transitions[1].completion_tokens, "R2")
+            r3_adv_w = _per_token_adv(r23_w, winner.transitions[2].completion_tokens, "R3")
+            r2_adv_l = _per_token_adv(r23_l, loser.transitions[1].completion_tokens, "R2")
+            r3_adv_l = _per_token_adv(r23_l, loser.transitions[2].completion_tokens, "R3")
+
+            data.append(
+                _merge_rounds_with_adv_values(
+                    debate=debate,
+                    traj=winner,
+                    r1_adv_value=r1_adv,
+                    r2_adv_value=r2_adv_w,
+                    r3_adv_value=r3_adv_w,
+                    metadata={
+                        "r1_reward": r1_reward,
+                        "r1_centered_reward": r1_reward - mean_reward,
+                        "r1_group_mean_reward": mean_reward,
+                        "r1_group_size": group_size,
+                        "r23_reward": r23_w,
+                        "r23_symmetric": r23_symmetric,
+                        "rounds_merged": 3,
+                        "r1_trained": True,
+                        "r23_trained": True,
+                    },
+                )
+            )
+
+            data.append(
+                _merge_rounds_with_adv_values(
+                    debate=debate,
+                    traj=loser,
+                    r1_adv_value=0.0,
+                    r2_adv_value=r2_adv_l,
+                    r3_adv_value=r3_adv_l,
+                    metadata={
+                        "r1_reward": 0.0,
+                        "r1_centered_reward": 0.0,
+                        "r1_group_mean_reward": mean_reward,
+                        "r1_group_size": group_size,
+                        "r23_reward": r23_l,
+                        "r23_symmetric": r23_symmetric,
+                        "rounds_merged": 3,
+                        "r1_trained": False,
+                        "r23_trained": True,
+                    },
+                )
+            )
 
     return data
 

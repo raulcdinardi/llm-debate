@@ -4,22 +4,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from tinker_debate.debate_env import build_judge_prompt, extract_reasoning, extract_solution, extract_verdict
+from tinker_debate.debate_env import extract_reasoning, extract_solution, extract_verdict
 from tinker_debate.debate_types import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
 from tinker_debate.prompts import load_prompt
 from tinker_debate.tasks.task_types import TaskInstance, TaskSpec
-
-
-def _im_start(role: str) -> str:
-    return f"<|im_start|>{role}\n"
-
-
-def _im_end() -> str:
-    return "<|im_end|>\n"
-
-
-def _encode(tokenizer: Any, text: str) -> list[int]:
-    return tokenizer.encode(text, add_special_tokens=False)
+from tinker_debate.chat_templates import get_chat_adapter
 
 
 def _split_template(template: str, placeholder: str) -> tuple[str, str]:
@@ -72,10 +61,15 @@ class DebateParadigm:
         r2_pre, r2_post = _split_template(r2_template, "{opponent_r1}")
         r3_pre, r3_post = _split_template(r3_template, "{opponent_r2}")
 
-        r2_prefix_tokens = _encode(self.tokenizer, _im_end() + _im_start("user") + r2_pre)
-        r2_suffix_tokens = _encode(self.tokenizer, r2_post + "\n" + _im_end() + _im_start("assistant"))
-        r3_prefix_tokens = _encode(self.tokenizer, _im_end() + _im_start("user") + r3_pre)
-        r3_suffix_tokens = _encode(self.tokenizer, r3_post + "\n" + _im_end() + _im_start("assistant"))
+        adapter = get_chat_adapter(self.tokenizer)
+        r2_prefix_tokens, r2_suffix_tokens = adapter.build_user_continuation_tokens(
+            user_pre=r2_pre,
+            user_post=r2_post,
+        )
+        r3_prefix_tokens, r3_suffix_tokens = adapter.build_user_continuation_tokens(
+            user_pre=r3_pre,
+            user_post=r3_post,
+        )
 
         print(f"[debate] Round 1: sampling {len(instances_repeated)} completions...")
         base_r1_prompt_tokens = [
@@ -210,23 +204,46 @@ class DebateParadigm:
                 judge_raw_response_list.append(None)
                 judge_retry_flags.append(False)
         else:
+            adapter = get_chat_adapter(self.tokenizer)
+            extra = (
+                "\n\nIMPORTANT: Output ONLY the tags. "
+                "VERDICT must be A or B (agent labels), never answer options like C/D. "
+                "If tied, choose A."
+            )
             for i in range(n_debates):
                 a_idx = 2 * i
                 b_idx = 2 * i + 1
                 inst_a, _inst_b = inst_pairs[i]
                 context = self.task.judge_context_text(inst=inst_a)
-                prompt = build_judge_prompt(
-                    question=context,
-                    r1_a=r1_text[a_idx],
-                    r1_b=r1_text[b_idx],
-                    r2_a=r2_text[a_idx],
-                    r2_b=r2_text[b_idx],
-                    r3_a=r3_text[a_idx],
-                    r3_b=r3_text[b_idx],
-                    config=self.config,
-                    strict=True,
+                system = self.config.system_judge + extra
+                user = (
+                    f"Question: {context}\n\n"
+                    "=== AGENT A ===\n"
+                    "Round 1 (Proposal):\n"
+                    f"{r1_text[a_idx]}\n\n"
+                    "Round 2 (Argument):\n"
+                    f"{r2_text[a_idx]}\n\n"
+                    "Round 3 (Response):\n"
+                    f"{r3_text[a_idx]}\n\n"
+                    "=== AGENT B ===\n"
+                    "Round 1 (Proposal):\n"
+                    f"{r1_text[b_idx]}\n\n"
+                    "Round 2 (Argument):\n"
+                    f"{r2_text[b_idx]}\n\n"
+                    "Round 3 (Response):\n"
+                    f"{r3_text[b_idx]}\n\n"
+                    "Based on the debate above, which agent made a more convincing case?\n"
+                    "Consider: solution correctness, argument quality, rebuttal effectiveness.\n"
+                    "VERDICT must be exactly A or B (agent labels), not an answer option.\n"
+                    "If tied, choose A.\n"
                 )
-                judge_prompt_tokens_list.append(_encode(self.tokenizer, prompt))
+                messages = [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ]
+                judge_prompt_tokens_list.append(
+                    adapter.encode_messages(messages, add_generation_prompt=True)
+                )
 
             judge_results = await self.sample_token_prompts(
                 prompt_tokens_list=judge_prompt_tokens_list,

@@ -209,6 +209,33 @@ def parse_args():
         choices=["task"],
         help="(debate only) Reward definition for debate training data (centered across winners).",
     )
+    parser.add_argument(
+        "--debate-r1-reward",
+        type=str,
+        default="task",
+        choices=["task", "none"],
+        help="(debate only) R1 reward source. 'task' trains winner R1 tokens with centered task reward.",
+    )
+    parser.add_argument(
+        "--debate-r23-reward",
+        type=str,
+        default="constant",
+        choices=["none", "constant"],
+        help="(debate only) R2/R3 reward. 'constant' applies win/loss reward to R2/R3 tokens.",
+    )
+    parser.add_argument(
+        "--debate-r23-constant",
+        type=float,
+        default=1.0,
+        help="(debate only) Constant reward magnitude for R2/R3 (used when --debate-r23-reward=constant).",
+    )
+    parser.add_argument(
+        "--debate-r23-mode",
+        type=str,
+        default="symmetric",
+        choices=["symmetric", "winner_only"],
+        help="(debate only) R2/R3 reward mode. symmetric => winner=+c, loser=-c. winner_only => loser=0.",
+    )
     return parser.parse_args()
 
 

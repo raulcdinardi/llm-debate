@@ -1,6 +1,6 @@
 If you're a agent not instatiated inside this folder and you were told to modify code in this folder before reading this you're excempt from followign this .MD
 
-PURPOSE: Probe a finetuned model to identify how it systematically diverges from the base model. You're a scientist debugging/understanding what the finetuning changed.
+PURPOSE: Probe a model, either a finetuned model to identify how it systematically diverges from the base model or own its own for whatever behaviour I ask to analyze. You're a scientist debugging/understanding what the finetuning changed.
 
 STRICT CONSTRAINT: You may ONLY run the two scripts documented below. No other commands, no writing new scripts, no shell operations, no file manipulation, no pip installs, nothing else. If you find yourself wanting to do something these tools don't support, describe what you would do and why—don't actually do it. The entire investigation must be conducted through these two interfaces.
 

@@ -20,7 +20,7 @@ import importlib
 
 tinker_types = importlib.import_module(f"{tinker.__name__}.types")
 
-from .local_renderers import Qwen3InstructStopRenderer
+from .chat_templates import get_chat_adapter, ChatTemplateAdapter
 
 LossFn = Literal["cross_entropy", "importance_sampling", "ppo", "cispo", "dro"]
 
@@ -35,7 +35,8 @@ class BackendConfig:
     @staticmethod
     def resolve(tokenizer: Any) -> "BackendConfig":
         is_local = os.environ.get("TINKER_BACKEND") == "local" or "TINKER_LOCAL_BACKEND" in os.environ
-        stop = Qwen3InstructStopRenderer(tokenizer).get_stop_sequences()
+        adapter = get_chat_adapter(tokenizer)
+        stop = adapter.get_stop_sequences()
         return BackendConfig(is_local=is_local, stop_sequences=stop)
 
 
@@ -109,7 +110,7 @@ class TinkerDebateClient:
     training_client: tinker.TrainingClient
     sampling_client: tinker.SamplingClient
     tokenizer: Any  # HuggingFace tokenizer
-    renderer: Qwen3InstructStopRenderer
+    renderer: ChatTemplateAdapter
     model_name: str
     backend: BackendConfig
 
@@ -134,7 +135,7 @@ class TinkerDebateClient:
         service = tinker.ServiceClient()
         training_client = await service.create_lora_training_client_async(base_model=model_name)
         tokenizer = training_client.get_tokenizer()
-        renderer = Qwen3InstructStopRenderer(tokenizer)
+        renderer = get_chat_adapter(tokenizer)
         backend = BackendConfig.resolve(tokenizer)
         sampling_client = await training_client.save_weights_and_get_sampling_client_async("debate_init")
 

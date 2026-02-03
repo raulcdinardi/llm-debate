@@ -8,20 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from tinker_debate.prompts import format_prompt, load_prompt
-from tinker_debate.local_renderers import infer_chat_preamble
+from tinker_debate.chat_templates import get_chat_adapter
 
 from .task_types import TaskInstance, TaskReward, TaskSpec
 
 
 QUESTIONS_PATH = Path(__file__).resolve().parents[2] / "tinker_debate" / "confidence" / "questions.json"
-
-
-def _im_start(role: str) -> str:
-    return f"<|im_start|>{role}\n"
-
-
-def _im_end() -> str:
-    return "<|im_end|>\n"
 
 
 def _parse_confidence(text: str) -> float | None:
@@ -67,10 +59,11 @@ class ConfidenceTask(TaskSpec):
         return out
 
     def stop_token_ids(self, *, tokenizer: Any) -> list[int]:
-        toks = tokenizer.encode("<|im_end|>", add_special_tokens=False)
-        if len(toks) != 1:
-            raise ValueError(f"Expected single token for <|im_end|>, got {len(toks)}")
-        return [int(toks[0])]
+        adapter = get_chat_adapter(tokenizer)
+        stop = adapter.get_stop_sequences()
+        if stop is None or len(stop) != 1:
+            raise ValueError("Stop token must be a single token for confidence task.")
+        return [int(stop[0])]
 
     def judge_context_text(self, *, inst: TaskInstance) -> str:
         return str(inst.payload["question"])
@@ -79,9 +72,9 @@ class ConfidenceTask(TaskSpec):
         q = inst.payload["question"]
         template = load_prompt("tasks/confidence_user.md")
         prompt = format_prompt(template, question=str(q))
-        preamble = infer_chat_preamble(tokenizer)
-        full = preamble + _im_start("user") + prompt + "\n" + _im_end() + _im_start("assistant")
-        return tokenizer.encode(full, add_special_tokens=False)
+        adapter = get_chat_adapter(tokenizer)
+        messages = [{"role": "user", "content": prompt}]
+        return adapter.encode_messages(messages, add_generation_prompt=True)
 
     def compute_reward(self, *, inst: TaskInstance, completion_tokens: list[int], tokenizer: Any) -> TaskReward:
         text = tokenizer.decode(completion_tokens, skip_special_tokens=True)

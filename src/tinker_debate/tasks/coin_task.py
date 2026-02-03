@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from tinker_debate.prompts import load_prompt
+from tinker_debate.chat_templates import get_chat_adapter
 
 from .task_types import TaskInstance, TaskReward, TaskSpec
 
@@ -33,14 +34,15 @@ class CoinTask(TaskSpec):
         if _SYSTEM_PROMPT:
             messages.append({"role": "system", "content": _SYSTEM_PROMPT})
         messages.append({"role": "user", "content": _USER_PROMPT})
-        chat = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        return tokenizer.encode(chat, add_special_tokens=False)
+        adapter = get_chat_adapter(tokenizer)
+        return adapter.encode_messages(messages, add_generation_prompt=True)
 
     def stop_token_ids(self, *, tokenizer: Any) -> list[int]:
-        toks = tokenizer.encode("<|im_end|>", add_special_tokens=False)
-        if len(toks) != 1:
-            raise ValueError(f"Expected single token for <|im_end|>, got {len(toks)}")
-        return [int(toks[0])]
+        adapter = get_chat_adapter(tokenizer)
+        stop = adapter.get_stop_sequences()
+        if stop is None or len(stop) != 1:
+            raise ValueError("Stop token must be a single token for coin task.")
+        return [int(stop[0])]
 
     def judge_context_text(self, *, inst: TaskInstance) -> str:
         return _USER_PROMPT
