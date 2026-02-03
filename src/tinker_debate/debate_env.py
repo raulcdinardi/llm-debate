@@ -248,7 +248,11 @@ async def run_debate_batch_token_only(
     Key guarantee: round-(k+1) prompt tokens are constructed as:
       prompt_{k+1} = prompt_k + completion_k + continuation_tokens
 
-    so we never re-tokenize the whole history.
+    so we never re-tokenize the whole history. This preserves exact token identity for
+    opponent insertions (tokenization is not bijective, so re-encoding full strings can
+    shift boundary tokens). If you don't care about token-exact continuity, you could
+    simplify by re-encoding full prompts each round, at the cost of possible drift and
+    logprob/advantage misalignment.
     """
     if config.num_rounds != 3:
         raise NotImplementedError("Only num_rounds=3 is currently supported")

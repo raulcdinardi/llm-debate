@@ -42,3 +42,4 @@
 2026-02-03T10:50:55-03:00 | SID-20260203-1043 | test: usp_vm02 single_turn QA dry-run ok (Ministral-3-3B-Base-2512, prompt_style=base) using /dev/shm logs/ckpts; rollout_time 1.1s; training_data 2
 2026-02-03T10:56:25-03:00 | SID-20260203-1043 | OBSERVED: constrained_writing debate dry-run failed using HF repo LiquidAI/LFM2.5-1.2B (repo not found)
 2026-02-03T10:56:55-03:00 | SID-20260203-1043 | test: local constrained_writing debate dry-run ok with local model models/LiquidAI__LFM2.5-1.2B-Instruct (mock judge) using /dev/shm logs/ckpts; rollout_time 364.0s; training_data 2
+2026-02-03T12:28:55-03:00 | SID-20260203-1228 | comment: explained token-exact continuity rationale + tradeoff in debate_env run_debate_batch_token_only docstring
