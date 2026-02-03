@@ -15,3 +15,4 @@
 2026-02-03T01:36:27-03:00 | SID-20260203-0136 | init session; branch feature/spec-gaming-sandbox for graph-spec gaming env
 2026-02-03T01:44:07-03:00 | SID-20260203-0136 | implement graph_path env + strict resampling in NormalParadigm; added prompt + task + train args; graph_path overrides accept_min_reward to allow negative proxy rewards
 2026-02-03T01:44:07-03:00 | SID-20260203-0136 | tests: py_compile graph_path_task/normal/orthogonal_driver ok; local dry-run graph_path n2 g1 max_tokens=32 strict_max_attempts=2 ok (training_data 2)
+2026-02-03T10:07:58-03:00 | SID-20260203-0136 | tests: py_compile graph_path_task/normal/orthogonal_driver/train.py ok; local graph_path dry-run n4 g2 seed=1 strict_max_attempts=3 ok (training_data 4); validate_rollout_logs on 4 baseline files ok; parse_success 3/4 (1 invalid still after resampling)
