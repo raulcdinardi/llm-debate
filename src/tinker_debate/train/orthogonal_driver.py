@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 from tinker_debate.debate_types import assemble_training_data_grpo, assemble_training_data_r1_r23
 from tinker_debate.paradigms.debate import DebateParadigm
@@ -28,6 +29,7 @@ class OrthogonalDriver(RolloutDriver):
         args = self.ctx.args
         self.chat_preamble = infer_chat_preamble(self.ctx.client.tokenizer)
 
+        prompt_style = os.environ.get("TINKER_PROMPT_STYLE", "").lower()
         if args.mode == "single_turn":
             if args.env is None:
                 raise ValueError("--env is required when --mode=single_turn")
@@ -36,6 +38,10 @@ class OrthogonalDriver(RolloutDriver):
             task_name = "qa" if args.env is None else args.env
         else:
             raise ValueError(f"Unknown --mode={args.mode!r}")
+
+        if prompt_style == "base":
+            if args.mode != "single_turn" or task_name != "qa":
+                raise ValueError("TINKER_PROMPT_STYLE=base is only supported for --mode single_turn --env qa.")
 
         if task_name == "summary":
             if args.dataset not in (None, "cnn_dailymail"):

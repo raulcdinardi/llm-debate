@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from tinker_debate.datasets import load_gpqa, load_test_dataset
 
 from tinker_debate.prompts import format_prompt, load_prompt
 from tinker_debate.chat_templates import get_chat_adapter
+from tinker_debate.local_renderers import infer_chat_preamble
 
 from .task_types import TaskInstance, TaskReward, TaskSpec
 
@@ -59,6 +61,13 @@ class QATask(TaskSpec):
 
     def build_r1_prompt_tokens(self, *, inst: TaskInstance, tokenizer: Any) -> list[int]:
         q = inst.payload["question"]
+        prompt_style = os.environ.get("TINKER_PROMPT_STYLE", "").lower()
+        if prompt_style == "base":
+            template = load_prompt("tasks/qa_base_user.md")
+            prompt = format_prompt(template, question=str(q))
+            preamble = infer_chat_preamble(tokenizer)
+            full = f"{preamble}{prompt}" if preamble else prompt
+            return list(tokenizer.encode(full, add_special_tokens=False))
         template = load_prompt("tasks/qa_user.md")
         prompt = format_prompt(template, question=str(q))
         adapter = get_chat_adapter(tokenizer)

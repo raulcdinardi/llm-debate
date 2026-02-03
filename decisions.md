@@ -28,3 +28,17 @@
 2026-02-03T10:40:03-03:00 | SID-20260203-1038 | fix: cast base model to requested dtype at load (base.to(device,dtype)) to avoid FP8 matmul failure
 2026-02-03T10:41:15-03:00 | SID-20260203-1038 | test: usp_vm02 debate dry-run ok (constrained_writing, mock judge) using Ministral-3-3B-Instruct-2512; logs/20260203_103710_n2_g1_debate_constrained_writing_custom_constrained_debate_ministral_3
 2026-02-03T10:42:05-03:00 | SID-20260203-1038 | tests: py_compile chat_templates.py and _transformers_backend.py ok
+2026-02-03T10:43:45-03:00 | SID-20260203-1043 | init session; branch feature/base-model-prompts to support base-model QA prompting
+2026-02-03T10:46:20-03:00 | SID-20260203-1043 | add base QA prompting (TINKER_PROMPT_STYLE=base) + guard in orthogonal_driver; new prompts/tasks/qa_base_user.md
+2026-02-03T10:46:45-03:00 | SID-20260203-1043 | tests: py_compile qa_task.py and orthogonal_driver.py ok
+2026-02-03T14:36:10Z | session=20260203-1010-suspend | scanned disk usage (df, du home/desktop/cache/local/var) to identify safe cleanup targets
+2026-02-03T14:40:46Z | session=20260203-1010-suspend | scanned ~/Desktop for venv-like directories and sizes
+2026-02-03T14:45:37Z | session=20260203-1010-suspend | deleted pip cache at ~/.cache/pip using python3; disk now 98% used (df /)
+2026-02-03T14:48:16Z | session=20260203-1010-suspend | wrote venv snapshots (python.version.txt, pip.version.txt, requirements.snapshot.txt via importlib.metadata) for LiveCodeBench, deepseek, RewardHacking
+2026-02-03T14:48:48Z | session=20260203-1010-suspend | deleted venvs: LiveCodeBench/.venv, deepseek/venv, RewardHacking/.venv; disk free now 21G (df /)
+2026-02-03T10:47:35-03:00 | SID-20260203-1043 | OBSERVED: local disk full (root 100%) caused safetensors save failure; workaround for tests: TMPDIR=/dev/shm, TINKER_DEBATE_LOG_ROOT=/dev/shm/tinker_logs, TINKER_LOCAL_CHECKPOINT_DIR=/dev/shm/tinker_checkpoints
+2026-02-03T10:47:57-03:00 | SID-20260203-1043 | test: local single_turn QA dry-run ok (LFM2.5-1.2B-Base, prompt_style=base) using tmpfs logs/ckpts; rollout_time 18.3s; training_data 2
+2026-02-03T10:49:10-03:00 | SID-20260203-1043 | sync: copied base-prompt changes to usp_vm02 (qa_task.py, orthogonal_driver.py, qa_base_user.md)
+2026-02-03T10:50:55-03:00 | SID-20260203-1043 | test: usp_vm02 single_turn QA dry-run ok (Ministral-3-3B-Base-2512, prompt_style=base) using /dev/shm logs/ckpts; rollout_time 1.1s; training_data 2
+2026-02-03T10:56:25-03:00 | SID-20260203-1043 | OBSERVED: constrained_writing debate dry-run failed using HF repo LiquidAI/LFM2.5-1.2B (repo not found)
+2026-02-03T10:56:55-03:00 | SID-20260203-1043 | test: local constrained_writing debate dry-run ok with local model models/LiquidAI__LFM2.5-1.2B-Instruct (mock judge) using /dev/shm logs/ckpts; rollout_time 364.0s; training_data 2
