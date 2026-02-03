@@ -112,7 +112,16 @@ def _select_sentinels(tokenizer: Any) -> list[tuple[str, int]] | None:
         special_tokens = []
     if not special_tokens:
         special_tokens = list(getattr(tokenizer, "all_special_tokens", []) or [])
-    base_specials = set(getattr(tokenizer, "special_tokens_map", {}).values())
+    base_specials: set[str] = set()
+    for val in getattr(tokenizer, "special_tokens_map", {}).values():
+        if val is None:
+            continue
+        if isinstance(val, (list, tuple)):
+            for item in val:
+                if item is not None:
+                    base_specials.add(str(item))
+        else:
+            base_specials.add(str(val))
     all_specials = set(getattr(tokenizer, "all_special_tokens", []) or [])
 
     preferred = ("<|tinker_sentinel_a|>", "<|tinker_sentinel_b|>")

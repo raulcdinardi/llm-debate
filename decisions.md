@@ -47,3 +47,8 @@
 2026-02-03T13:54:40-03:00 | SID-20260203-1354 | init session; add robust training diagnostics (grad/param stats + ratio/adv stats) for local+cloud
 2026-02-03T13:55:10-03:00 | SID-20260203-1354 | code: local training_client now reports grad/param metrics; tinker_client computes ratio/adv stats; train.py prints diagnostics per step
 2026-02-03T13:55:30-03:00 | SID-20260203-1354 | tests: py_compile training_client.py, tinker_client.py, scripts/train.py ok
+2026-02-03T13:55:20-03:00 | SID-20260203-1355 | init session; md-friction-plan start
+2026-02-03T13:58:19-03:00 | SID-20260203-1355 | md-friction-plan: read all md files + scanned scripts/train.py, scripts/test_debate.py, orthogonal_driver.py for entrypoints; draft friction notes
+2026-02-03T13:59:20-03:00 | SID-20260203-1354 | OBSERVED: GPU box local run failed; HF repo Qwen/Qwen3-4B-Instruct returned 404 (tokenizer_config not found)
+2026-02-03T14:03:05-03:00 | SID-20260203-1354 | fix: chat_templates _select_sentinels handles list-valued special_tokens_map entries (Qwen3) to avoid unhashable list error
+2026-02-03T14:03:15-03:00 | SID-20260203-1354 | tests: py_compile chat_templates.py ok
