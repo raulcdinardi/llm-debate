@@ -19,3 +19,12 @@
 2026-02-03T13:10:09Z | session=20260203-1010-suspend | scheduled user systemd timer codex-suspend-3h to run /usr/bin/systemctl suspend in 3h (one-off)
 2026-02-03T10:16:23-03:00 | SID-20260203-0136 | constrained_writing debate dry-run (llm judge) failed: judge INVALID verdict -> training_data empty -> RuntimeError; logs saved in logs/20260203_100950_n2_g1_debate_constrained_writing_custom_constrained_debate_smoke_1
 2026-02-03T10:16:23-03:00 | SID-20260203-0136 | constrained_writing debate dry-runs w/ mock judge ok: logs in logs/20260203_101154_n2_g1_debate_constrained_writing_custom_constrained_debate_smoke_2 and logs/20260203_101358_n2_g1_debate_constrained_writing_custom_constrained_debate_smoke_3; manual review shows R2/R3 largely restate R1, minimal critique
+2026-02-03T10:17:55-03:00 | SID-20260203-0136 | checked usp_vm02 via nvidia-smi: GPU util 0%, mem used 619MB/12282MB; repo not found on usp_vm02
+2026-02-03T13:20:16Z | session=20260203-1010-suspend | canceled user systemd timer codex-suspend-3h (no suspend scheduled)
+2026-02-03T13:22:05Z | session=20260203-1010-suspend | started temporary sleep inhibitor for 3h via user systemd unit codex-inhibit-sleep-3h (systemd-inhibit --what=sleep)
+2026-02-03T10:38:30-03:00 | SID-20260203-1038 | init session; focus: Ministral-3-3B-Instruct-2512 local backend (sentinels + FP8) on usp_vm02
+2026-02-03T10:39:12-03:00 | SID-20260203-1038 | fix: chat_templates sentinel selection now prefers <|tinker_sentinel_a|>/<|tinker_sentinel_b|> when present and skips base specials to avoid duplicate/absent sentinels in templated prompts
+2026-02-03T10:39:45-03:00 | SID-20260203-1038 | OBSERVED: usp_vm02 dry-run failed with RuntimeError addmm_cuda not implemented for Float8_e4m3fn (LoRA on FP8 weights)
+2026-02-03T10:40:03-03:00 | SID-20260203-1038 | fix: cast base model to requested dtype at load (base.to(device,dtype)) to avoid FP8 matmul failure
+2026-02-03T10:41:15-03:00 | SID-20260203-1038 | test: usp_vm02 debate dry-run ok (constrained_writing, mock judge) using Ministral-3-3B-Instruct-2512; logs/20260203_103710_n2_g1_debate_constrained_writing_custom_constrained_debate_ministral_3
+2026-02-03T10:42:05-03:00 | SID-20260203-1038 | tests: py_compile chat_templates.py and _transformers_backend.py ok

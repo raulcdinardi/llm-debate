@@ -16,7 +16,12 @@ class BackendConfig:
 def load_tokenizer(model_name: str):
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    trust_remote_code = os.environ.get("TINKER_LOCAL_TRUST_REMOTE_CODE") == "1"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=trust_remote_code)
+    if os.environ.get("TINKER_LOCAL_ADD_SENTINELS") == "1":
+        tokenizer.add_special_tokens(
+            {"additional_special_tokens": ["<|tinker_sentinel_a|>", "<|tinker_sentinel_b|>"]}
+        )
     # Decoder-only generation with batched padding should be left-padded.
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
@@ -39,22 +44,50 @@ def load_lora_model_and_tokenizer(*, model_name: str, rank: int, config: LocalCo
 
     import torch
     from peft import LoraConfig, get_peft_model
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoConfig, AutoModelForCausalLM, Mistral3ForConditionalGeneration
 
     if config.device == "cuda":
         dtype = torch.bfloat16
     else:
         dtype = torch.float32
 
-    base = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+    tokenizer = load_tokenizer(model_name)
+
+    trust_remote_code = os.environ.get("TINKER_LOCAL_TRUST_REMOTE_CODE") == "1"
+    cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    if getattr(cfg, "model_type", None) == "mistral3":
+        base = Mistral3ForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+        )
+    else:
+        base = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        )
+    if base.get_input_embeddings().num_embeddings != len(tokenizer):
+        base.resize_token_embeddings(len(tokenizer))
+    # Mistral3 weights are FP8 by default; cast to the requested dtype to avoid FP8 matmul failures.
+    base.to(device=config.device, dtype=dtype)
     base.gradient_checkpointing_enable()
     base.enable_input_require_grads()
-    base.to(config.device)
 
     target_modules = None
-    if getattr(base.config, "model_type", None) == "lfm2":
+    model_type = getattr(base.config, "model_type", None)
+    if model_type == "lfm2":
         # LFM2.5 doesn't provide PEFT target module hints; specify common attention/MLP linears.
         target_modules = ["q_proj", "k_proj", "v_proj", "out_proj", "w1", "w2", "w3", "in_proj"]
+    if model_type in ("mistral3", "ministral3"):
+        target_modules = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
 
     lora = LoraConfig(
         r=rank,
@@ -75,7 +108,6 @@ def load_lora_model_and_tokenizer(*, model_name: str, rank: int, config: LocalCo
     else:
         model.to(torch.device("cpu"))
 
-    tokenizer = load_tokenizer(model_name)
     return model, tokenizer
 
 

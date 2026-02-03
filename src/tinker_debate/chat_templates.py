@@ -105,8 +105,26 @@ def _infer_chatml_token_ids(tokenizer: Any) -> tuple[int, int] | None:
 def _select_sentinels(tokenizer: Any) -> list[tuple[str, int]] | None:
     template = getattr(tokenizer, "chat_template", "") or ""
     candidates: list[tuple[str, int]] = []
+    special_tokens: list[str] = []
+    try:
+        special_tokens = list(getattr(tokenizer, "additional_special_tokens", []) or [])
+    except Exception:
+        special_tokens = []
+    if not special_tokens:
+        special_tokens = list(getattr(tokenizer, "all_special_tokens", []) or [])
+    base_specials = set(getattr(tokenizer, "special_tokens_map", {}).values())
+    all_specials = set(getattr(tokenizer, "all_special_tokens", []) or [])
+
+    preferred = ("<|tinker_sentinel_a|>", "<|tinker_sentinel_b|>")
+    if all(tok in all_specials for tok in preferred):
+        ids = [tokenizer.encode(tok, add_special_tokens=False) for tok in preferred]
+        if all(len(tok_ids) == 1 for tok_ids in ids) and not any(tok in base_specials for tok in preferred):
+            return [(preferred[0], int(ids[0][0])), (preferred[1], int(ids[1][0]))]
+
     # Prefer reserved special tokens not referenced in the chat template to ensure uniqueness.
-    for tok in getattr(tokenizer, "additional_special_tokens", []) or []:
+    for tok in special_tokens:
+        if tok in base_specials:
+            continue
         if tok in template:
             continue
         ids = tokenizer.encode(tok, add_special_tokens=False)
@@ -129,6 +147,7 @@ def _continuation_with_sentinels(
     user_sentinel_id: int,
 ) -> tuple[list[int], list[int]]:
     messages = [
+        {"role": "user", "content": "DUMMY"},
         {"role": "assistant", "content": assistant_sentinel},
         {"role": "user", "content": f"{user_pre}{user_sentinel}{user_post}"},
     ]
