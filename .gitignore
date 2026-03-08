@@ -32,6 +32,7 @@ outcodex.txt
 
 # Virtualenv
 venv/
+.venv/
 
 # Misc
 .train.py.kate-swp

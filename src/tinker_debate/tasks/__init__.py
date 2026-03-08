@@ -3,6 +3,7 @@ from __future__ import annotations
 from .coin_task import CoinTask
 from .constrained_writing_task import ConstrainedWritingTask
 from .confidence_task import ConfidenceTask
+from .ht_sequence_task import HTSequenceTask
 from .qa_task import QATask
 from .secret_word_debate_task import SecretWordDebateTask
 from .summary_task import SummaryTask
@@ -12,6 +13,7 @@ __all__ = [
     "CoinTask",
     "ConstrainedWritingTask",
     "ConfidenceTask",
+    "HTSequenceTask",
     "QATask",
     "SecretWordDebateTask",
     "SummaryTask",

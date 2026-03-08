@@ -9,6 +9,7 @@ from tinker_debate.summary.rewards import RewardConfig
 from tinker_debate.tasks.coin_task import CoinTask
 from tinker_debate.tasks.constrained_writing_task import ConstrainedWritingTask
 from tinker_debate.tasks.confidence_task import ConfidenceTask
+from tinker_debate.tasks.ht_sequence_task import HTSequenceTask
 from tinker_debate.tasks.qa_task import QATask
 from tinker_debate.tasks.secret_word_debate_task import SecretWordDebateTask
 from tinker_debate.tasks.summary_task import SummaryTask
@@ -56,6 +57,10 @@ class OrthogonalDriver(RolloutDriver):
             self.normal_temperature = float(args.temperature)
         elif task_name == "coin":
             self.task = CoinTask.create(target_color=str(args.coin_target))
+            self.normal_max_tokens = int(args.max_tokens)
+            self.normal_temperature = float(args.temperature)
+        elif task_name == "ht_sequence":
+            self.task = HTSequenceTask.create(sequence_len=int(args.ht_seq_len))
             self.normal_max_tokens = int(args.max_tokens)
             self.normal_temperature = float(args.temperature)
         elif task_name == "qa":

@@ -52,9 +52,18 @@ def load_lora_model_and_tokenizer(*, model_name: str, rank: int, config: LocalCo
     base.to(config.device)
 
     target_modules = None
-    if getattr(base.config, "model_type", None) == "lfm2":
+    model_type = getattr(base.config, "model_type", None)
+    if model_type == "lfm2":
         # LFM2.5 doesn't provide PEFT target module hints; specify common attention/MLP linears.
         target_modules = ["q_proj", "k_proj", "v_proj", "out_proj", "w1", "w2", "w3", "in_proj"]
+    elif model_type == "qwen3_5":
+        # Qwen3.5 may not auto-map in PEFT; target common attention + MLP projections explicitly.
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+    if target_modules is None:
+        # Fail-safe for model families that PEFT cannot auto-map in this environment.
+        # "all-linear" is supported by PEFT and avoids brittle architecture name checks.
+        target_modules = "all-linear"
 
     lora = LoraConfig(
         r=rank,
@@ -83,4 +92,16 @@ def build_optimizer(model, learning_rate: float):
     import torch
 
     params = [p for p in model.parameters() if p.requires_grad]
-    return torch.optim.AdamW(params, lr=learning_rate)
+    optimizer_name = os.environ.get("TINKER_LOCAL_OPTIMIZER", "adamw").strip().lower()
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(params, lr=learning_rate)
+    if optimizer_name == "sgd":
+        momentum_env = os.environ.get("TINKER_LOCAL_SGD_MOMENTUM")
+        momentum = 0.0 if momentum_env is None else float(momentum_env)
+        nesterov = os.environ.get("TINKER_LOCAL_SGD_NESTEROV", "0") == "1"
+        if nesterov and momentum <= 0.0:
+            raise ValueError("TINKER_LOCAL_SGD_NESTEROV=1 requires TINKER_LOCAL_SGD_MOMENTUM > 0.")
+        return torch.optim.SGD(params, lr=learning_rate, momentum=momentum, nesterov=nesterov)
+    raise ValueError(
+        f"Unknown TINKER_LOCAL_OPTIMIZER={optimizer_name!r}. Expected 'adamw' or 'sgd'."
+    )

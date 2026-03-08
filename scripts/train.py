@@ -98,12 +98,30 @@ def parse_args():
         "--env",
         type=str,
         default=None,
-        choices=["qa", "confidence", "summary", "coin", "secret_word", "constrained_writing"],
+        choices=["qa", "confidence", "summary", "coin", "ht_sequence", "secret_word", "constrained_writing"],
         help="Task/env. Required if --mode=single_turn. Optional if --mode=debate (default: qa).",
     )
     parser.add_argument("-n", "--num-rollouts", type=int, default=16, help="Total rollouts per step")
     parser.add_argument("-s", "--steps", type=int, default=1, help="Training steps")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument(
+        "--opt",
+        type=str,
+        default=None,
+        choices=["adamw", "sgd"],
+        help="(local backend) Optimizer override. Default remains AdamW.",
+    )
+    parser.add_argument(
+        "--sgd-momentum",
+        type=float,
+        default=None,
+        help="(local backend, --opt=sgd) Momentum for SGD.",
+    )
+    parser.add_argument(
+        "--sgd-nesterov",
+        action="store_true",
+        help="(local backend, --opt=sgd) Enable Nesterov momentum.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Run debates but don't train")
     parser.add_argument("--mock-judge", action="store_true", help="Use random mock judge instead of LLM")
     parser.add_argument(
@@ -170,6 +188,12 @@ def parse_args():
         default="Blue",
         choices=["Red", "Blue"],
         help="(coin env) Color treated as reward=1.",
+    )
+    parser.add_argument(
+        "--ht-seq-len",
+        type=int,
+        default=8,
+        help="(ht_sequence env) Target number of H/T characters in the generated sequence.",
     )
     parser.add_argument(
         "--temperature",
@@ -470,6 +494,23 @@ def save_summary_log(*, record: dict, log_dir: Path, model_name: str | None = No
 async def main():
     args = parse_args()
 
+    if (args.sgd_momentum is not None or args.sgd_nesterov) and args.opt != "sgd":
+        console.print("[red]Error: --sgd-momentum/--sgd-nesterov require --opt=sgd[/red]")
+        sys.exit(1)
+
+    is_local_backend = ("TINKER_LOCAL_BACKEND" in os.environ) or (os.environ.get("TINKER_BACKEND") == "local")
+    if args.opt == "sgd" and not is_local_backend:
+        console.print("[red]Error: --opt=sgd is currently supported only in local backend mode.[/red]")
+        console.print("[red]API mode currently exposes Adam optimizer params only.[/red]")
+        sys.exit(1)
+
+    if args.opt is not None:
+        os.environ["TINKER_LOCAL_OPTIMIZER"] = str(args.opt)
+    if args.sgd_momentum is not None:
+        os.environ["TINKER_LOCAL_SGD_MOMENTUM"] = str(float(args.sgd_momentum))
+    if args.sgd_nesterov:
+        os.environ["TINKER_LOCAL_SGD_NESTEROV"] = "1"
+
     # Validate mode/env combination
     if args.mode == "single_turn" and args.env is None:
         console.print("[red]Error: --env is required when --mode=single_turn[/red]")
@@ -514,6 +555,8 @@ async def main():
         console.print("Dataset: confidence/questions.json")
     elif args.env == "summary":
         console.print(f"Dataset: cnn_dailymail, reward_fn: {args.reward_fn}")
+    elif args.env == "ht_sequence":
+        console.print(f"H/T sequence env: sequence_len={args.ht_seq_len}")
     elif args.env == "constrained_writing":
         console.print(
             "Constrained writing: "

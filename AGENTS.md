@@ -51,6 +51,19 @@ CODE PRACTICES:
 * Report changes as “what changed + why” (not just “done”).
 * Prefer minimal diffs: 1) implement the minimal change satisfying the request 2) verify it works 3) refactor or generalize only after validation. Assume there is significant “wiring” cost; think of facilitated variation where weak regulatory linkage and modularity helps with evolvability.
 * Aim for reproducibility (when not in conflict with standard practice, common sense, the goal of the project, etc.): set and log RNG seeds; log full config; write outputs with deterministic names.
+* Give folders/files descriptive names.
+  A good name should:
+  - Optimize for discoverability: someone should infer purpose without opening the file.
+  - Encode only disambiguating context (task/scope/key variant/date), not noise (temp/new/final/final2).
+  - Be stable and sortable: lowercase `snake_case`, consistent field order, deterministic separators.
+  - Reflect artifact type in the noun (e.g., `runbook`, `analysis`, `plot`, `sweep`, `decision_log`).
+  - Distinguish persistent vs throwaway work explicitly (`scratch_`, `archive_`, or dated/session-scoped names).
+  - Preserve references when renaming already-linked docs by leaving a short pointer stub at the old path.
+* Use good Git hygiene to keep history readable and recoverable.
+  - Make one commit per logical change; do not mix unrelated edits.
+  - Use descriptive commit messages (`area: what changed`).
+  - Before committing, inspect `git status --short` and staged diff to avoid accidental files.
+  - Prefer additive history; do not rewrite shared history unless explicitly requested.
 * Run simple validations (except when it will cost money, e.g. it hits an API; then suggest running a minimal validation. If there’s an idle SPU instance you can start a minimal validation without suggesting.)
 * Comments are for future readers (including LLM agents) who read code fluently but lack conversation context. Each comment should add information not recoverable from the code—why this approach, what shaped the decision, what non-obvious things it depends on. Prolix language wastes context window tokens; dense comments don’t. Roughly 30% comment-to-code ratio is fine if they’re high-value—the cost is verbosity, not volume. You can add comments to legacy code but you need to be certain of the information correctness in the comment.
 * When reporting unexpected behavior, separate OBSERVED (what literally happened—logs, outputs, traces) from HYPOTHESIZED (your interpretation). Include what would confirm/refute the hypothesis. Don’t collapse these.
@@ -66,6 +79,13 @@ Very practical advice:
 * LMs are very reliant on the token template they use during training; i.e., the chat template should exactly match. Instruction-tuned models should be given instructions, not completions like base models are given.
 * Read tinker-cookbook/llms-full.txt if working with the Tinker API or the local API.
 * The local and cloud APIs should match; flag STRONGLY discrepancies.
+* For remote long-running jobs and queueing, use named `tmux` sessions instead of `nohup` (especially avoid nested `nohup` over SSH).
+* Enforce a single-owner queue per host/workdir: before starting a queue, check existing queue sessions/processes and avoid duplicate wait loops.
+* Prefer `rsync -av --relative` for remote code sync; avoid `scp` patterns that drop files into repo root by accident.
+* For `scripts/vastai_autostop.py`, use it in both places: locally and on the cloud machine. In local context it sends a download-only prompt to Codex (from this repo) to pull experiment artifacts, then this script stops the instance; in machine context it skips Codex and still enforces stop rules. Configure both stoppers together when needed (`--max-hours` timer + zero-GPU stopper via `--idle-mins` with `--gpu-util-threshold 0`). Include `--codex-downloader-extra "..."` so the launcher can pass exact cloud artifact paths and exact local destination paths for deterministic downloads.
+* For run-health and stop decisions, prefer GPU wattage as the primary activity signal (`nvidia-smi --query-gpu=power.draw,power.limit`) and treat `gpu_util` as secondary. If wattage and utilization disagree, trust sustained wattage trends.
+* After remote launch, verify twice: immediate (session/process/log created) and delayed (step count/log timestamp/GPU util advancing).
+* In decisions logs for remote runs, always include host, tmux session name, PID, command, and log path for recovery/handoff.
 
 Thanks :)
 
