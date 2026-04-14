@@ -1,0 +1,11 @@
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+.coverage
+checkpoints/
+artifacts/
+hf_home/
+.mypy_cache/
