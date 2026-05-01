@@ -44,9 +44,11 @@ def test_single_turn_builder_uses_shared_adapter() -> None:
         max_tokens=8,
         temperature=0.0,
         seed=0,
+        min_p=0.2,
     )
     assert len(sample.turns) == 1
     assert sampler.requests[0].adapter_name == "shared"
+    assert sampler.requests[0].min_p == 0.2
 
 
 def test_debate_builder_routes_solution_then_debate() -> None:

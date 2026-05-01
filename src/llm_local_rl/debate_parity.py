@@ -1,0 +1,962 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import math
+from typing import Any, Callable, Literal
+
+from llm_local_rl.prompts import load_prompt
+from llm_local_rl.types import TrainExample
+
+Verdict = Literal["A", "B", "INVALID"]
+
+
+@dataclass
+class Transition:
+    prompt_tokens: list[int]
+    completion_tokens: list[int]
+    completion_logprobs: list[float]
+    round_num: int
+    metrics: dict[str, Any] = field(default_factory=dict)
+    raw_response: dict[str, Any] | None = None
+
+    @property
+    def total_tokens(self) -> int:
+        return len(self.prompt_tokens) + len(self.completion_tokens)
+
+
+@dataclass
+class DebateTrajectory:
+    agent: Literal["A", "B"]
+    transitions: list[Transition]
+    frozen_solution: str | None
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def total_completion_tokens(self) -> int:
+        return sum(len(t.completion_tokens) for t in self.transitions)
+
+
+@dataclass
+class DebateResult:
+    question: str
+    ground_truth: str | None
+    trajectory_a: DebateTrajectory
+    trajectory_b: DebateTrajectory
+    verdict: Verdict
+    judge_reasoning: str
+    metrics: dict[str, Any] = field(default_factory=dict)
+    judge_prompt_tokens: list[int] | None = None
+    judge_completion_tokens: list[int] | None = None
+    judge_completion_logprobs: list[float] | None = None
+    judge_raw_response: dict[str, Any] | None = None
+
+    def get_winner_trajectory(self) -> DebateTrajectory:
+        if self.verdict == "A":
+            return self.trajectory_a
+        return self.trajectory_b
+
+    def get_loser_trajectory(self) -> DebateTrajectory:
+        if self.verdict == "A":
+            return self.trajectory_b
+        return self.trajectory_a
+
+
+@dataclass
+class DebateConfig:
+    num_rounds: int = 3
+    enable_thinking: bool | None = None
+    max_tokens_per_turn: int | None = None
+    temperature: float = 0.8
+    kl_coef: float = 0.01
+    learning_rate: float = 1e-5
+    system_propose: str = load_prompt("debate/system_propose.md")
+    system_argue: str = load_prompt("debate/system_argue.md")
+    system_judge: str = load_prompt("debate/system_judge.md")
+    r2_user_template: str = load_prompt("debate/r2_user_template.md")
+    r3_user_template: str = load_prompt("debate/r3_user_template.md")
+    chat_preamble: str = ""
+
+    @staticmethod
+    def cheap(*, chat_preamble: str = "") -> "DebateConfig":
+        return DebateConfig(max_tokens_per_turn=None, temperature=0.7, chat_preamble=chat_preamble)
+
+
+@dataclass
+class TrainingDatum:
+    prompt_tokens: list[int]
+    completion_tokens: list[int]
+    completion_logprobs: list[float]
+    completion_advantages: list[float]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _im_start(role: str) -> str:
+    return f"<|im_start|>{role}\n"
+
+
+def _im_end() -> str:
+    return "<|im_end|>\n"
+
+
+def build_r1_prompt(question: str, config: DebateConfig) -> str:
+    return (
+        config.chat_preamble
+        + _im_start("system")
+        + config.system_propose
+        + "\n"
+        + _im_end()
+        + _im_start("user")
+        + question
+        + "\n"
+        + _im_end()
+        + _im_start("assistant")
+    )
+
+
+def build_r2_continuation(opponent_r1: str, config: DebateConfig) -> str:
+    user_msg = config.r2_user_template.format(opponent_r1=opponent_r1)
+    return _im_end() + _im_start("user") + user_msg + "\n" + _im_end() + _im_start("assistant")
+
+
+def build_r3_continuation(opponent_r2: str, config: DebateConfig) -> str:
+    user_msg = config.r3_user_template.format(opponent_r2=opponent_r2)
+    return _im_end() + _im_start("user") + user_msg + "\n" + _im_end() + _im_start("assistant")
+
+
+def _merge_rounds_with_centered_reward(
+    *,
+    debate: DebateResult,
+    winner: DebateTrajectory,
+    reward: float,
+    mean_reward: float,
+    group_size: int | None,
+    std_reward: float | None = None,
+) -> TrainingDatum:
+    if len(winner.transitions) != 3:
+        raise ValueError(f"Expected 3 rounds, got {len(winner.transitions)}")
+
+    t1, t2, t3 = winner.transitions
+    for t in (t1, t2, t3):
+        if len(t.completion_tokens) != len(t.completion_logprobs):
+            raise ValueError(
+                f"Completion/logprob length mismatch in round {t.round_num}: "
+                f"{len(t.completion_tokens)} vs {len(t.completion_logprobs)}"
+            )
+
+    r1_full_len = len(t1.prompt_tokens) + len(t1.completion_tokens)
+    if len(t2.prompt_tokens) < r1_full_len:
+        raise ValueError("R2 prompt shorter than R1 history; extension property violated.")
+    r2_continuation_tokens = t2.prompt_tokens[r1_full_len:]
+
+    r2_full_len = len(t2.prompt_tokens) + len(t2.completion_tokens)
+    if len(t3.prompt_tokens) < r2_full_len:
+        raise ValueError("R3 prompt shorter than R2 history; extension property violated.")
+    r3_continuation_tokens = t3.prompt_tokens[r2_full_len:]
+
+    merged_completion = (
+        t1.completion_tokens
+        + r2_continuation_tokens
+        + t2.completion_tokens
+        + r3_continuation_tokens
+        + t3.completion_tokens
+    )
+    merged_logprobs = (
+        list(t1.completion_logprobs)
+        + [0.0] * len(r2_continuation_tokens)
+        + list(t2.completion_logprobs)
+        + [0.0] * len(r3_continuation_tokens)
+        + list(t3.completion_logprobs)
+    )
+
+    total_generated_tokens = len(t1.completion_tokens) + len(t2.completion_tokens) + len(t3.completion_tokens)
+    if total_generated_tokens <= 0:
+        raise ValueError("Winner trajectory has zero generated tokens.")
+
+    centered_reward = reward - mean_reward
+    if std_reward is not None:
+        if std_reward > 0:
+            centered_reward = centered_reward / std_reward
+        else:
+            centered_reward = 0.0
+    advantage_value = centered_reward / total_generated_tokens
+
+    merged_advantages = (
+        [advantage_value] * len(t1.completion_tokens)
+        + [0.0] * len(r2_continuation_tokens)
+        + [advantage_value] * len(t2.completion_tokens)
+        + [0.0] * len(r3_continuation_tokens)
+        + [advantage_value] * len(t3.completion_tokens)
+    )
+
+    return TrainingDatum(
+        prompt_tokens=t1.prompt_tokens,
+        completion_tokens=merged_completion,
+        completion_logprobs=merged_logprobs,
+        completion_advantages=merged_advantages,
+        metadata={
+            "question": debate.question[:100],
+            "agent": winner.agent,
+            "verdict": debate.verdict,
+            "reward": reward,
+            "centered_reward": centered_reward,
+            "group_mean_reward": mean_reward,
+            "group_std_reward": std_reward,
+            "group_size": group_size,
+            "rounds_merged": 3,
+        },
+    )
+
+
+def _merge_rounds_with_adv_values(
+    *,
+    debate: DebateResult,
+    traj: DebateTrajectory,
+    r1_adv_value: float,
+    r2_adv_value: float,
+    r3_adv_value: float,
+    metadata: dict[str, Any],
+) -> TrainingDatum:
+    if len(traj.transitions) != 3:
+        raise ValueError(f"Expected 3 rounds, got {len(traj.transitions)}")
+    t1, t2, t3 = traj.transitions
+    for t in (t1, t2, t3):
+        if len(t.completion_tokens) != len(t.completion_logprobs):
+            raise ValueError(
+                f"Completion/logprob length mismatch in round {t.round_num}: "
+                f"{len(t.completion_tokens)} vs {len(t.completion_logprobs)}"
+            )
+    if r1_adv_value != 0.0 and len(t1.completion_tokens) == 0:
+        raise ValueError("Non-zero R1 advantage with zero R1 completion tokens.")
+    if r2_adv_value != 0.0 and len(t2.completion_tokens) == 0:
+        raise ValueError("Non-zero R2 advantage with zero R2 completion tokens.")
+    if r3_adv_value != 0.0 and len(t3.completion_tokens) == 0:
+        raise ValueError("Non-zero R3 advantage with zero R3 completion tokens.")
+
+    r1_full_len = len(t1.prompt_tokens) + len(t1.completion_tokens)
+    if len(t2.prompt_tokens) < r1_full_len:
+        raise ValueError("R2 prompt shorter than R1 history; extension property violated.")
+    r2_continuation_tokens = t2.prompt_tokens[r1_full_len:]
+    r2_full_len = len(t2.prompt_tokens) + len(t2.completion_tokens)
+    if len(t3.prompt_tokens) < r2_full_len:
+        raise ValueError("R3 prompt shorter than R2 history; extension property violated.")
+    r3_continuation_tokens = t3.prompt_tokens[r2_full_len:]
+
+    merged_completion = (
+        t1.completion_tokens
+        + r2_continuation_tokens
+        + t2.completion_tokens
+        + r3_continuation_tokens
+        + t3.completion_tokens
+    )
+    merged_logprobs = (
+        list(t1.completion_logprobs)
+        + [0.0] * len(r2_continuation_tokens)
+        + list(t2.completion_logprobs)
+        + [0.0] * len(r3_continuation_tokens)
+        + list(t3.completion_logprobs)
+    )
+    merged_advantages = (
+        [r1_adv_value] * len(t1.completion_tokens)
+        + [0.0] * len(r2_continuation_tokens)
+        + [r2_adv_value] * len(t2.completion_tokens)
+        + [0.0] * len(r3_continuation_tokens)
+        + [r3_adv_value] * len(t3.completion_tokens)
+    )
+
+    return TrainingDatum(
+        prompt_tokens=t1.prompt_tokens,
+        completion_tokens=merged_completion,
+        completion_logprobs=merged_logprobs,
+        completion_advantages=merged_advantages,
+        metadata={
+            "question": debate.question[:100],
+            "agent": traj.agent,
+            "verdict": debate.verdict,
+            **metadata,
+        },
+    )
+
+
+def _merge_two_rounds_with_adv_values(
+    *,
+    debate: DebateResult,
+    traj: DebateTrajectory,
+    r1_adv_value: float,
+    r2_adv_value: float,
+    metadata: dict[str, Any],
+) -> TrainingDatum:
+    if len(traj.transitions) != 2:
+        raise ValueError(f"Expected 2 rounds, got {len(traj.transitions)}")
+    t1, t2 = traj.transitions
+    for t in (t1, t2):
+        if len(t.completion_tokens) != len(t.completion_logprobs):
+            raise ValueError(
+                f"Completion/logprob length mismatch in round {t.round_num}: "
+                f"{len(t.completion_tokens)} vs {len(t.completion_logprobs)}"
+            )
+    if r1_adv_value != 0.0 and len(t1.completion_tokens) == 0:
+        raise ValueError("Non-zero R1 advantage with zero R1 completion tokens.")
+    if r2_adv_value != 0.0 and len(t2.completion_tokens) == 0:
+        raise ValueError("Non-zero R2 advantage with zero R2 completion tokens.")
+
+    r1_full_len = len(t1.prompt_tokens) + len(t1.completion_tokens)
+    if len(t2.prompt_tokens) < r1_full_len:
+        raise ValueError("R2 prompt shorter than R1 history; extension property violated.")
+    r2_continuation_tokens = t2.prompt_tokens[r1_full_len:]
+    merged_completion = t1.completion_tokens + r2_continuation_tokens + t2.completion_tokens
+    merged_logprobs = list(t1.completion_logprobs) + [0.0] * len(r2_continuation_tokens) + list(t2.completion_logprobs)
+    merged_advantages = [r1_adv_value] * len(t1.completion_tokens) + [0.0] * len(r2_continuation_tokens) + [r2_adv_value] * len(t2.completion_tokens)
+
+    return TrainingDatum(
+        prompt_tokens=t1.prompt_tokens,
+        completion_tokens=merged_completion,
+        completion_logprobs=merged_logprobs,
+        completion_advantages=merged_advantages,
+        metadata={
+            "question": debate.question[:100],
+            "agent": traj.agent,
+            "verdict": debate.verdict,
+            **metadata,
+        },
+    )
+
+
+def assemble_training_data_grpo(
+    debates: list[DebateResult],
+    reward_fn: Callable[[DebateTrajectory, DebateResult], float],
+) -> list[TrainingDatum]:
+    groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
+    for debate in debates:
+        if debate.verdict not in ("A", "B"):
+            continue
+        winner = debate.get_winner_trajectory()
+        reward = reward_fn(winner, debate)
+        groups.setdefault(debate.question, []).append((winner, debate, reward))
+
+    data: list[TrainingDatum] = []
+    for question, group in groups.items():
+        _ = question
+        rewards = [r for _, _, r in group]
+        mean_reward = sum(rewards) / len(rewards)
+        var = sum((r - mean_reward) ** 2 for r in rewards) / len(rewards)
+        std = math.sqrt(var)
+        group_size = len(group)
+        for winner, debate, reward in group:
+            data.append(
+                _merge_rounds_with_centered_reward(
+                    debate=debate,
+                    winner=winner,
+                    reward=reward,
+                    mean_reward=mean_reward,
+                    std_reward=std,
+                    group_size=group_size,
+                )
+            )
+    return data
+
+
+def assemble_training_data_r1_r23(
+    debates: list[DebateResult],
+    r1_reward_fn: Callable[[DebateTrajectory, DebateResult], float],
+    *,
+    r23_reward: float,
+    r23_symmetric: bool,
+) -> list[TrainingDatum]:
+    groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
+    for debate in debates:
+        if debate.verdict not in ("A", "B"):
+            continue
+        traj_a = debate.trajectory_a
+        traj_b = debate.trajectory_b
+        groups.setdefault(debate.question, []).extend(
+            [
+                (traj_a, debate, r1_reward_fn(traj_a, debate)),
+                (traj_b, debate, r1_reward_fn(traj_b, debate)),
+            ]
+        )
+
+    data: list[TrainingDatum] = []
+    for question, group in groups.items():
+        _ = question
+
+        def _per_token_adv(reward: float, tokens: list[int], label: str) -> float:
+            if len(tokens) == 0:
+                raise ValueError(f"{label} completion tokens empty; cannot assign reward.")
+            return reward / len(tokens)
+
+        rewards = [r for _, _, r in group]
+        mean_reward = sum(rewards) / len(rewards)
+        var = sum((r - mean_reward) ** 2 for r in rewards) / len(rewards)
+        std = math.sqrt(var)
+        group_size = len(group)
+        r23_w = float(r23_reward)
+        r23_l = -float(r23_reward) if r23_symmetric else 0.0
+
+        for traj, debate, r1_reward in group:
+            if std > 0:
+                r1_centered = (r1_reward - mean_reward) / std
+            else:
+                r1_centered = 0.0
+            r1_adv = _per_token_adv(r1_centered, traj.transitions[0].completion_tokens, "R1")
+            is_winner = debate.get_winner_trajectory().agent == traj.agent
+            r23_reward_signed = r23_w if is_winner else r23_l
+            r2_adv = _per_token_adv(r23_reward_signed, traj.transitions[1].completion_tokens, "R2")
+            r3_adv = _per_token_adv(r23_reward_signed, traj.transitions[2].completion_tokens, "R3")
+            data.append(
+                _merge_rounds_with_adv_values(
+                    debate=debate,
+                    traj=traj,
+                    r1_adv_value=r1_adv,
+                    r2_adv_value=r2_adv,
+                    r3_adv_value=r3_adv,
+                    metadata={
+                        "r1_reward": r1_reward,
+                        "r1_centered_reward": r1_centered,
+                        "r1_adv_value": r1_adv,
+                        "r1_group_mean_reward": mean_reward,
+                        "r1_group_std_reward": std,
+                        "r1_group_size": group_size,
+                        "r23_reward": r23_reward_signed,
+                        "r23_symmetric": r23_symmetric,
+                        "r23_adv_value": r23_reward_signed,
+                        "rounds_merged": 3,
+                        "r1_trained": True,
+                        "r23_trained": r23_reward_signed != 0.0,
+                    },
+                )
+            )
+    return data
+
+
+def assemble_training_data_r1_only_centered(
+    debates: list[DebateResult],
+    reward_fn: Callable[[DebateTrajectory, DebateResult], float],
+) -> list[TrainingDatum]:
+    groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
+    for debate in debates:
+        if debate.verdict not in ("A", "B"):
+            continue
+        traj_a = debate.trajectory_a
+        traj_b = debate.trajectory_b
+        groups.setdefault(debate.question, []).extend(
+            [
+                (traj_a, debate, float(reward_fn(traj_a, debate))),
+                (traj_b, debate, float(reward_fn(traj_b, debate))),
+            ]
+        )
+
+    data: list[TrainingDatum] = []
+    for question, group in groups.items():
+        _ = question
+        rewards = [r for _, _, r in group]
+        mean_reward = sum(rewards) / len(rewards)
+        var = sum((r - mean_reward) ** 2 for r in rewards) / len(rewards)
+        std = math.sqrt(var)
+        group_size = len(group)
+        for traj, debate, reward in group:
+            t1 = traj.transitions[0]
+            if len(t1.completion_tokens) == 0:
+                raise ValueError("R1 completion tokens empty; cannot assign centered R1 reward.")
+            centered = (reward - mean_reward) / std if std > 0 else 0.0
+            adv = centered / len(t1.completion_tokens)
+            data.append(
+                TrainingDatum(
+                    prompt_tokens=t1.prompt_tokens,
+                    completion_tokens=t1.completion_tokens,
+                    completion_logprobs=t1.completion_logprobs,
+                    completion_advantages=[adv] * len(t1.completion_tokens),
+                    metadata={
+                        "question": debate.question[:100],
+                        "agent": traj.agent,
+                        "verdict": debate.verdict,
+                        "reward": reward,
+                        "centered_reward": centered,
+                        "group_mean_reward": mean_reward,
+                        "group_std_reward": std,
+                        "group_size": group_size,
+                        "rounds_merged": 1,
+                        "r1_trained": True,
+                        "r23_trained": False,
+                    },
+                )
+            )
+    return data
+
+
+def assemble_training_data_r1_only_compare(
+    debates: list[DebateResult],
+    *,
+    r1_reward: float,
+    r1_symmetric: bool,
+) -> tuple[list[TrainingDatum], int]:
+    data: list[TrainingDatum] = []
+    skipped_empty_r1_debates = 0
+    loser_reward = -float(r1_reward) if r1_symmetric else 0.0
+    winner_reward = float(r1_reward)
+    for debate in debates:
+        if debate.verdict not in ("A", "B"):
+            continue
+        if any(len(traj.transitions[0].completion_tokens) == 0 for traj in (debate.trajectory_a, debate.trajectory_b)):
+            skipped_empty_r1_debates += 1
+            continue
+        for traj in (debate.trajectory_a, debate.trajectory_b):
+            t1 = traj.transitions[0]
+            is_winner = debate.get_winner_trajectory().agent == traj.agent
+            reward = winner_reward if is_winner else loser_reward
+            adv = reward / len(t1.completion_tokens)
+            data.append(
+                TrainingDatum(
+                    prompt_tokens=t1.prompt_tokens,
+                    completion_tokens=t1.completion_tokens,
+                    completion_logprobs=t1.completion_logprobs,
+                    completion_advantages=[adv] * len(t1.completion_tokens),
+                    metadata={
+                        "question": debate.question[:100],
+                        "agent": traj.agent,
+                        "verdict": debate.verdict,
+                        "r1_reward": reward,
+                        "r1_adv_value": adv,
+                        "r1_symmetric": r1_symmetric,
+                        "rounds_merged": 1,
+                        "r1_trained": reward != 0.0,
+                        "r23_trained": False,
+                    },
+                )
+            )
+    return data, skipped_empty_r1_debates
+
+
+def assemble_training_data_r1_r2(
+    debates: list[DebateResult],
+    r1_reward_fn: Callable[[DebateTrajectory, DebateResult], float],
+    *,
+    r2_reward: float,
+    r2_symmetric: bool,
+) -> list[TrainingDatum]:
+    groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
+    for debate in debates:
+        if debate.verdict not in ("A", "B"):
+            continue
+        traj_a = debate.trajectory_a
+        traj_b = debate.trajectory_b
+        groups.setdefault(debate.question, []).extend(
+            [
+                (traj_a, debate, r1_reward_fn(traj_a, debate)),
+                (traj_b, debate, r1_reward_fn(traj_b, debate)),
+            ]
+        )
+
+    data: list[TrainingDatum] = []
+    for question, group in groups.items():
+        _ = question
+
+        def _per_token_adv(reward: float, tokens: list[int], label: str) -> float:
+            if len(tokens) == 0:
+                raise ValueError(f"{label} completion tokens empty; cannot assign reward.")
+            return reward / len(tokens)
+
+        rewards = [r for _, _, r in group]
+        mean_reward = sum(rewards) / len(rewards)
+        var = sum((r - mean_reward) ** 2 for r in rewards) / len(rewards)
+        std = math.sqrt(var)
+        group_size = len(group)
+        r2_w = float(r2_reward)
+        r2_l = -float(r2_reward) if r2_symmetric else 0.0
+
+        for traj, debate, r1_reward in group:
+            if std > 0:
+                r1_centered = (r1_reward - mean_reward) / std
+            else:
+                r1_centered = 0.0
+            r1_adv = _per_token_adv(r1_centered, traj.transitions[0].completion_tokens, "R1")
+            is_winner = debate.get_winner_trajectory().agent == traj.agent
+            r2_reward_signed = r2_w if is_winner else r2_l
+            r2_adv = _per_token_adv(r2_reward_signed, traj.transitions[1].completion_tokens, "R2")
+            data.append(
+                _merge_two_rounds_with_adv_values(
+                    debate=debate,
+                    traj=traj,
+                    r1_adv_value=r1_adv,
+                    r2_adv_value=r2_adv,
+                    metadata={
+                        "r1_reward": r1_reward,
+                        "r1_centered_reward": r1_centered,
+                        "r1_adv_value": r1_adv,
+                        "r1_group_mean_reward": mean_reward,
+                        "r1_group_std_reward": std,
+                        "r1_group_size": group_size,
+                        "r2_reward": r2_reward_signed,
+                        "r2_symmetric": r2_symmetric,
+                        "r2_adv_value": r2_adv,
+                        "rounds_merged": 2,
+                        "r1_trained": True,
+                        "r23_trained": r2_reward_signed != 0.0,
+                    },
+                )
+            )
+    return data
+
+
+def assemble_training_data_r1_compare_r2(
+    debates: list[DebateResult],
+    *,
+    r1_reward: float,
+    r1_symmetric: bool,
+    r2_reward: float,
+    r2_symmetric: bool,
+) -> list[TrainingDatum]:
+    data: list[TrainingDatum] = []
+    r1_winner_reward = float(r1_reward)
+    r1_loser_reward = -float(r1_reward) if r1_symmetric else 0.0
+    r2_winner_reward = float(r2_reward)
+    r2_loser_reward = -float(r2_reward) if r2_symmetric else 0.0
+    for debate in debates:
+        if debate.verdict not in ("A", "B"):
+            continue
+        for traj in (debate.trajectory_a, debate.trajectory_b):
+            t1, t2 = traj.transitions
+            if len(t1.completion_tokens) == 0:
+                raise ValueError("R1 completion tokens empty; cannot assign judge-compare reward.")
+            if len(t2.completion_tokens) == 0:
+                raise ValueError("R2 completion tokens empty; cannot assign reward.")
+            is_winner = debate.get_winner_trajectory().agent == traj.agent
+            signed_r1_reward = r1_winner_reward if is_winner else r1_loser_reward
+            signed_r2_reward = r2_winner_reward if is_winner else r2_loser_reward
+            data.append(
+                _merge_two_rounds_with_adv_values(
+                    debate=debate,
+                    traj=traj,
+                    r1_adv_value=signed_r1_reward / len(t1.completion_tokens),
+                    r2_adv_value=signed_r2_reward / len(t2.completion_tokens),
+                    metadata={
+                        "r1_reward": signed_r1_reward,
+                        "r1_compare": True,
+                        "r1_symmetric": r1_symmetric,
+                        "r1_adv_value": signed_r1_reward / len(t1.completion_tokens),
+                        "r2_reward": signed_r2_reward,
+                        "r2_symmetric": r2_symmetric,
+                        "r2_adv_value": signed_r2_reward / len(t2.completion_tokens),
+                        "rounds_merged": 2,
+                        "r1_trained": signed_r1_reward != 0.0,
+                        "r23_trained": signed_r2_reward != 0.0,
+                    },
+                )
+            )
+    return data
+
+
+def assemble_training_data_r1_compare_r23(
+    debates: list[DebateResult],
+    *,
+    r1_reward: float,
+    r1_symmetric: bool,
+    r23_reward: float,
+    r23_symmetric: bool,
+) -> list[TrainingDatum]:
+    data: list[TrainingDatum] = []
+    r1_winner_reward = float(r1_reward)
+    r1_loser_reward = -float(r1_reward) if r1_symmetric else 0.0
+    r23_winner_reward = float(r23_reward)
+    r23_loser_reward = -float(r23_reward) if r23_symmetric else 0.0
+    for debate in debates:
+        if debate.verdict not in ("A", "B"):
+            continue
+        for traj in (debate.trajectory_a, debate.trajectory_b):
+            t1, t2, t3 = traj.transitions
+            if len(t1.completion_tokens) == 0:
+                raise ValueError("R1 completion tokens empty; cannot assign judge-compare reward.")
+            if len(t2.completion_tokens) == 0:
+                raise ValueError("R2 completion tokens empty; cannot assign reward.")
+            if len(t3.completion_tokens) == 0:
+                raise ValueError("R3 completion tokens empty; cannot assign reward.")
+            is_winner = debate.get_winner_trajectory().agent == traj.agent
+            signed_r1_reward = r1_winner_reward if is_winner else r1_loser_reward
+            signed_r23_reward = r23_winner_reward if is_winner else r23_loser_reward
+            data.append(
+                _merge_rounds_with_adv_values(
+                    debate=debate,
+                    traj=traj,
+                    r1_adv_value=signed_r1_reward / len(t1.completion_tokens),
+                    r2_adv_value=signed_r23_reward / len(t2.completion_tokens),
+                    r3_adv_value=signed_r23_reward / len(t3.completion_tokens),
+                    metadata={
+                        "r1_reward": signed_r1_reward,
+                        "r1_compare": True,
+                        "r1_symmetric": r1_symmetric,
+                        "r1_adv_value": signed_r1_reward / len(t1.completion_tokens),
+                        "r23_reward": signed_r23_reward,
+                        "r23_symmetric": r23_symmetric,
+                        "r23_adv_value": signed_r23_reward / len(t2.completion_tokens),
+                        "rounds_merged": 3,
+                        "r1_trained": signed_r1_reward != 0.0,
+                        "r23_trained": signed_r23_reward != 0.0,
+                    },
+                )
+            )
+    return data
+
+
+def training_datum_to_train_example(*, datum: TrainingDatum, adapter_name: str) -> TrainExample:
+    if len(datum.completion_tokens) == 0:
+        raise ValueError("Cannot train on an empty completion.")
+    if len(datum.completion_tokens) != len(datum.completion_logprobs):
+        raise ValueError("Completion tokens and logprobs must have equal length.")
+    if len(datum.completion_tokens) != len(datum.completion_advantages):
+        raise ValueError("Completion tokens and advantages must have equal length.")
+
+    full_token_ids = datum.prompt_tokens + datum.completion_tokens
+    input_ids = full_token_ids[:-1]
+    target_ids = full_token_ids[1:]
+    prompt_prefix_len = len(datum.prompt_tokens) - 1
+    if prompt_prefix_len < 0:
+        raise ValueError("Prompt must contain at least one token.")
+
+    return TrainExample(
+        adapter_name=adapter_name,
+        input_ids=input_ids,
+        target_ids=target_ids,
+        loss_mask=([0] * prompt_prefix_len) + ([1] * len(datum.completion_tokens)),
+        old_logprobs=([0.0] * prompt_prefix_len) + list(datum.completion_logprobs),
+        advantages=([0.0] * prompt_prefix_len) + list(datum.completion_advantages),
+        metadata=dict(datum.metadata),
+    )
+
+
+def assemble_training_data_by_mode(
+    *,
+    debates: list[DebateResult],
+    num_rounds: int,
+    r1_reward_mode: str,
+    r23_reward_mode: str,
+    r23_constant: float,
+    r23_symmetric: bool,
+    task_reward_fn: Callable[[DebateTrajectory, DebateResult], float],
+    pointwise_reward_map: dict[int, float] | None = None,
+) -> list[TrainingDatum]:
+    if num_rounds == 1:
+        if r23_reward_mode != "none":
+            raise ValueError("r23 reward must be none when num_rounds=1")
+        if r1_reward_mode == "task":
+            return assemble_training_data_r1_only_centered(debates, task_reward_fn)
+        if r1_reward_mode == "judge_pointwise":
+            if pointwise_reward_map is None:
+                raise ValueError("judge_pointwise requires pointwise_reward_map")
+            return assemble_training_data_r1_only_centered(debates, lambda traj, _debate: pointwise_reward_map[id(traj)])
+        if r1_reward_mode == "judge":
+            result = assemble_training_data_r1_only_compare(
+                debates,
+                r1_reward=float(r23_constant),
+                r1_symmetric=r23_symmetric,
+            )
+            if isinstance(result, tuple):
+                return result[0]
+            return result
+        raise ValueError(f"Unsupported r1_reward_mode={r1_reward_mode!r}")
+    if num_rounds == 2:
+        if r1_reward_mode == "task":
+            r1_reward_fn = task_reward_fn
+        elif r1_reward_mode == "judge_pointwise":
+            if pointwise_reward_map is None:
+                raise ValueError("judge_pointwise requires pointwise_reward_map")
+            r1_reward_fn = lambda traj, _debate: pointwise_reward_map[id(traj)]
+        elif r1_reward_mode == "judge":
+            r2_reward = 0.0 if r23_reward_mode == "none" else float(r23_constant)
+            return assemble_training_data_r1_compare_r2(
+                debates,
+                r1_reward=float(r23_constant),
+                r1_symmetric=r23_symmetric,
+                r2_reward=r2_reward,
+                r2_symmetric=r23_symmetric,
+            )
+        elif r1_reward_mode == "none":
+            r1_reward_fn = lambda _traj, _debate: 0.0
+        else:
+            raise ValueError(f"Unsupported r1_reward_mode={r1_reward_mode!r}")
+        r2_reward = 0.0 if r23_reward_mode == "none" else float(r23_constant)
+        return assemble_training_data_r1_r2(
+            debates,
+            r1_reward_fn=r1_reward_fn,
+            r2_reward=r2_reward,
+            r2_symmetric=r23_symmetric,
+        )
+    if num_rounds == 3:
+        if r1_reward_mode == "task":
+            r1_reward_fn = task_reward_fn
+        elif r1_reward_mode == "judge_pointwise":
+            if pointwise_reward_map is None:
+                raise ValueError("judge_pointwise requires pointwise_reward_map")
+            r1_reward_fn = lambda traj, _debate: pointwise_reward_map[id(traj)]
+        elif r1_reward_mode == "judge":
+            r23_reward = 0.0 if r23_reward_mode == "none" else float(r23_constant)
+            return assemble_training_data_r1_compare_r23(
+                debates,
+                r1_reward=float(r23_constant),
+                r1_symmetric=r23_symmetric,
+                r23_reward=r23_reward,
+                r23_symmetric=r23_symmetric,
+            )
+        elif r1_reward_mode == "none":
+            r1_reward_fn = lambda _traj, _debate: 0.0
+        else:
+            raise ValueError(f"Unsupported r1_reward_mode={r1_reward_mode!r}")
+        r23_reward = 0.0 if r23_reward_mode == "none" else float(r23_constant)
+        return assemble_training_data_r1_r23(
+            debates,
+            r1_reward_fn=r1_reward_fn,
+            r23_reward=r23_reward,
+            r23_symmetric=r23_symmetric,
+        )
+    raise ValueError(f"Unsupported num_rounds={num_rounds!r}")
+
+
+def assemble_split_train_examples(
+    *,
+    debates: list[DebateResult],
+    num_rounds: int,
+    round_adapter_names: tuple[str, ...],
+    r1_reward_mode: str,
+    r23_reward_mode: str,
+    r23_constant: float,
+    r23_symmetric: bool,
+    task_reward_fn: Callable[[DebateTrajectory, DebateResult], float],
+    pointwise_reward_map: dict[int, float] | None = None,
+) -> dict[str, list[TrainExample]]:
+    if len(round_adapter_names) < num_rounds:
+        raise ValueError(f"Need at least {num_rounds} round adapter names, got {len(round_adapter_names)}")
+    grouped: dict[str, list[TrainExample]] = {}
+
+    def _append_turn(*, adapter_name: str, prompt_tokens: list[int], completion_tokens: list[int], completion_logprobs: list[float], advantages: list[float], metadata: dict[str, Any]) -> None:
+        datum = TrainingDatum(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            completion_logprobs=completion_logprobs,
+            completion_advantages=advantages,
+            metadata=metadata,
+        )
+        grouped.setdefault(adapter_name, []).append(
+            training_datum_to_train_example(datum=datum, adapter_name=adapter_name)
+        )
+
+    if num_rounds == 1 and r1_reward_mode == "judge":
+        result = assemble_training_data_r1_only_compare(
+            debates,
+            r1_reward=float(r23_constant),
+            r1_symmetric=r23_symmetric,
+        )
+        data = result[0] if isinstance(result, tuple) else result
+        for datum in data:
+            _append_turn(
+                adapter_name=round_adapter_names[0],
+                prompt_tokens=datum.prompt_tokens,
+                completion_tokens=datum.completion_tokens,
+                completion_logprobs=datum.completion_logprobs,
+                advantages=datum.completion_advantages,
+                metadata=dict(datum.metadata),
+            )
+        return grouped
+
+    groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
+    for debate in debates:
+        if debate.verdict not in ("A", "B"):
+            continue
+        traj_a = debate.trajectory_a
+        traj_b = debate.trajectory_b
+        if r1_reward_mode == "task":
+            r1_a = task_reward_fn(traj_a, debate)
+            r1_b = task_reward_fn(traj_b, debate)
+        elif r1_reward_mode == "judge_pointwise":
+            if pointwise_reward_map is None:
+                raise ValueError("judge_pointwise requires pointwise_reward_map")
+            r1_a = pointwise_reward_map[id(traj_a)]
+            r1_b = pointwise_reward_map[id(traj_b)]
+        elif r1_reward_mode == "judge":
+            winner_reward = float(r23_constant)
+            loser_reward = -winner_reward if r23_symmetric else 0.0
+            winner_agent = debate.get_winner_trajectory().agent
+            r1_a = winner_reward if winner_agent == traj_a.agent else loser_reward
+            r1_b = winner_reward if winner_agent == traj_b.agent else loser_reward
+        else:
+            r1_a = 0.0
+            r1_b = 0.0
+        groups.setdefault(debate.question, []).extend([(traj_a, debate, float(r1_a)), (traj_b, debate, float(r1_b))])
+
+    for question, group in groups.items():
+        _ = question
+        rewards = [reward for _traj, _debate, reward in group]
+        mean_reward = sum(rewards) / len(rewards)
+        var = sum((reward - mean_reward) ** 2 for reward in rewards) / len(rewards)
+        std = math.sqrt(var)
+        winner_reward = 0.0 if r23_reward_mode == "none" else float(r23_constant)
+        loser_reward = -winner_reward if r23_symmetric else 0.0
+
+        for traj, debate, r1_reward in group:
+            t1 = traj.transitions[0]
+            if len(t1.completion_tokens) == 0:
+                raise ValueError("R1 completion tokens empty.")
+            if r1_reward_mode == "judge":
+                r1_value = r1_reward
+                r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
+            else:
+                r1_value = (r1_reward - mean_reward) / std if std > 0 else 0.0
+                r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
+            _append_turn(
+                adapter_name="solution",
+                prompt_tokens=t1.prompt_tokens,
+                completion_tokens=t1.completion_tokens,
+                completion_logprobs=t1.completion_logprobs,
+                advantages=r1_advantages,
+                metadata={
+                    "question": debate.question[:100],
+                    "agent": traj.agent,
+                    "verdict": debate.verdict,
+                    "source_exact_shared_equivalent": False,
+                    "reason": "split_layout_per_round_projection",
+                    "round_num": 1,
+                    "r1_reward": r1_reward,
+                    "r1_compare": r1_reward_mode == "judge",
+                    "r1_centered_reward": None if r1_reward_mode == "judge" else r1_value,
+                },
+            )
+            if num_rounds >= 2:
+                t2 = traj.transitions[1]
+                signed = winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
+                if len(t2.completion_tokens) == 0:
+                    raise ValueError("R2 completion tokens empty.")
+                _append_turn(
+                    adapter_name=round_adapter_names[1],
+                    prompt_tokens=t2.prompt_tokens,
+                    completion_tokens=t2.completion_tokens,
+                    completion_logprobs=t2.completion_logprobs,
+                    advantages=[signed / len(t2.completion_tokens)] * len(t2.completion_tokens),
+                    metadata={
+                        "question": debate.question[:100],
+                        "agent": traj.agent,
+                        "verdict": debate.verdict,
+                        "source_exact_shared_equivalent": False,
+                        "reason": "split_layout_per_round_projection",
+                        "round_num": 2,
+                        "r23_reward": signed,
+                    },
+                )
+            if num_rounds >= 3:
+                t3 = traj.transitions[2]
+                signed = winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
+                if len(t3.completion_tokens) == 0:
+                    raise ValueError("R3 completion tokens empty.")
+                _append_turn(
+                    adapter_name=round_adapter_names[2],
+                    prompt_tokens=t3.prompt_tokens,
+                    completion_tokens=t3.completion_tokens,
+                    completion_logprobs=t3.completion_logprobs,
+                    advantages=[signed / len(t3.completion_tokens)] * len(t3.completion_tokens),
+                    metadata={
+                        "question": debate.question[:100],
+                        "agent": traj.agent,
+                        "verdict": debate.verdict,
+                        "source_exact_shared_equivalent": False,
+                        "reason": "split_layout_per_round_projection",
+                        "round_num": 3,
+                        "r23_reward": signed,
+                    },
+                )
+    return grouped

@@ -1,0 +1,24 @@
+services:
+  ht-debate-qwen35:
+    build:
+      context: ..
+      dockerfile: docker/qwen35-ht-debate.Dockerfile
+    image: llm-local-rl:qwen35-ht-debate
+    shm_size: "16gb"
+    ipc: host
+    gpus: all
+    working_dir: /workspace/llm-local-rl
+    env_file:
+      - qwen35-ht-debate.env
+    environment:
+      HF_HOME: /cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      TRANSFORMERS_CACHE: /cache/huggingface
+      VLLM_CACHE_ROOT: /cache/vllm
+      PYTHONPATH: /workspace/llm-local-rl/src
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    volumes:
+      - ..:/workspace/llm-local-rl
+      - ${LLM_LOCAL_RL_CACHE_DIR:-../.cache/docker}:/cache
+      - ${LLM_LOCAL_RL_RUNS_DIR:-../runs/docker}:/outputs
+    command: ["docker/run_ht_debate_qwen35.sh"]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from llm_local_rl.types import HTSequenceInstance, SamplingRequest, SamplingResult, TrainExample
+from llm_local_rl.types import SamplingRequest, SamplingResult, TrainExample
 
 
 class Tokenizer(Protocol):
@@ -13,13 +13,13 @@ class Tokenizer(Protocol):
 class Environment(Protocol):
     name: str
 
-    def sample_instances(self, *, n: int, seed: int | None) -> list[HTSequenceInstance]: ...
-    def build_initial_prompt(self, *, instance: HTSequenceInstance) -> str: ...
+    def sample_instances(self, *, n: int, seed: int | None) -> list[object]: ...
+    def build_initial_prompt(self, *, instance: object) -> str: ...
     def stop_token_ids(self, *, tokenizer: Tokenizer) -> list[int]: ...
     def score_completion(
         self,
         *,
-        instance: HTSequenceInstance,
+        instance: object,
         tokenizer: Tokenizer,
         completion_token_ids: list[int],
     ) -> tuple[float, dict]: ...

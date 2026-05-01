@@ -14,6 +14,7 @@ class SamplingRequest:
     max_tokens: int
     temperature: float
     seed: int | None = None
+    min_p: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -60,3 +61,9 @@ class TrainExample:
 class HTSequenceInstance:
     instance_id: str
     sequence_len: int
+
+
+@dataclass(frozen=True)
+class CoinFlipInstance:
+    instance_id: str
+    options: tuple[str, str] = ("Heads", "Tails")

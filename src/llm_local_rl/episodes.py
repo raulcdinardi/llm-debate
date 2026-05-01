@@ -20,9 +20,14 @@ class SingleTurnEpisodeBuilder:
         max_tokens: int,
         temperature: float,
         seed: int | None,
+        min_p: float = 0.0,
     ) -> EpisodeSample:
-        prompt_text = env.build_initial_prompt(instance=instance)
-        prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_builder = getattr(env, "build_initial_prompt_token_ids", None)
+        if callable(prompt_builder):
+            prompt_token_ids = prompt_builder(instance=instance, tokenizer=tokenizer, enable_thinking=None)
+        else:
+            prompt_text = env.build_initial_prompt(instance=instance)
+            prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
         result = sampler.sample(
             SamplingRequest(
                 adapter_name=self.adapter_name,
@@ -31,6 +36,7 @@ class SingleTurnEpisodeBuilder:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 seed=seed,
+                min_p=min_p,
             )
         )
         reward, reward_metrics = env.score_completion(
@@ -71,10 +77,15 @@ class DebateEpisodeBuilder:
         max_tokens: int,
         temperature: float,
         seed: int | None,
+        min_p: float = 0.0,
     ) -> EpisodeSample:
         # The environment remains task-only. Debate mechanics live here.
-        prompt_text = env.build_initial_prompt(instance=instance)
-        prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_builder = getattr(env, "build_initial_prompt_token_ids", None)
+        if callable(prompt_builder):
+            prompt_token_ids = prompt_builder(instance=instance, tokenizer=tokenizer, enable_thinking=None)
+        else:
+            prompt_text = env.build_initial_prompt(instance=instance)
+            prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
         stop_token_ids = env.stop_token_ids(tokenizer=tokenizer)
 
         solution_result = sampler.sample(
@@ -85,6 +96,7 @@ class DebateEpisodeBuilder:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 seed=seed,
+                min_p=min_p,
             )
         )
         critique_prefix = tokenizer.encode(" Critique the previous answer.", add_special_tokens=False)
@@ -97,6 +109,7 @@ class DebateEpisodeBuilder:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 seed=None if seed is None else seed + 1,
+                min_p=min_p,
             )
         )
         reward, reward_metrics = env.score_completion(
