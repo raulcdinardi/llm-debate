@@ -48,8 +48,11 @@ Done.
 Use this image on Vast:
   ${IMAGE_URI}
 
-With command:
-  docker/run_ht_debate_qwen35.sh
+Default entrypoint:
+  entrypoint.sh
+
+If you override the container command, use:
+  bash docker/run_ht_debate_qwen35.sh
 
 The image default MODEL_ID is:
   ${PRELOAD_MODEL_DIR}

@@ -20,27 +20,40 @@ The on-start script uses `AUTO_STOP=1` by default. Use `AUTO_DESTROY=1` only if 
 
 ## Best Launch Path
 
-### Fastest Runtime: Preloaded Image
+### Fastest Runtime: DockerHub Preloaded Image
 
 Best final setup:
 
-1. Build and push a single preloaded image:
+1. Log in to DockerHub on a Docker-capable machine:
 
 ```bash
-IMAGE_URI=ghcr.io/YOUR_USER/llm-local-rl:qwen35-ht-debate-preloaded \
-  bash scripts/build_push_qwen35_vast_image.sh
+docker login
 ```
 
-2. On Vast, set the image to:
+2. Build and push a single preloaded image:
+
+```bash
+bash scripts/build_push_dockerhub_qwen35_vast_image.sh
+```
+
+This defaults to:
 
 ```text
-ghcr.io/YOUR_USER/llm-local-rl:qwen35-ht-debate-preloaded
+docker.io/raulcdinardi/llm-debate:qwen35-ht-debate-preloaded
 ```
 
-3. Set the container command to:
+Override it with `DOCKERHUB_REPO=your_user/your_repo` if needed.
+
+3. On Vast, set the image to:
+
+```text
+raulcdinardi/llm-debate:qwen35-ht-debate-preloaded
+```
+
+The image default entrypoint runs the experiment. If Vast needs an on-start command, use exactly:
 
 ```bash
-docker/run_ht_debate_qwen35.sh
+entrypoint.sh
 ```
 
 This image includes the code and model files. Vast still spends time pulling the image, but it avoids git clone, dependency install, and Hugging Face model download at startup.
@@ -112,9 +125,6 @@ Upload `dist/vast/llm-local-rl-vast-src.tar.gz` to any private URL Vast can fetc
 Minimum recommended env vars:
 
 ```bash
--e REPO_URL=https://github.com/YOUR_USER/YOUR_REPO.git \
--e REPO_REF=main \
--e MODEL_ID=Qwen/Qwen3.5-4B-Base \
 -e RUN_NAME=ht-debate-qwen35-vast \
 -e AUTO_STOP=1 \
 -e STEPS=5 \
@@ -127,6 +137,8 @@ Minimum recommended env vars:
 -e TRAIN_MINIBATCH_SIZE=1 \
 -e TRACE_TOP_LOGPROBS=5
 ```
+
+For the preloaded DockerHub image, do not set `REPO_URL` or `REPO_REF`. It already contains the source. It also defaults `MODEL_ID` to `/opt/models/qwen35-4b-base`.
 
 If Hugging Face auth is needed:
 

@@ -193,6 +193,18 @@ prepare_source() {
 
 install_python_deps() {
   cd "${SOURCE_DIR}"
+  if [[ "${SKIP_PYTHON_DEPS:-0}" == "1" ]]; then
+    echo "SKIP_PYTHON_DEPS=1; using Python environment baked into the image."
+    python3 - <<'PY'
+import importlib.util
+missing = [name for name in ("torch", "transformers", "peft", "vllm", "llm_local_rl") if importlib.util.find_spec(name) is None]
+if missing:
+    raise SystemExit("Missing required packages: " + ", ".join(missing))
+print("required Python packages available")
+PY
+    return 0
+  fi
+
   python3 -m pip install --upgrade pip
   python3 -m pip install --no-cache-dir \
     "transformers>=4.57.0" \

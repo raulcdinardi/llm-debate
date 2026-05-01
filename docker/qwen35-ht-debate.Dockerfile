@@ -8,6 +8,7 @@ ENV HF_HOME=/cache/huggingface
 ENV TRANSFORMERS_CACHE=/cache/huggingface
 ENV VLLM_CACHE_ROOT=/cache/vllm
 ENV PYTHONPATH=/workspace/llm-local-rl/src
+ENV SKIP_PYTHON_DEPS=1
 
 WORKDIR /workspace/llm-local-rl
 
@@ -26,4 +27,9 @@ COPY docker ./docker
 
 RUN python3 -m pip install -e .
 
-ENTRYPOINT ["/bin/bash"]
+RUN chmod +x docker/*.sh && \
+    cp docker/entrypoint.sh /usr/local/bin/entrypoint.sh && \
+    chmod +x /usr/local/bin/entrypoint.sh && \
+    ln -sf /usr/local/bin/entrypoint.sh /entrypoint.sh
+
+ENTRYPOINT ["entrypoint.sh"]

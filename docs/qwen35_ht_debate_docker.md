@@ -95,17 +95,23 @@ Set `TRACE_MODEL_IO=0` to disable tracing entirely.
 
 ## Preloaded Model Image
 
-To make a single image that Vast can fetch with the source code and model already inside:
+To make a single DockerHub image that Vast can fetch with the source code and model already inside:
 
 ```bash
-IMAGE_URI=ghcr.io/YOUR_USER/llm-local-rl:qwen35-ht-debate-preloaded \
-  bash scripts/build_push_qwen35_vast_image.sh
+docker login
+bash scripts/build_push_dockerhub_qwen35_vast_image.sh
 ```
 
 This builds:
 
-1. `llm-local-rl:qwen35-ht-debate` runtime image
-2. a preloaded image with `Qwen/Qwen3.5-4B-Base` downloaded to `/opt/models/qwen35-4b-base`
+1. `docker.io/raulcdinardi/llm-debate:qwen35-ht-debate` runtime image
+2. `docker.io/raulcdinardi/llm-debate:qwen35-ht-debate-preloaded` with `Qwen/Qwen3.5-4B-Base` downloaded to `/opt/models/qwen35-4b-base`
+
+Override the DockerHub repository if needed:
+
+```bash
+DOCKERHUB_REPO=your_user/your_repo bash scripts/build_push_dockerhub_qwen35_vast_image.sh
+```
 
 The preloaded image sets:
 
@@ -114,3 +120,9 @@ MODEL_ID=/opt/models/qwen35-4b-base
 ```
 
 This makes Vast startup simpler, but the pushed image will be large because it includes the model weights.
+
+The image has `/usr/local/bin/entrypoint.sh` and `/entrypoint.sh`. On Vast, either let the image entrypoint run directly or put this in the on-start box:
+
+```bash
+entrypoint.sh
+```
