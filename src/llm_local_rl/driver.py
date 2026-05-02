@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from statistics import mean, pstdev
+from contextlib import nullcontext
 
 from transformers import AutoTokenizer
 
@@ -18,6 +19,7 @@ from llm_local_rl.local_renderers import infer_chat_preamble
 from llm_local_rl.masking import make_train_example
 from llm_local_rl.model_io_trace import configure_model_io_tracing, trace_context
 from llm_local_rl.registry import build_debate_task, build_environment, build_episode_builder
+from llm_local_rl.resource_monitor import ResourceMonitor
 from llm_local_rl.trainer import MultiAdapterTrainer, TrainerConfig
 from llm_local_rl.debate_parity import DebateConfig
 from llm_local_rl.types import EpisodeSample, EpisodeTurn, SamplingRequest
@@ -29,6 +31,12 @@ class TrainingDriver:
         self.config = config
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.resource_monitor = ResourceMonitor(
+            output_path=self.output_dir / "resource_usage.jsonl",
+            interval_s=config.resource_log_interval_s,
+            enabled=config.resource_logging,
+        )
+        self.resource_monitor.start()
         self.env = build_environment(config) if config.rollout.mode == "single_turn" else None
         self.episode_builder = build_episode_builder(config) if config.rollout.mode == "single_turn" else None
         self.debate_task = build_debate_task(config) if config.rollout.mode == "debate" else None
@@ -45,15 +53,19 @@ class TrainingDriver:
             name: str(self.output_dir / f"adapter_init_{name}")
             for name in self._adapter_names()
         }
-        self.trainer = self._make_fresh_trainer()
+        with self._stage("init_trainer", step=0):
+            self.trainer = self._make_fresh_trainer()
         for adapter_name, adapter_dir in self.current_adapter_dirs.items():
             self.current_adapter_dirs[adapter_name] = self.trainer.save_adapter(
                 adapter_name=adapter_name,
                 output_dir=adapter_dir,
             )
-        self.trainer.sleep()
-        self.sampler = self._make_sampler()
-        self.sampler.sleep(level=2)
+        with self._stage("trainer_sleep", step=0):
+            self.trainer.sleep()
+        with self._stage("init_sampler", step=0):
+            self.sampler = self._make_sampler()
+        with self._stage("sampler_sleep", step=0, level=2):
+            self.sampler.sleep(level=2)
         self._write_manifest(current_step=0)
 
     @classmethod
@@ -63,6 +75,12 @@ class TrainingDriver:
         driver = object.__new__(cls)
         driver.config = config
         driver.output_dir = Path(config.output_dir)
+        driver.resource_monitor = ResourceMonitor(
+            output_path=driver.output_dir / "resource_usage.jsonl",
+            interval_s=config.resource_log_interval_s,
+            enabled=config.resource_logging,
+        )
+        driver.resource_monitor.start()
         driver.env = build_environment(config) if config.rollout.mode == "single_turn" else None
         driver.episode_builder = build_episode_builder(config) if config.rollout.mode == "single_turn" else None
         driver.debate_task = build_debate_task(config) if config.rollout.mode == "debate" else None
@@ -76,11 +94,21 @@ class TrainingDriver:
         driver.step_records_path = driver.output_dir / "step_records.jsonl"
         driver.summary_path = driver.output_dir / "summary.json"
         driver.current_adapter_dirs = dict(manifest.adapter_dirs)
-        driver.trainer = driver._make_trainer_from_current_adapters()
-        driver.trainer.sleep()
-        driver.sampler = driver._make_sampler()
-        driver.sampler.sleep(level=2)
+        with driver._stage("init_trainer_resume", step=driver.start_step):
+            driver.trainer = driver._make_trainer_from_current_adapters()
+        with driver._stage("trainer_sleep", step=driver.start_step):
+            driver.trainer.sleep()
+        with driver._stage("init_sampler", step=driver.start_step):
+            driver.sampler = driver._make_sampler()
+        with driver._stage("sampler_sleep", step=driver.start_step, level=2):
+            driver.sampler.sleep(level=2)
         return driver
+
+    def _stage(self, name: str, **metadata: object):
+        monitor = getattr(self, "resource_monitor", None)
+        if monitor is None or not monitor.enabled:
+            return nullcontext()
+        return monitor.stage(name, **metadata)
 
     def _adapter_names(self) -> tuple[str, ...]:
         if self.config.adapter_layout == "shared":
@@ -164,8 +192,10 @@ class TrainingDriver:
 
     def _ensure_sampler(self) -> None:
         if self.sampler is None:
-            self.sampler = self._make_sampler()
-            self.sampler.sleep(level=2)
+            with self._stage("init_sampler"):
+                self.sampler = self._make_sampler()
+            with self._stage("sampler_sleep", level=2):
+                self.sampler.sleep(level=2)
 
     def _should_teardown_sampler_before_training(self) -> bool:
         return self.config.rollout.mode == "debate" and self.config.adapter_layout == "split"
@@ -173,7 +203,8 @@ class TrainingDriver:
     def _teardown_sampler(self) -> None:
         if self.sampler is None:
             return
-        self.sampler.close()
+        with self._stage("sampler_teardown"):
+            self.sampler.close()
         self.sampler = None
 
     def _per_sample_advantages(self, *, rewards: list[float]) -> list[float]:
@@ -375,95 +406,119 @@ class TrainingDriver:
         }
 
     def run(self, *, max_steps: int | None = None) -> dict:
-        self.config.write_json(self.output_dir / "run_config.json")
-        end_step = self.config.steps if max_steps is None else min(self.config.steps, self.start_step + max_steps)
-        for step_idx in range(self.start_step, end_step):
-            self._ensure_sampler()
-            self.sampler.set_adapter_paths(adapter_paths=self.current_adapter_dirs)
-            self.sampler.wake_up()
-            if self.config.rollout.mode == "single_turn":
-                with trace_context(step=step_idx + 1, rollout_mode="single_turn"):
-                    samples = self._run_single_turn_samples(step_idx=step_idx)
-                grouped_examples = self._group_examples(samples=samples)
-                record_samples = [
-                    {
-                        "instance_id": sample.instance_id,
-                        "reward": sample.reward,
-                        "reward_metrics": sample.reward_metrics,
-                        "turns": [
+        try:
+            self.config.write_json(self.output_dir / "run_config.json")
+            end_step = self.config.steps if max_steps is None else min(self.config.steps, self.start_step + max_steps)
+            for step_idx in range(self.start_step, end_step):
+                step_num = step_idx + 1
+                with self._stage("step", step=step_num):
+                    self._ensure_sampler()
+                    self.sampler.set_adapter_paths(adapter_paths=self.current_adapter_dirs)
+                    with self._stage("sampler_wake", step=step_num):
+                        self.sampler.wake_up()
+                    if self.config.rollout.mode == "single_turn":
+                        with self._stage("rollout_single_turn", step=step_num), trace_context(
+                            step=step_num, rollout_mode="single_turn"
+                        ):
+                            samples = self._run_single_turn_samples(step_idx=step_idx)
+                        grouped_examples = self._group_examples(samples=samples)
+                        record_samples = [
                             {
-                                "turn_name": turn.turn_name,
-                                "adapter_name": turn.adapter_name,
-                                "completion_text": turn.metadata.get("text", ""),
+                                "instance_id": sample.instance_id,
+                                "reward": sample.reward,
+                                "reward_metrics": sample.reward_metrics,
+                                "turns": [
+                                    {
+                                        "turn_name": turn.turn_name,
+                                        "adapter_name": turn.adapter_name,
+                                        "completion_text": turn.metadata.get("text", ""),
+                                    }
+                                    for turn in sample.turns
+                                ],
                             }
-                            for turn in sample.turns
-                        ],
+                            for sample in samples
+                        ]
+                        extra_record = {}
+                        mean_reward = mean(float(sample.reward) for sample in samples) if samples else 0.0
+                        mean_parse_success = (
+                            mean(float(sample.reward_metrics["parse_success"]) for sample in samples)
+                            if samples
+                            else 0.0
+                        )
+                    else:
+                        step_seed = None if self.config.rollout.seed is None else self.config.rollout.seed + step_idx
+                        with self._stage("rollout_debate", step=step_num), trace_context(
+                            step=step_num, rollout_mode="debate"
+                        ):
+                            debates = self._debate_runtime().rollout(step_seed=step_seed).debates
+                        with self._stage("group_debate_examples", step=step_num), trace_context(
+                            step=step_num, rollout_mode="debate", phase_hint="group_debate_examples"
+                        ):
+                            grouped_examples, extra_record = self._group_debate_examples(
+                                debates=debates, step_seed=step_seed
+                            )
+                        record_samples = [
+                            {
+                                "question": debate.question,
+                                "verdict": debate.verdict,
+                                "judge_reasoning": debate.judge_reasoning,
+                                "trajectory_a": debate.trajectory_a.metrics,
+                                "trajectory_b": debate.trajectory_b.metrics,
+                            }
+                            for debate in debates
+                        ]
+                        rewards = [
+                            float(traj.metrics["task_reward"])
+                            for debate in debates
+                            for traj in (debate.trajectory_a, debate.trajectory_b)
+                        ]
+                        parse_values = [
+                            float(traj.metrics["task_reward_metrics"]["parse_success"])
+                            for debate in debates
+                            for traj in (debate.trajectory_a, debate.trajectory_b)
+                        ]
+                        mean_reward = mean(rewards) if rewards else 0.0
+                        mean_parse_success = mean(parse_values) if parse_values else 0.0
+                    with self._stage("sampler_sleep", step=step_num, level=2):
+                        self.sampler.sleep(level=2)
+                    if self._should_teardown_sampler_before_training():
+                        self._teardown_sampler()
+
+                    with self._stage("trainer_wake", step=step_num):
+                        self.trainer.wake_up()
+                    train_metrics = {}
+                    for adapter_name, batch in grouped_examples.items():
+                        with self._stage("train_adapter", step=step_num, adapter_name=adapter_name), trace_context(
+                            step=step_num, phase_hint="train", adapter_name=adapter_name
+                        ):
+                            train_metrics[adapter_name] = self.trainer.train_batch(
+                                adapter_name=adapter_name, batch=batch
+                            )
+                        adapter_dir = self.output_dir / f"step_{step_num:03d}_{adapter_name}"
+                        with self._stage("save_adapter", step=step_num, adapter_name=adapter_name):
+                            self.current_adapter_dirs[adapter_name] = self.trainer.save_adapter(
+                                adapter_name=adapter_name,
+                                output_dir=str(adapter_dir),
+                            )
+                    with self._stage("trainer_sleep", step=step_num):
+                        self.trainer.sleep()
+                    if self._should_teardown_sampler_before_training():
+                        self._ensure_sampler()
+
+                    record = {
+                        "step": step_num,
+                        "mean_reward": mean_reward,
+                        "mean_parse_success": mean_parse_success,
+                        "train_metrics": train_metrics,
+                        "sample_records": record_samples,
+                        "adapter_dirs": dict(self.current_adapter_dirs),
+                        **extra_record,
                     }
-                    for sample in samples
-                ]
-                extra_record = {}
-                mean_reward = mean(float(sample.reward) for sample in samples) if samples else 0.0
-                mean_parse_success = (
-                    mean(float(sample.reward_metrics["parse_success"]) for sample in samples) if samples else 0.0
-                )
-            else:
-                step_seed = None if self.config.rollout.seed is None else self.config.rollout.seed + step_idx
-                with trace_context(step=step_idx + 1, rollout_mode="debate"):
-                    debates = self._debate_runtime().rollout(step_seed=step_seed).debates
-                with trace_context(step=step_idx + 1, rollout_mode="debate", phase_hint="group_debate_examples"):
-                    grouped_examples, extra_record = self._group_debate_examples(debates=debates, step_seed=step_seed)
-                record_samples = [
-                    {
-                        "question": debate.question,
-                        "verdict": debate.verdict,
-                        "judge_reasoning": debate.judge_reasoning,
-                        "trajectory_a": debate.trajectory_a.metrics,
-                        "trajectory_b": debate.trajectory_b.metrics,
-                    }
-                    for debate in debates
-                ]
-                rewards = [
-                    float(traj.metrics["task_reward"])
-                    for debate in debates
-                    for traj in (debate.trajectory_a, debate.trajectory_b)
-                ]
-                parse_values = [
-                    float(traj.metrics["task_reward_metrics"]["parse_success"])
-                    for debate in debates
-                    for traj in (debate.trajectory_a, debate.trajectory_b)
-                ]
-                mean_reward = mean(rewards) if rewards else 0.0
-                mean_parse_success = mean(parse_values) if parse_values else 0.0
-            self.sampler.sleep(level=2)
-            if self._should_teardown_sampler_before_training():
-                self._teardown_sampler()
+                    with self.step_records_path.open("a") as f:
+                        f.write(json.dumps(record) + "\n")
+                    self._write_manifest(current_step=step_num)
+                    print(json.dumps(record, indent=2))
 
-            self.trainer.wake_up()
-            train_metrics = {}
-            for adapter_name, batch in grouped_examples.items():
-                with trace_context(step=step_idx + 1, phase_hint="train", adapter_name=adapter_name):
-                    train_metrics[adapter_name] = self.trainer.train_batch(adapter_name=adapter_name, batch=batch)
-                adapter_dir = self.output_dir / f"step_{step_idx + 1:03d}_{adapter_name}"
-                self.current_adapter_dirs[adapter_name] = self.trainer.save_adapter(
-                    adapter_name=adapter_name,
-                    output_dir=str(adapter_dir),
-                )
-            self.trainer.sleep()
-            if self._should_teardown_sampler_before_training():
-                self._ensure_sampler()
-
-            record = {
-                "step": step_idx + 1,
-                "mean_reward": mean_reward,
-                "mean_parse_success": mean_parse_success,
-                "train_metrics": train_metrics,
-                "sample_records": record_samples,
-                "adapter_dirs": dict(self.current_adapter_dirs),
-                **extra_record,
-            }
-            with self.step_records_path.open("a") as f:
-                f.write(json.dumps(record) + "\n")
-            self._write_manifest(current_step=step_idx + 1)
-            print(json.dumps(record, indent=2))
-
-        return self._write_summary()
+            return self._write_summary()
+        finally:
+            self.resource_monitor.stop()

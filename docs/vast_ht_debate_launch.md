@@ -168,6 +168,12 @@ The trace viewer is at:
 /outputs/<RUN_NAME>/model_io_trace/index.html
 ```
 
+Stage-tagged GPU memory samples are at:
+
+```text
+/outputs/<RUN_NAME>/resource_usage.jsonl
+```
+
 ## After It Stops
 
 1. Copy `/outputs/<RUN_NAME>.tar.gz` from the stopped instance using Vast's data tools or by restarting briefly.

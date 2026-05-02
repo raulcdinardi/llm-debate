@@ -53,6 +53,8 @@ class TrainRunConfig:
     trace_model_io: bool = True
     trace_model_io_dir: str | None = None
     trace_top_logprobs: int = 5
+    resource_logging: bool = True
+    resource_log_interval_s: float = 5.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -104,6 +106,8 @@ class TrainRunConfig:
             trace_model_io=data.get("trace_model_io", True),
             trace_model_io_dir=data.get("trace_model_io_dir"),
             trace_top_logprobs=data.get("trace_top_logprobs", 5),
+            resource_logging=data.get("resource_logging", True),
+            resource_log_interval_s=data.get("resource_log_interval_s", 5.0),
         )
 
     def write_json(self, path: str | Path) -> None:

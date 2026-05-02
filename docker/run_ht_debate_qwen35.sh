@@ -40,10 +40,15 @@ cmd=(
   --sampler-gpu-memory-utilization "${SAMPLER_GPU_MEMORY_UTILIZATION:-0.45}"
   --sampler-max-model-len "${SAMPLER_MAX_MODEL_LEN:-768}"
   --trace-top-logprobs "${TRACE_TOP_LOGPROBS:-5}"
+  --resource-log-interval-s "${RESOURCE_LOG_INTERVAL_S:-5}"
 )
 
 if [[ "${TRACE_MODEL_IO:-1}" == "0" ]]; then
   cmd+=(--no-trace-model-io)
+fi
+
+if [[ "${RESOURCE_LOGGING:-1}" == "0" ]]; then
+  cmd+=(--no-resource-logging)
 fi
 
 if [[ -n "${TRACE_MODEL_IO_DIR:-}" ]]; then

@@ -24,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-trace-model-io", action="store_true")
     parser.add_argument("--trace-model-io-dir", default=None)
     parser.add_argument("--trace-top-logprobs", type=int, default=5)
+    parser.add_argument("--no-resource-logging", action="store_true")
+    parser.add_argument("--resource-log-interval-s", type=float, default=5.0)
     return parser.parse_args()
 
 
@@ -52,6 +54,8 @@ def main() -> int:
             trace_model_io=not args.no_trace_model_io,
             trace_model_io_dir=args.trace_model_io_dir,
             trace_top_logprobs=args.trace_top_logprobs,
+            resource_logging=not args.no_resource_logging,
+            resource_log_interval_s=args.resource_log_interval_s,
         )
     )
     driver.run()

@@ -63,6 +63,12 @@ The trace viewer is written to:
 runs/docker/<RUN_NAME>/model_io_trace/index.html
 ```
 
+Stage-tagged GPU memory samples are written to:
+
+```text
+runs/docker/<RUN_NAME>/resource_usage.jsonl
+```
+
 ## Shared Machine Notes
 
 Before running on `vm02`, check GPU availability:
@@ -92,6 +98,12 @@ TRACE_TOP_LOGPROBS=0
 ```
 
 Set `TRACE_MODEL_IO=0` to disable tracing entirely.
+
+Set `RESOURCE_LOGGING=0` to disable stage-tagged GPU/process memory logging, or adjust:
+
+```bash
+RESOURCE_LOG_INTERVAL_S=2
+```
 
 ## Preloaded Model Image
 
