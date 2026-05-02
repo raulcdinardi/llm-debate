@@ -37,6 +37,7 @@ class TrainingDriver:
             enabled=config.resource_logging,
         )
         self.resource_monitor.start()
+        self._progress("driver_init_start", output_dir=str(self.output_dir), mode=config.rollout.mode)
         self.env = build_environment(config) if config.rollout.mode == "single_turn" else None
         self.episode_builder = build_episode_builder(config) if config.rollout.mode == "single_turn" else None
         self.debate_task = build_debate_task(config) if config.rollout.mode == "debate" else None
@@ -67,6 +68,7 @@ class TrainingDriver:
         with self._stage("sampler_sleep", step=0, level=2):
             self.sampler.sleep(level=2)
         self._write_manifest(current_step=0)
+        self._progress("driver_init_done", output_dir=str(self.output_dir))
 
     @classmethod
     def resume(cls, *, output_dir: str) -> "TrainingDriver":
@@ -81,6 +83,7 @@ class TrainingDriver:
             enabled=config.resource_logging,
         )
         driver.resource_monitor.start()
+        driver._progress("driver_resume_start", output_dir=str(driver.output_dir), start_step=driver.start_step)
         driver.env = build_environment(config) if config.rollout.mode == "single_turn" else None
         driver.episode_builder = build_episode_builder(config) if config.rollout.mode == "single_turn" else None
         driver.debate_task = build_debate_task(config) if config.rollout.mode == "debate" else None
@@ -102,6 +105,7 @@ class TrainingDriver:
             driver.sampler = driver._make_sampler()
         with driver._stage("sampler_sleep", step=driver.start_step, level=2):
             driver.sampler.sleep(level=2)
+        driver._progress("driver_resume_done", output_dir=str(driver.output_dir), start_step=driver.start_step)
         return driver
 
     def _stage(self, name: str, **metadata: object):
@@ -109,6 +113,9 @@ class TrainingDriver:
         if monitor is None or not monitor.enabled:
             return nullcontext()
         return monitor.stage(name, **metadata)
+
+    def _progress(self, event: str, **fields: object) -> None:
+        print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
 
     def _adapter_names(self) -> tuple[str, ...]:
         if self.config.adapter_layout == "shared":
@@ -204,7 +211,9 @@ class TrainingDriver:
         if self.sampler is None:
             return
         with self._stage("sampler_teardown"):
+            self._progress("sampler_teardown_start")
             self.sampler.close()
+            self._progress("sampler_teardown_done")
         self.sampler = None
 
     def _per_sample_advantages(self, *, rewards: list[float]) -> list[float]:
@@ -412,15 +421,20 @@ class TrainingDriver:
             for step_idx in range(self.start_step, end_step):
                 step_num = step_idx + 1
                 with self._stage("step", step=step_num):
+                    self._progress("step_start", step=step_num, total_steps=self.config.steps)
                     self._ensure_sampler()
                     self.sampler.set_adapter_paths(adapter_paths=self.current_adapter_dirs)
                     with self._stage("sampler_wake", step=step_num):
+                        self._progress("sampler_wake_start", step=step_num)
                         self.sampler.wake_up()
+                        self._progress("sampler_wake_done", step=step_num)
                     if self.config.rollout.mode == "single_turn":
                         with self._stage("rollout_single_turn", step=step_num), trace_context(
                             step=step_num, rollout_mode="single_turn"
                         ):
+                            self._progress("rollout_start", step=step_num, mode="single_turn")
                             samples = self._run_single_turn_samples(step_idx=step_idx)
+                            self._progress("rollout_done", step=step_num, mode="single_turn", num_samples=len(samples))
                         grouped_examples = self._group_examples(samples=samples)
                         record_samples = [
                             {
@@ -450,12 +464,26 @@ class TrainingDriver:
                         with self._stage("rollout_debate", step=step_num), trace_context(
                             step=step_num, rollout_mode="debate"
                         ):
+                            self._progress(
+                                "rollout_start",
+                                step=step_num,
+                                mode="debate",
+                                num_groups=self.config.rollout.num_groups,
+                                group_size=self.config.rollout.group_size,
+                            )
                             debates = self._debate_runtime().rollout(step_seed=step_seed).debates
+                            self._progress("rollout_done", step=step_num, mode="debate", num_debates=len(debates))
                         with self._stage("group_debate_examples", step=step_num), trace_context(
                             step=step_num, rollout_mode="debate", phase_hint="group_debate_examples"
                         ):
+                            self._progress("group_examples_start", step=step_num)
                             grouped_examples, extra_record = self._group_debate_examples(
                                 debates=debates, step_seed=step_seed
+                            )
+                            self._progress(
+                                "group_examples_done",
+                                step=step_num,
+                                examples_by_adapter={name: len(batch) for name, batch in grouped_examples.items()},
                             )
                         record_samples = [
                             {
@@ -480,28 +508,53 @@ class TrainingDriver:
                         mean_reward = mean(rewards) if rewards else 0.0
                         mean_parse_success = mean(parse_values) if parse_values else 0.0
                     with self._stage("sampler_sleep", step=step_num, level=2):
+                        self._progress("sampler_sleep_start", step=step_num, level=2)
                         self.sampler.sleep(level=2)
+                        self._progress("sampler_sleep_done", step=step_num, level=2)
                     if self._should_teardown_sampler_before_training():
                         self._teardown_sampler()
 
                     with self._stage("trainer_wake", step=step_num):
+                        self._progress("trainer_wake_start", step=step_num)
                         self.trainer.wake_up()
+                        self._progress("trainer_wake_done", step=step_num)
                     train_metrics = {}
                     for adapter_name, batch in grouped_examples.items():
                         with self._stage("train_adapter", step=step_num, adapter_name=adapter_name), trace_context(
                             step=step_num, phase_hint="train", adapter_name=adapter_name
                         ):
+                            self._progress(
+                                "train_adapter_start",
+                                step=step_num,
+                                adapter_name=adapter_name,
+                                num_examples=len(batch),
+                            )
                             train_metrics[adapter_name] = self.trainer.train_batch(
                                 adapter_name=adapter_name, batch=batch
                             )
+                            self._progress(
+                                "train_adapter_done",
+                                step=step_num,
+                                adapter_name=adapter_name,
+                                metrics=train_metrics[adapter_name],
+                            )
                         adapter_dir = self.output_dir / f"step_{step_num:03d}_{adapter_name}"
                         with self._stage("save_adapter", step=step_num, adapter_name=adapter_name):
+                            self._progress("save_adapter_start", step=step_num, adapter_name=adapter_name)
                             self.current_adapter_dirs[adapter_name] = self.trainer.save_adapter(
                                 adapter_name=adapter_name,
                                 output_dir=str(adapter_dir),
                             )
+                            self._progress(
+                                "save_adapter_done",
+                                step=step_num,
+                                adapter_name=adapter_name,
+                                adapter_dir=self.current_adapter_dirs[adapter_name],
+                            )
                     with self._stage("trainer_sleep", step=step_num):
+                        self._progress("trainer_sleep_start", step=step_num)
                         self.trainer.sleep()
+                        self._progress("trainer_sleep_done", step=step_num)
                     if self._should_teardown_sampler_before_training():
                         self._ensure_sampler()
 
@@ -517,8 +570,16 @@ class TrainingDriver:
                     with self.step_records_path.open("a") as f:
                         f.write(json.dumps(record) + "\n")
                     self._write_manifest(current_step=step_num)
+                    self._progress(
+                        "step_done",
+                        step=step_num,
+                        mean_reward=mean_reward,
+                        mean_parse_success=mean_parse_success,
+                    )
                     print(json.dumps(record, indent=2))
 
-            return self._write_summary()
+            summary = self._write_summary()
+            self._progress("run_done", num_steps_completed=summary["num_steps_completed"])
+            return summary
         finally:
             self.resource_monitor.stop()
