@@ -151,8 +151,10 @@ prepare_system_tools() {
 }
 
 prepare_source() {
-  if [[ -x "${SOURCE_DIR}/docker/run_ht_debate_qwen35.sh" ]]; then
+  local prefer_external_source="${PREFER_EXTERNAL_SOURCE:-0}"
+  if [[ "${prefer_external_source}" != "1" && -z "${REPO_URL:-}" && -z "${REPO_TARBALL_URL:-}" && -x "${SOURCE_DIR}/docker/run_ht_debate_qwen35.sh" ]]; then
     echo "Using existing source at ${SOURCE_DIR}."
+    export PYTHONPATH="${SOURCE_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
     return 0
   fi
 
@@ -165,6 +167,7 @@ prepare_source() {
     curl -fL "${REPO_TARBALL_URL}" -o /tmp/llm-local-rl-src.tar.gz
     mkdir -p "${SOURCE_DIR}"
     tar -xzf /tmp/llm-local-rl-src.tar.gz -C "${SOURCE_DIR}" --strip-components="${TARBALL_STRIP_COMPONENTS:-1}"
+    export PYTHONPATH="${SOURCE_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
     return 0
   fi
 
@@ -172,10 +175,12 @@ prepare_source() {
     echo "Extracting source bundle ${SOURCE_BUNDLE_PATH}."
     tar -xzf "${SOURCE_BUNDLE_PATH}" -C /workspace
     if [[ -x "${SOURCE_DIR}/docker/run_ht_debate_qwen35.sh" ]]; then
+      export PYTHONPATH="${SOURCE_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
       return 0
     fi
     if [[ -x "/workspace/llm-local-rl-vast-src/docker/run_ht_debate_qwen35.sh" ]]; then
       SOURCE_DIR="/workspace/llm-local-rl-vast-src"
+      export PYTHONPATH="${SOURCE_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
       return 0
     fi
   fi
@@ -184,6 +189,7 @@ prepare_source() {
     prepare_system_tools
     echo "Cloning ${REPO_URL}."
     git clone --depth 1 ${REPO_REF:+--branch "${REPO_REF}"} "${REPO_URL}" "${SOURCE_DIR}"
+    export PYTHONPATH="${SOURCE_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
     return 0
   fi
 

@@ -140,6 +140,17 @@ Minimum recommended env vars:
 
 For the preloaded DockerHub image, do not set `REPO_URL` or `REPO_REF`. It already contains the source. It also defaults `MODEL_ID` to `/opt/models/qwen35-4b-base`.
 
+To use the stable preloaded model image but pull the latest code from GitHub at launch time, set:
+
+```bash
+-e SOURCE_DIR=/workspace/llm-local-rl-live \
+-e PYTHONPATH=/workspace/llm-local-rl-live/src \
+-e REPO_URL=https://github.com/raulcdinardi/llm-debate.git \
+-e REPO_REF=codex/local-rl-rewrite
+```
+
+This avoids rebuilding the large preloaded image for normal code changes.
+
 If Hugging Face auth is needed:
 
 ```bash
