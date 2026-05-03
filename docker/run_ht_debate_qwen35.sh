@@ -19,6 +19,7 @@ if [[ "${REQUIRE_QWEN35_4B_BASE:-1}" == "1" ]]; then
 fi
 
 mkdir -p "${OUTPUT_DIR}" "${HF_HOME:-/cache/huggingface}" "${VLLM_CACHE_ROOT:-/cache/vllm}"
+export VLLM_USE_V1="${VLLM_USE_V1:-0}"
 
 read -r -a ROUND_ADAPTER_NAMES <<< "${DEBATE_ROUND_ADAPTER_NAMES:-solution debate debate}"
 DEFAULT_BASE_R2_PREFILL=$'The reasons that my solution is better than my opponent'\''s are:\n1)'
@@ -61,6 +62,14 @@ cmd=(
   --trace-top-logprobs "${TRACE_TOP_LOGPROBS:-5}"
   --resource-log-interval-s "${RESOURCE_LOG_INTERVAL_S:-5}"
 )
+
+if [[ "${SAMPLER_ENFORCE_EAGER:-1}" == "0" || "${SAMPLER_ENFORCE_EAGER:-true}" == "false" ]]; then
+  cmd+=(--no-sampler-enforce-eager)
+fi
+
+if [[ "${SAMPLER_TEARDOWN_BEFORE_TRAINING:-1}" == "1" ]]; then
+  cmd+=(--sampler-teardown-before-training)
+fi
 
 if [[ "${TRACE_MODEL_IO:-1}" == "0" ]]; then
   cmd+=(--no-trace-model-io)

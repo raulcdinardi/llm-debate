@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-minibatch-size", type=int, default=0)
     parser.add_argument("--sampler-gpu-memory-utilization", type=float, default=0.55)
     parser.add_argument("--sampler-max-model-len", type=int, default=512)
+    parser.add_argument("--sampler-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sampler-teardown-before-training", action="store_true")
     parser.add_argument("--no-trace-model-io", action="store_true")
     parser.add_argument("--trace-model-io-dir", default=None)
     parser.add_argument("--trace-top-logprobs", type=int, default=5)
@@ -98,6 +100,8 @@ def main() -> int:
                 train_minibatch_size=args.train_minibatch_size,
                 sampler_gpu_memory_utilization=args.sampler_gpu_memory_utilization,
                 sampler_max_model_len=args.sampler_max_model_len,
+                sampler_enforce_eager=args.sampler_enforce_eager,
+                sampler_teardown_before_training=args.sampler_teardown_before_training,
                 trace_model_io=not args.no_trace_model_io,
                 trace_model_io_dir=args.trace_model_io_dir,
                 trace_top_logprobs=args.trace_top_logprobs,

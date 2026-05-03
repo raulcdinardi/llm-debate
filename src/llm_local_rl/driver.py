@@ -65,8 +65,6 @@ class TrainingDriver:
             self.trainer.sleep()
         with self._stage("init_sampler", step=0):
             self.sampler = self._make_sampler()
-        with self._stage("sampler_sleep", step=0, level=2):
-            self.sampler.sleep(level=2)
         self._write_manifest(current_step=0)
         self._progress("driver_init_done", output_dir=str(self.output_dir))
 
@@ -103,8 +101,6 @@ class TrainingDriver:
             driver.trainer.sleep()
         with driver._stage("init_sampler", step=driver.start_step):
             driver.sampler = driver._make_sampler()
-        with driver._stage("sampler_sleep", step=driver.start_step, level=2):
-            driver.sampler.sleep(level=2)
         driver._progress("driver_resume_done", output_dir=str(driver.output_dir), start_step=driver.start_step)
         return driver
 
@@ -201,11 +197,11 @@ class TrainingDriver:
         if self.sampler is None:
             with self._stage("init_sampler"):
                 self.sampler = self._make_sampler()
-            with self._stage("sampler_sleep", level=2):
-                self.sampler.sleep(level=2)
 
     def _should_teardown_sampler_before_training(self) -> bool:
-        return self.config.rollout.mode == "debate" and self.config.adapter_layout == "split"
+        return self.config.sampler_teardown_before_training or (
+            self.config.rollout.mode == "debate" and self.config.adapter_layout == "split"
+        )
 
     def _teardown_sampler(self) -> None:
         if self.sampler is None:
@@ -513,12 +509,13 @@ class TrainingDriver:
                         ]
                         mean_reward = mean(rewards) if rewards else 0.0
                         mean_parse_success = mean(parse_values) if parse_values else 0.0
-                    with self._stage("sampler_sleep", step=step_num, level=2):
-                        self._progress("sampler_sleep_start", step=step_num, level=2)
-                        self.sampler.sleep(level=2)
-                        self._progress("sampler_sleep_done", step=step_num, level=2)
                     if self._should_teardown_sampler_before_training():
                         self._teardown_sampler()
+                    else:
+                        with self._stage("sampler_sleep", step=step_num, level=2):
+                            self._progress("sampler_sleep_start", step=step_num, level=2)
+                            self.sampler.sleep(level=2)
+                            self._progress("sampler_sleep_done", step=step_num, level=2)
 
                     with self._stage("trainer_wake", step=step_num):
                         self._progress("trainer_wake_start", step=step_num)

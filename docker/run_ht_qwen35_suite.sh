@@ -7,6 +7,7 @@ RUN_NAME="${RUN_NAME:-ht-suite-qwen35-$(date -u +%Y%m%dT%H%M%SZ)}"
 SUITE_OUTPUT_DIR="${OUTPUT_DIR:-/outputs/${RUN_NAME}}"
 
 mkdir -p "${SUITE_OUTPUT_DIR}" "${HF_HOME:-/cache/huggingface}" "${VLLM_CACHE_ROOT:-/cache/vllm}"
+export VLLM_USE_V1="${VLLM_USE_V1:-0}"
 
 COMMON_ARGS=(
   --model-path "${MODEL_ID}"
@@ -32,6 +33,14 @@ COMMON_ARGS=(
   --trace-top-logprobs "${TRACE_TOP_LOGPROBS:-5}"
   --resource-log-interval-s "${RESOURCE_LOG_INTERVAL_S:-5}"
 )
+
+if [[ "${SAMPLER_ENFORCE_EAGER:-1}" == "0" || "${SAMPLER_ENFORCE_EAGER:-true}" == "false" ]]; then
+  COMMON_ARGS+=(--no-sampler-enforce-eager)
+fi
+
+if [[ "${SAMPLER_TEARDOWN_BEFORE_TRAINING:-1}" == "1" ]]; then
+  COMMON_ARGS+=(--sampler-teardown-before-training)
+fi
 
 maybe_disable_flags=()
 if [[ "${TRACE_MODEL_IO:-1}" == "0" ]]; then

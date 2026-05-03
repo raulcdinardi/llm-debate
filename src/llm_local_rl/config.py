@@ -52,6 +52,7 @@ class TrainRunConfig:
     sampler_enforce_eager: bool = True
     sampler_max_lora_rank: int = 32
     sampler_max_loras: int = 4
+    sampler_teardown_before_training: bool = False
     target_modules: tuple[str, ...] = ("q_proj", "v_proj")
     lora_rank: int = 32
     trace_model_io: bool = True
@@ -109,6 +110,7 @@ class TrainRunConfig:
             sampler_enforce_eager=data.get("sampler_enforce_eager", True),
             sampler_max_lora_rank=data.get("sampler_max_lora_rank", 32),
             sampler_max_loras=data.get("sampler_max_loras", 4),
+            sampler_teardown_before_training=data.get("sampler_teardown_before_training", False),
             target_modules=tuple(data["target_modules"]),
             lora_rank=data["lora_rank"],
             trace_model_io=data.get("trace_model_io", True),
