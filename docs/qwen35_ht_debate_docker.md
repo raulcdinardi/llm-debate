@@ -1,6 +1,7 @@
 # Qwen3.5 HT Debate Docker Run
 
 This Docker setup runs a real `ht_sequence` debate experiment with `Qwen/Qwen3.5-4B-Base`.
+The launcher refuses Qwen3.5 4B non-base-looking overrides by default; set `REQUIRE_QWEN35_4B_BASE=0` only if you deliberately want to test another model.
 
 The default `qwen35-ht-debate.env.example` run is intentionally small for a shared RTX 4070:
 - 1 training step

@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-4B-Base}"
+DEFAULT_MODEL_ID="Qwen/Qwen3.5-4B-Base"
+MODEL_ID="${MODEL_ID:-${DEFAULT_MODEL_ID}}"
 RUN_NAME="${RUN_NAME:-ht-debate-qwen35-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUTPUT_DIR="${OUTPUT_DIR:-/outputs/${RUN_NAME}}"
+
+if [[ "${REQUIRE_QWEN35_4B_BASE:-1}" == "1" ]]; then
+  case "${MODEL_ID}" in
+    "${DEFAULT_MODEL_ID}"|/opt/models/qwen35-4b-base|*/qwen35-4b-base)
+      ;;
+    *Qwen3.5-4B*|*qwen3.5-4b*|*qwen35-4b*)
+      printf 'ERROR: MODEL_ID=%q does not look like the required Qwen3.5 4B Base model.\n' "${MODEL_ID}" >&2
+      printf 'Use MODEL_ID=%q, or set REQUIRE_QWEN35_4B_BASE=0 to override deliberately.\n' "${DEFAULT_MODEL_ID}" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 mkdir -p "${OUTPUT_DIR}" "${HF_HOME:-/cache/huggingface}" "${VLLM_CACHE_ROOT:-/cache/vllm}"
 

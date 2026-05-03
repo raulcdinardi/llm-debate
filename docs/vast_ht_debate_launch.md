@@ -140,6 +140,7 @@ Minimum recommended env vars:
 ```
 
 For the preloaded DockerHub image, do not set `REPO_URL` or `REPO_REF`. It already contains the source. It also defaults `MODEL_ID` to `/opt/models/qwen35-4b-base`.
+The launch wrapper requires the Qwen3.5 4B Base model by default and will reject Qwen3.5 4B non-base-looking overrides unless `REQUIRE_QWEN35_4B_BASE=0` is set deliberately.
 
 To use the stable preloaded model image but pull the latest code from GitHub at launch time, set:
 
