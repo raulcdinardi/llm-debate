@@ -28,7 +28,7 @@ COMMON_ARGS=(
   --advantage-mode "${ADVANTAGE_MODE:-zscore}"
   --train-minibatch-size "${TRAIN_MINIBATCH_SIZE:-1}"
   --sampler-gpu-memory-utilization "${SAMPLER_GPU_MEMORY_UTILIZATION:-0.55}"
-  --sampler-max-model-len "${SAMPLER_MAX_MODEL_LEN:-1024}"
+  --sampler-max-model-len "${SAMPLER_MAX_MODEL_LEN:-2048}"
   --trace-top-logprobs "${TRACE_TOP_LOGPROBS:-5}"
   --resource-log-interval-s "${RESOURCE_LOG_INTERVAL_S:-5}"
 )
