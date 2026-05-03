@@ -236,6 +236,10 @@ run_experiment() {
   export OUTPUT_DIR
   export MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-4B-Base}"
   export RUN_NAME
+  if [[ "${RUN_SUITE:-0}" == "1" ]]; then
+    bash docker/run_ht_qwen35_suite.sh
+    return 0
+  fi
   bash docker/run_ht_debate_qwen35.sh
 }
 

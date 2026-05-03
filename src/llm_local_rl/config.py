@@ -43,6 +43,9 @@ class TrainRunConfig:
     debate_external_judge_url: str | None = None
     debate_external_judge_timeout_s: float = 600.0
     debate_round_adapter_names: tuple[str, ...] = ("solution", "debate", "debate")
+    debate_prompt_format: str = "chat"
+    base_r2_prefill: str = "The reasons that my solution is better than my opponent's are:\n1)"
+    base_r3_prefill: str = "Responding to my opponent's criticism:\n1)"
     train_minibatch_size: int = 0
     sampler_gpu_memory_utilization: float = 0.55
     sampler_max_model_len: int = 512
@@ -97,6 +100,9 @@ class TrainRunConfig:
             debate_external_judge_url=data.get("debate_external_judge_url"),
             debate_external_judge_timeout_s=data.get("debate_external_judge_timeout_s", 600.0),
             debate_round_adapter_names=tuple(data.get("debate_round_adapter_names", ("solution", "debate", "debate"))),
+            debate_prompt_format=data.get("debate_prompt_format", "chat"),
+            base_r2_prefill=data.get("base_r2_prefill", "The reasons that my solution is better than my opponent's are:\n1)"),
+            base_r3_prefill=data.get("base_r3_prefill", "Responding to my opponent's criticism:\n1)"),
             train_minibatch_size=data.get("train_minibatch_size", 0),
             sampler_gpu_memory_utilization=data.get("sampler_gpu_memory_utilization", 0.55),
             sampler_max_model_len=data.get("sampler_max_model_len", 512),

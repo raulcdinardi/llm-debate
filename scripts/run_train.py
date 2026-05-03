@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debate-external-judge-url", default=None)
     parser.add_argument("--debate-external-judge-timeout-s", type=float, default=600.0)
     parser.add_argument("--debate-round-adapter-names", nargs="*", default=["solution", "debate", "debate"])
+    parser.add_argument("--debate-prompt-format", default="chat", choices=["chat", "qwen35_base_text_prefill"])
+    parser.add_argument("--base-r2-prefill", default="The reasons that my solution is better than my opponent's are:\n1)")
+    parser.add_argument("--base-r3-prefill", default="Responding to my opponent's criticism:\n1)")
     parser.add_argument("--train-minibatch-size", type=int, default=0)
     parser.add_argument("--sampler-gpu-memory-utilization", type=float, default=0.55)
     parser.add_argument("--sampler-max-model-len", type=int, default=512)
@@ -89,6 +92,9 @@ def main() -> int:
                 debate_external_judge_url=args.debate_external_judge_url,
                 debate_external_judge_timeout_s=args.debate_external_judge_timeout_s,
                 debate_round_adapter_names=tuple(args.debate_round_adapter_names),
+                debate_prompt_format=args.debate_prompt_format,
+                base_r2_prefill=args.base_r2_prefill,
+                base_r3_prefill=args.base_r3_prefill,
                 train_minibatch_size=args.train_minibatch_size,
                 sampler_gpu_memory_utilization=args.sampler_gpu_memory_utilization,
                 sampler_max_model_len=args.sampler_max_model_len,

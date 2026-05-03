@@ -22,6 +22,14 @@ _REASONING_RE = re.compile(r"<REASONING>(.*?)</REASONING>", re.IGNORECASE | re.D
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _THINK_TAIL_RE = re.compile(r"<think>.*$", re.IGNORECASE | re.DOTALL)
 _CLOSING_THINK_RE = re.compile(r"</think>", re.IGNORECASE)
+_EOS_LITERAL = "<|endoftext|>"
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+_NUMBERED_SENTENCE_RE = re.compile(r"^\s*\d+\)")
+_BASE_STOP_SENTINEL = "CONCLUDED"
+_FAIR_COIN_CONSTITUTION = (
+    "Choose the answer that better simulates a fair coin while obeying the exact requested H/T output format. "
+    "Prefer the sequence that looks more statistically plausible for a fair coin, not the one that merely sounds persuasive."
+)
 
 
 def extract_solution(text: str) -> str | None:
@@ -48,6 +56,48 @@ def _strip_think_blocks(text: str) -> str:
     text = _THINK_TAIL_RE.sub("", text)
     text = _CLOSING_THINK_RE.sub("", text)
     return text.strip()
+
+
+def _clean_visible_completion_text(text: str) -> str:
+    return _strip_think_blocks(text).replace(_EOS_LITERAL, "").split(_BASE_STOP_SENTINEL, 1)[0].strip()
+
+
+def truncate_seeded_numbered_completion_text(text: str) -> str:
+    clean_text = _clean_visible_completion_text(text)
+    if not clean_text:
+        return clean_text
+    kept_end = 0
+    raw_start = 0
+    boundaries = [match.end() for match in _SENTENCE_BOUNDARY_RE.finditer(clean_text)]
+    boundaries.append(len(clean_text))
+    for raw_end in boundaries:
+        raw_segment = clean_text[raw_start:raw_end]
+        if raw_segment.strip():
+            right_trimmed_segment = raw_segment.rstrip()
+            segment_text = right_trimmed_segment
+            is_numbered = kept_end == 0 or bool(_NUMBERED_SENTENCE_RE.match(segment_text))
+            if is_numbered:
+                kept_end = raw_start + len(right_trimmed_segment)
+            else:
+                break
+        raw_start = raw_end
+    return clean_text[:kept_end].strip()
+
+
+def _base_text_prompt(*, system_text: str | None, user_text: str, assistant_prefill: str = "") -> str:
+    if system_text:
+        return f"System:\n{system_text}\n\nUser:\n{user_text}\nAssistant:\n{assistant_prefill}"
+    return f"User:\n{user_text}\nAssistant:\n{assistant_prefill}"
+
+
+def _base_debate_system_text(round_name: str) -> str:
+    return (
+        f"You are participating in Round {round_name} of a debate about whether an H/T sequence looks like a fair coin.\n"
+        "Your Round 1 sequence is fixed and cannot change.\n"
+        "Argue only about why your fixed sequence better simulates a fair coin while respecting the exact output format.\n"
+        "Use concrete evidence such as balance, streaks, clumping, and alternation.\n"
+        "Do not emit <think> tags."
+    )
 
 
 def _fallback_verdict_from_invalid_judge(*, step_seed: int | None, debate_idx: int) -> Verdict:
@@ -89,6 +139,9 @@ class DebateRuntimeConfig:
     round_adapter_names: tuple[str, ...] = ("solution", "debate", "debate")
     rollout_batch_size: int = 0
     request_seed_mode: str = "none"
+    prompt_format: str = "chat"
+    base_r2_prefill: str = "The reasons that my solution is better than my opponent's are:\n1)"
+    base_r3_prefill: str = "Responding to my opponent's criticism:\n1)"
 
 
 @dataclass
@@ -255,6 +308,108 @@ class DebateRuntime:
             return None
         return step_seed + round_num * 100000 + request_idx
 
+    def _use_base_text_prefill(self) -> bool:
+        if self.runtime_config.prompt_format == "chat":
+            return False
+        if self.runtime_config.prompt_format == "qwen35_base_text_prefill":
+            return True
+        raise ValueError(f"Unsupported prompt_format={self.runtime_config.prompt_format!r}")
+
+    def _encode_base_text(self, text: str) -> list[int]:
+        return list(self.tokenizer.encode(text, add_special_tokens=False))
+
+    def _base_r1_prompt_tokens(self, *, inst: TaskInstance) -> list[int]:
+        return self._encode_base_text(
+            _base_text_prompt(
+                system_text=None,
+                user_text=self.task.judge_context_text(inst=inst),
+            )
+        )
+
+    def _base_r2_continuation_tokens(
+        self,
+        *,
+        inst: TaskInstance,
+        own_r1: str,
+        opponent_r1: str,
+    ) -> list[int]:
+        user_text = (
+            f"Original task prompt:\n{self.task.judge_context_text(inst=inst)}\n\n"
+            f"Constitution:\n{_FAIR_COIN_CONSTITUTION}\n\n"
+            f"Your fixed Round 1 sequence:\n{own_r1}\n\n"
+            f"Opponent Round 1 sequence:\n{opponent_r1}\n\n"
+            "Write exactly 3 short numbered points for your Round 2 argument.\n"
+            "- Argue why your fixed sequence looks more like a fair coin.\n"
+            "- Point out concrete weaknesses in the opponent's sequence.\n"
+            "- Do not revise your Round 1 sequence.\n"
+            f"- After point 3, immediately output {_BASE_STOP_SENTINEL} and nothing else.\n"
+        )
+        return self._encode_base_text(
+            "\n\n"
+            + _base_text_prompt(
+                system_text=_base_debate_system_text("2"),
+                user_text=user_text,
+                assistant_prefill=self.runtime_config.base_r2_prefill,
+            )
+        )
+
+    def _base_r3_continuation_tokens(
+        self,
+        *,
+        inst: TaskInstance,
+        own_r1: str,
+        opponent_r1: str,
+        own_r2: str,
+        opponent_r2: str,
+    ) -> list[int]:
+        user_text = (
+            f"Original task prompt:\n{self.task.judge_context_text(inst=inst)}\n\n"
+            f"Constitution:\n{_FAIR_COIN_CONSTITUTION}\n\n"
+            f"Your fixed Round 1 sequence:\n{own_r1}\n\n"
+            f"Opponent Round 1 sequence:\n{opponent_r1}\n\n"
+            f"Your Round 2 argument:\n{own_r2}\n\n"
+            f"Opponent Round 2 argument:\n{opponent_r2}\n\n"
+            "Write exactly 3 short numbered points for your Round 3 response.\n"
+            "- Respond to the opponent's criticisms.\n"
+            "- Make your final case that your fixed sequence better simulates a fair coin.\n"
+            "- Do not revise your Round 1 sequence.\n"
+            f"- After point 3, immediately output {_BASE_STOP_SENTINEL} and nothing else.\n"
+        )
+        return self._encode_base_text(
+            "\n\n"
+            + _base_text_prompt(
+                system_text=_base_debate_system_text("3"),
+                user_text=user_text,
+                assistant_prefill=self.runtime_config.base_r3_prefill,
+            )
+        )
+
+    def _truncate_numbered_result(
+        self,
+        *,
+        completion_tokens: list[int],
+        completion_logprobs: list[float],
+        text: str,
+        raw: dict,
+    ) -> tuple[list[int], list[float], str, dict]:
+        truncated_text = truncate_seeded_numbered_completion_text(text)
+        clean_text = _clean_visible_completion_text(text)
+        if not truncated_text or truncated_text == clean_text:
+            return completion_tokens, completion_logprobs, text, raw
+        for end in range(1, len(completion_tokens) + 1):
+            prefix_text = _clean_visible_completion_text(
+                self.tokenizer.decode(completion_tokens[:end], skip_special_tokens=True)
+            )
+            if prefix_text == truncated_text:
+                updated_raw = dict(raw)
+                updated_raw["untruncated_completion_text"] = text
+                updated_raw["truncated_completion_text"] = truncated_text
+                return completion_tokens[:end], completion_logprobs[:end], truncated_text, updated_raw
+        updated_raw = dict(raw)
+        updated_raw["untruncated_completion_text"] = text
+        updated_raw["truncated_completion_text"] = truncated_text
+        return completion_tokens, completion_logprobs, truncated_text, updated_raw
+
     def _sample_many(self, *, prompt_tokens_list: list[list[int]], round_num: int, step_seed: int | None, stop_token_ids: list[int], max_tokens: int, temperature: float, adapter_name: str | None = None) -> list[tuple[list[int], list[float], str, dict]]:
         requests = []
         for idx, prompt_tokens in enumerate(prompt_tokens_list):
@@ -327,23 +482,32 @@ class DebateRuntime:
         return prompts
 
     def _rollout_three_rounds(self, *, instances_repeated: list[TaskInstance], step_seed: int | None) -> DebateRolloutOutput:
-        r2_template = self.task.debate_r2_user_template() or load_prompt("debate/r2_token_template.md")
-        r3_template = self.task.debate_r3_user_template() or load_prompt("debate/r3_token_template.md")
-        r2_pre, r2_post = _split_template(r2_template, "{opponent_r1}")
-        r3_pre, r3_post = _split_template(r3_template, "{opponent_r2}")
-        adapter = get_chat_adapter(self.tokenizer)
-        r2_prefix_tokens, r2_suffix_tokens = adapter.build_user_continuation_tokens(
-            user_pre=r2_pre,
-            user_post=r2_post,
-            enable_thinking=self.debate_config.enable_thinking,
-        )
-        r3_prefix_tokens, r3_suffix_tokens = adapter.build_user_continuation_tokens(
-            user_pre=r3_pre,
-            user_post=r3_post,
-            enable_thinking=self.debate_config.enable_thinking,
-        )
+        use_base_text_prefill = self._use_base_text_prefill()
+        if use_base_text_prefill:
+            r2_prefix_tokens: list[int] = []
+            r2_suffix_tokens: list[int] = []
+            r3_prefix_tokens: list[int] = []
+            r3_suffix_tokens: list[int] = []
+        else:
+            r2_template = self.task.debate_r2_user_template() or load_prompt("debate/r2_token_template.md")
+            r3_template = self.task.debate_r3_user_template() or load_prompt("debate/r3_token_template.md")
+            r2_pre, r2_post = _split_template(r2_template, "{opponent_r1}")
+            r3_pre, r3_post = _split_template(r3_template, "{opponent_r2}")
+            adapter = get_chat_adapter(self.tokenizer)
+            r2_prefix_tokens, r2_suffix_tokens = adapter.build_user_continuation_tokens(
+                user_pre=r2_pre,
+                user_post=r2_post,
+                enable_thinking=self.debate_config.enable_thinking,
+            )
+            r3_prefix_tokens, r3_suffix_tokens = adapter.build_user_continuation_tokens(
+                user_pre=r3_pre,
+                user_post=r3_post,
+                enable_thinking=self.debate_config.enable_thinking,
+            )
         base_r1_prompt_tokens = [
-            self.task.build_r1_prompt_tokens(inst=inst, tokenizer=self.tokenizer, enable_thinking=self.debate_config.enable_thinking)
+            self._base_r1_prompt_tokens(inst=inst)
+            if use_base_text_prefill
+            else self.task.build_r1_prompt_tokens(inst=inst, tokenizer=self.tokenizer, enable_thinking=self.debate_config.enable_thinking)
             for inst in instances_repeated
         ]
         stop_token_ids = self.task.stop_token_ids(tokenizer=self.tokenizer)
@@ -374,10 +538,30 @@ class DebateRuntime:
         for idx in range(n_debates):
             a_idx = 2 * idx
             b_idx = 2 * idx + 1
-            opp_r1_a = self.tokenizer.encode(r1_visible_text[b_idx], add_special_tokens=False)
-            opp_r1_b = self.tokenizer.encode(r1_visible_text[a_idx], add_special_tokens=False)
-            r2_prompt_tokens.append(base_r1_prompt_tokens[a_idx] + r1_tokens[a_idx] + r2_prefix_tokens + opp_r1_a + r2_suffix_tokens)
-            r2_prompt_tokens.append(base_r1_prompt_tokens[b_idx] + r1_tokens[b_idx] + r2_prefix_tokens + opp_r1_b + r2_suffix_tokens)
+            if use_base_text_prefill:
+                r2_prompt_tokens.append(
+                    base_r1_prompt_tokens[a_idx]
+                    + r1_tokens[a_idx]
+                    + self._base_r2_continuation_tokens(
+                        inst=instances_repeated[a_idx],
+                        own_r1=r1_visible_text[a_idx],
+                        opponent_r1=r1_visible_text[b_idx],
+                    )
+                )
+                r2_prompt_tokens.append(
+                    base_r1_prompt_tokens[b_idx]
+                    + r1_tokens[b_idx]
+                    + self._base_r2_continuation_tokens(
+                        inst=instances_repeated[b_idx],
+                        own_r1=r1_visible_text[b_idx],
+                        opponent_r1=r1_visible_text[a_idx],
+                    )
+                )
+            else:
+                opp_r1_a = self.tokenizer.encode(r1_visible_text[b_idx], add_special_tokens=False)
+                opp_r1_b = self.tokenizer.encode(r1_visible_text[a_idx], add_special_tokens=False)
+                r2_prompt_tokens.append(base_r1_prompt_tokens[a_idx] + r1_tokens[a_idx] + r2_prefix_tokens + opp_r1_a + r2_suffix_tokens)
+                r2_prompt_tokens.append(base_r1_prompt_tokens[b_idx] + r1_tokens[b_idx] + r2_prefix_tokens + opp_r1_b + r2_suffix_tokens)
         r2_results = self._sample_many(
             prompt_tokens_list=r2_prompt_tokens,
             round_num=2,
@@ -386,6 +570,11 @@ class DebateRuntime:
             max_tokens=int(self.debate_config.max_tokens_per_turn or 64),
             temperature=float(self.debate_config.temperature),
         )
+        if use_base_text_prefill:
+            r2_results = [
+                self._truncate_numbered_result(completion_tokens=comp, completion_logprobs=lps, text=text, raw=raw)
+                for comp, lps, text, raw in r2_results
+            ]
         r2_tokens = [comp for comp, _lps, _text, _raw in r2_results]
         r2_lps = [lps for _comp, lps, _text, _raw in r2_results]
         r2_text = [text for _comp, _lps, text, _raw in r2_results]
@@ -396,10 +585,34 @@ class DebateRuntime:
         for idx in range(n_debates):
             a_idx = 2 * idx
             b_idx = 2 * idx + 1
-            opp_r2_a = self.tokenizer.encode(r2_visible_text[b_idx], add_special_tokens=False)
-            opp_r2_b = self.tokenizer.encode(r2_visible_text[a_idx], add_special_tokens=False)
-            r3_prompt_tokens.append(r2_prompt_tokens[a_idx] + r2_tokens[a_idx] + r3_prefix_tokens + opp_r2_a + r3_suffix_tokens)
-            r3_prompt_tokens.append(r2_prompt_tokens[b_idx] + r2_tokens[b_idx] + r3_prefix_tokens + opp_r2_b + r3_suffix_tokens)
+            if use_base_text_prefill:
+                r3_prompt_tokens.append(
+                    r2_prompt_tokens[a_idx]
+                    + r2_tokens[a_idx]
+                    + self._base_r3_continuation_tokens(
+                        inst=instances_repeated[a_idx],
+                        own_r1=r1_visible_text[a_idx],
+                        opponent_r1=r1_visible_text[b_idx],
+                        own_r2=r2_visible_text[a_idx],
+                        opponent_r2=r2_visible_text[b_idx],
+                    )
+                )
+                r3_prompt_tokens.append(
+                    r2_prompt_tokens[b_idx]
+                    + r2_tokens[b_idx]
+                    + self._base_r3_continuation_tokens(
+                        inst=instances_repeated[b_idx],
+                        own_r1=r1_visible_text[b_idx],
+                        opponent_r1=r1_visible_text[a_idx],
+                        own_r2=r2_visible_text[b_idx],
+                        opponent_r2=r2_visible_text[a_idx],
+                    )
+                )
+            else:
+                opp_r2_a = self.tokenizer.encode(r2_visible_text[b_idx], add_special_tokens=False)
+                opp_r2_b = self.tokenizer.encode(r2_visible_text[a_idx], add_special_tokens=False)
+                r3_prompt_tokens.append(r2_prompt_tokens[a_idx] + r2_tokens[a_idx] + r3_prefix_tokens + opp_r2_a + r3_suffix_tokens)
+                r3_prompt_tokens.append(r2_prompt_tokens[b_idx] + r2_tokens[b_idx] + r3_prefix_tokens + opp_r2_b + r3_suffix_tokens)
         r3_results = self._sample_many(
             prompt_tokens_list=r3_prompt_tokens,
             round_num=3,
@@ -408,6 +621,11 @@ class DebateRuntime:
             max_tokens=int(self.debate_config.max_tokens_per_turn or 64),
             temperature=float(self.debate_config.temperature),
         )
+        if use_base_text_prefill:
+            r3_results = [
+                self._truncate_numbered_result(completion_tokens=comp, completion_logprobs=lps, text=text, raw=raw)
+                for comp, lps, text, raw in r3_results
+            ]
         r3_tokens = [comp for comp, _lps, _text, _raw in r3_results]
         r3_lps = [lps for _comp, lps, _text, _raw in r3_results]
         r3_text = [text for _comp, _lps, text, _raw in r3_results]
@@ -492,8 +710,11 @@ class DebateRuntime:
         return DebateRolloutOutput(debates=debates, info_lines=[f"Debates={len(debates)} rounds=2"])
 
     def _rollout_r1_only(self, *, instances_repeated: list[TaskInstance], step_seed: int | None) -> DebateRolloutOutput:
+        use_base_text_prefill = self._use_base_text_prefill()
         base_r1_prompt_tokens = [
-            self.task.build_r1_prompt_tokens(inst=inst, tokenizer=self.tokenizer, enable_thinking=self.debate_config.enable_thinking)
+            self._base_r1_prompt_tokens(inst=inst)
+            if use_base_text_prefill
+            else self.task.build_r1_prompt_tokens(inst=inst, tokenizer=self.tokenizer, enable_thinking=self.debate_config.enable_thinking)
             for inst in instances_repeated
         ]
         stop_token_ids = self.task.stop_token_ids(tokenizer=self.tokenizer)

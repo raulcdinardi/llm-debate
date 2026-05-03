@@ -21,6 +21,8 @@ fi
 mkdir -p "${OUTPUT_DIR}" "${HF_HOME:-/cache/huggingface}" "${VLLM_CACHE_ROOT:-/cache/vllm}"
 
 read -r -a ROUND_ADAPTER_NAMES <<< "${DEBATE_ROUND_ADAPTER_NAMES:-solution debate debate}"
+DEFAULT_BASE_R2_PREFILL=$'The reasons that my solution is better than my opponent'\''s are:\n1)'
+DEFAULT_BASE_R3_PREFILL=$'Responding to my opponent'\''s criticism:\n1)'
 
 cmd=(
   python3 scripts/run_train.py
@@ -50,6 +52,9 @@ cmd=(
   --debate-r23-mode "${DEBATE_R23_MODE:-symmetric}"
   --debate-judge-adapter "${DEBATE_JUDGE_ADAPTER:-policy}"
   --debate-round-adapter-names "${ROUND_ADAPTER_NAMES[@]}"
+  --debate-prompt-format "${DEBATE_PROMPT_FORMAT:-qwen35_base_text_prefill}"
+  --base-r2-prefill "${BASE_R2_PREFILL:-${DEFAULT_BASE_R2_PREFILL}}"
+  --base-r3-prefill "${BASE_R3_PREFILL:-${DEFAULT_BASE_R3_PREFILL}}"
   --train-minibatch-size "${TRAIN_MINIBATCH_SIZE:-1}"
   --sampler-gpu-memory-utilization "${SAMPLER_GPU_MEMORY_UTILIZATION:-0.45}"
   --sampler-max-model-len "${SAMPLER_MAX_MODEL_LEN:-768}"
