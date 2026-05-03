@@ -290,6 +290,7 @@ class TrainingDriver:
                 judge_adapter=self.config.debate_judge_adapter,
                 round_adapter_names=self.config.debate_round_adapter_names,
                 rollout_batch_size=self.config.rollout.rollout_batch_size,
+                request_seed_mode=self.config.rollout.request_seed_mode,
             ),
             adapter_layout=self.config.adapter_layout,
             judge_fn=judge_fn,
@@ -323,8 +324,10 @@ class TrainingDriver:
                     prompt_text = self.env.build_initial_prompt(instance=instance)
                     prompt_token_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
                 request_seed = None
-                if self.config.rollout.seed is not None:
+                if self.config.rollout.request_seed_mode == "per_request" and self.config.rollout.seed is not None:
                     request_seed = self.config.rollout.seed + step_idx * self.config.rollout.num_samples + sample_idx
+                elif self.config.rollout.request_seed_mode != "none":
+                    raise ValueError(f"Unsupported request_seed_mode={self.config.rollout.request_seed_mode!r}")
                 requests.append(
                     SamplingRequest(
                         adapter_name=adapter_name,

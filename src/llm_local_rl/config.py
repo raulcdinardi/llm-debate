@@ -17,6 +17,7 @@ class RolloutConfig:
     temperature: float = 0.7
     min_p: float = 0.0
     seed: int | None = None
+    request_seed_mode: str = "none"
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ class TrainRunConfig:
                 temperature=rollout_data.get("temperature", 0.7),
                 min_p=rollout_data.get("min_p", 0.0),
                 seed=rollout_data.get("seed"),
+                request_seed_mode=rollout_data.get("request_seed_mode", "none"),
             ),
             steps=data["steps"],
             learning_rate=data["learning_rate"],

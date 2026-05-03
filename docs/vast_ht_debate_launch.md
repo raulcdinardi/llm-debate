@@ -10,7 +10,7 @@ This is the lowest-friction Vast path for the Qwen HT debate experiment.
 - The experiment defaults are conservative for a shared 4070.
 - The Vast script stops the instance at the end by default.
 
-`GROUP_SIZE=2` is only for smoke testing. For a real run, use `GROUP_SIZE=8` or larger. With `ROLLOUT_BATCH_SIZE=1`, group size mostly increases runtime and training data, not peak rollout memory.
+`GROUP_SIZE=2` is only for smoke testing. For a real run, use `GROUP_SIZE=8` or larger. Keep `ROLLOUT_BATCH_SIZE=0` unless you need to cap memory; `0` sends each full debate round to vLLM so it can batch generation.
 
 ## Important Billing Behavior
 
@@ -130,7 +130,8 @@ Minimum recommended env vars:
 -e STEPS=5 \
 -e NUM_GROUPS=2 \
 -e GROUP_SIZE=8 \
--e ROLLOUT_BATCH_SIZE=1 \
+-e ROLLOUT_BATCH_SIZE=0 \
+-e REQUEST_SEED_MODE=none \
 -e MAX_TOKENS=128 \
 -e SAMPLER_MAX_MODEL_LEN=1024 \
 -e SAMPLER_GPU_MEMORY_UTILIZATION=0.55 \

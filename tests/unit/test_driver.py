@@ -14,11 +14,11 @@ def test_config_and_manifest_roundtrip() -> None:
         config = TrainRunConfig(
             model_path="/tmp/nonexistent_model_for_shape_only",
             output_dir=tmpdir,
-            rollout=RolloutConfig(mode="single_turn"),
             steps=1,
             debate_external_judge_url="http://judge.test:8123",
             debate_external_judge_timeout_s=123.0,
             thinking_mode="no_think",
+            rollout=RolloutConfig(mode="single_turn", request_seed_mode="per_request"),
             trace_model_io=False,
             trace_model_io_dir=str(Path(tmpdir) / "trace"),
             trace_top_logprobs=7,
@@ -41,6 +41,7 @@ def test_config_and_manifest_roundtrip() -> None:
         restored_config = TrainRunConfig.from_dict(loaded.run_config)
         assert restored_config.rollout.env_name == "ht_sequence"
         assert restored_config.rollout.mode == "single_turn"
+        assert restored_config.rollout.request_seed_mode == "per_request"
         assert restored_config.debate_external_judge_url == "http://judge.test:8123"
         assert restored_config.debate_external_judge_timeout_s == 123.0
         assert restored_config.thinking_mode == "no_think"

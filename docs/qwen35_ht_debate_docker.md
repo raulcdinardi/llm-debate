@@ -6,7 +6,7 @@ The default `qwen35-ht-debate.env.example` run is intentionally small for a shar
 - 1 training step
 - 1 debate group
 - 2 agents per group
-- rollout batch size 1
+- rollout batch size 0, meaning one vLLM batch per debate round
 - 64 generated tokens per turn
 - vLLM GPU memory utilization 0.45
 - token-level model I/O tracing enabled with top-5 alternatives
@@ -19,6 +19,8 @@ That default is:
 - 128 generated tokens per turn
 
 `GROUP_SIZE=2` is only a smoke test. It creates one pairwise debate per task group, so it is useful for validating the stack but too small for meaningful GRPO-style group comparisons.
+
+Use `REQUEST_SEED_MODE=none` for normal training throughput. The global `SEED` still seeds task sampling, but vLLM requests are not assigned unique per-request seeds that would fragment batches. Set `REQUEST_SEED_MODE=per_request` only when you need the older fully seeded request behavior.
 
 ## Files
 

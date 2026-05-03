@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--request-seed-mode", default="none", choices=["none", "per_request"])
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--sequence-len", type=int, default=8)
     parser.add_argument("--reward-mode", default="num_h", choices=["num_h", "num_transitions"])
@@ -69,6 +70,7 @@ def main() -> int:
                     temperature=args.temperature,
                     min_p=args.min_p,
                     seed=args.seed,
+                    request_seed_mode=args.request_seed_mode,
                 ),
                 steps=args.steps,
                 learning_rate=args.learning_rate,

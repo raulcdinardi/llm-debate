@@ -88,6 +88,7 @@ class DebateRuntimeConfig:
     judge_adapter: str = "policy"
     round_adapter_names: tuple[str, ...] = ("solution", "debate", "debate")
     rollout_batch_size: int = 0
+    request_seed_mode: str = "none"
 
 
 @dataclass
@@ -246,6 +247,10 @@ class DebateRuntime:
         return "debate"
 
     def _round_seed(self, *, step_seed: int | None, request_idx: int, round_num: int) -> int | None:
+        if self.runtime_config.request_seed_mode == "none":
+            return None
+        if self.runtime_config.request_seed_mode != "per_request":
+            raise ValueError(f"Unsupported request_seed_mode={self.runtime_config.request_seed_mode!r}")
         if step_seed is None:
             return None
         return step_seed + round_num * 100000 + request_idx

@@ -114,3 +114,15 @@ def test_debate_runtime_supports_general_round_adapter_mapping_and_rollout_batch
     assert adapter_sequence[6] == "debate"
     assert all(size == 1 for size in sampler.call_sizes)
     assert len(sampler.call_sizes) in {7, 8}
+
+
+def test_debate_runtime_default_request_seed_mode_does_not_seed_each_request() -> None:
+    runtime = object.__new__(DebateRuntime)
+    runtime.runtime_config = DebateRuntimeConfig(request_seed_mode="none")
+    assert runtime._round_seed(step_seed=123, request_idx=4, round_num=2) is None
+
+
+def test_debate_runtime_per_request_seed_mode_preserves_unique_request_seeds() -> None:
+    runtime = object.__new__(DebateRuntime)
+    runtime.runtime_config = DebateRuntimeConfig(request_seed_mode="per_request")
+    assert runtime._round_seed(step_seed=123, request_idx=4, round_num=2) == 200127
