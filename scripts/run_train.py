@@ -10,7 +10,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generic rollout+train driver for the rewrite stack.")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--env", default="ht_sequence", choices=["ht_sequence", "coin_flip"])
+    parser.add_argument("--env", default="ht_sequence", choices=["ht_sequence", "coin_flip", "short_story", "secret_word"])
     parser.add_argument("--mode", default="debate", choices=["single_turn", "debate"])
     parser.add_argument("--adapter-layout", default="shared", choices=["shared", "split"])
     parser.add_argument("--steps", type=int, default=1)

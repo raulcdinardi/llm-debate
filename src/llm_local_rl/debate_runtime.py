@@ -319,10 +319,15 @@ class DebateRuntime:
         return list(self.tokenizer.encode(text, add_special_tokens=False))
 
     def _base_r1_prompt_tokens(self, *, inst: TaskInstance) -> list[int]:
+        context_builder = getattr(self.task, "r1_context_text", None)
+        if callable(context_builder):
+            user_text = str(context_builder(inst=inst))
+        else:
+            user_text = self.task.judge_context_text(inst=inst)
         return self._encode_base_text(
             _base_text_prompt(
                 system_text=None,
-                user_text=self.task.judge_context_text(inst=inst),
+                user_text=user_text,
             )
         )
 
@@ -333,17 +338,27 @@ class DebateRuntime:
         own_r1: str,
         opponent_r1: str,
     ) -> list[int]:
-        user_text = (
-            f"Original task prompt:\n{self.task.judge_context_text(inst=inst)}\n\n"
-            f"Constitution:\n{_FAIR_COIN_CONSTITUTION}\n\n"
-            f"Your fixed Round 1 sequence:\n{own_r1}\n\n"
-            f"Opponent Round 1 sequence:\n{opponent_r1}\n\n"
-            "Write exactly 3 short numbered points for your Round 2 argument.\n"
-            "- Argue why your fixed sequence looks more like a fair coin.\n"
-            "- Point out concrete weaknesses in the opponent's sequence.\n"
-            "- Do not revise your Round 1 sequence.\n"
-            f"- After point 3, immediately output {_BASE_STOP_SENTINEL} and nothing else.\n"
-        )
+        task_template = self.task.debate_r2_user_template()
+        if task_template is None:
+            user_text = (
+                f"Original task prompt:\n{self.task.judge_context_text(inst=inst)}\n\n"
+                f"Constitution:\n{_FAIR_COIN_CONSTITUTION}\n\n"
+                f"Your fixed Round 1 sequence:\n{own_r1}\n\n"
+                f"Opponent Round 1 sequence:\n{opponent_r1}\n\n"
+                "Write exactly 3 short numbered points for your Round 2 argument.\n"
+                "- Argue why your fixed sequence looks more like a fair coin.\n"
+                "- Point out concrete weaknesses in the opponent's sequence.\n"
+                "- Do not revise your Round 1 sequence.\n"
+                f"- After point 3, immediately output {_BASE_STOP_SENTINEL} and nothing else.\n"
+            )
+        else:
+            user_text = (
+                f"Original task prompt:\n{self.task.judge_context_text(inst=inst)}\n\n"
+                f"Constitution:\n{self.task.judge_constitution_text(inst=inst)}\n\n"
+                f"Your fixed Round 1 answer:\n{own_r1}\n\n"
+                + task_template.replace("{opponent_r1}", opponent_r1)
+                + f"\n\nWrite exactly 3 short numbered points. After point 3, immediately output {_BASE_STOP_SENTINEL} and nothing else.\n"
+            )
         return self._encode_base_text(
             "\n\n"
             + _base_text_prompt(
@@ -362,19 +377,31 @@ class DebateRuntime:
         own_r2: str,
         opponent_r2: str,
     ) -> list[int]:
-        user_text = (
-            f"Original task prompt:\n{self.task.judge_context_text(inst=inst)}\n\n"
-            f"Constitution:\n{_FAIR_COIN_CONSTITUTION}\n\n"
-            f"Your fixed Round 1 sequence:\n{own_r1}\n\n"
-            f"Opponent Round 1 sequence:\n{opponent_r1}\n\n"
-            f"Your Round 2 argument:\n{own_r2}\n\n"
-            f"Opponent Round 2 argument:\n{opponent_r2}\n\n"
-            "Write exactly 3 short numbered points for your Round 3 response.\n"
-            "- Respond to the opponent's criticisms.\n"
-            "- Make your final case that your fixed sequence better simulates a fair coin.\n"
-            "- Do not revise your Round 1 sequence.\n"
-            f"- After point 3, immediately output {_BASE_STOP_SENTINEL} and nothing else.\n"
-        )
+        task_template = self.task.debate_r3_user_template()
+        if task_template is None:
+            user_text = (
+                f"Original task prompt:\n{self.task.judge_context_text(inst=inst)}\n\n"
+                f"Constitution:\n{_FAIR_COIN_CONSTITUTION}\n\n"
+                f"Your fixed Round 1 sequence:\n{own_r1}\n\n"
+                f"Opponent Round 1 sequence:\n{opponent_r1}\n\n"
+                f"Your Round 2 argument:\n{own_r2}\n\n"
+                f"Opponent Round 2 argument:\n{opponent_r2}\n\n"
+                "Write exactly 3 short numbered points for your Round 3 response.\n"
+                "- Respond to the opponent's criticisms.\n"
+                "- Make your final case that your fixed sequence better simulates a fair coin.\n"
+                "- Do not revise your Round 1 sequence.\n"
+                f"- After point 3, immediately output {_BASE_STOP_SENTINEL} and nothing else.\n"
+            )
+        else:
+            user_text = (
+                f"Original task prompt:\n{self.task.judge_context_text(inst=inst)}\n\n"
+                f"Constitution:\n{self.task.judge_constitution_text(inst=inst)}\n\n"
+                f"Your fixed Round 1 answer:\n{own_r1}\n\n"
+                f"Opponent Round 1 answer:\n{opponent_r1}\n\n"
+                f"Your Round 2 argument:\n{own_r2}\n\n"
+                + task_template.replace("{opponent_r2}", opponent_r2)
+                + f"\n\nWrite exactly 3 short numbered points. After point 3, immediately output {_BASE_STOP_SENTINEL} and nothing else.\n"
+            )
         return self._encode_base_text(
             "\n\n"
             + _base_text_prompt(

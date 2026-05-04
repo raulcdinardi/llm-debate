@@ -67,3 +67,9 @@ class HTSequenceInstance:
 class CoinFlipInstance:
     instance_id: str
     options: tuple[str, str] = ("Heads", "Tails")
+
+
+@dataclass(frozen=True)
+class ShortStoryInstance:
+    instance_id: str
+    secret_word: str

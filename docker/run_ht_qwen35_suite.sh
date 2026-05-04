@@ -3,7 +3,8 @@ set -euo pipefail
 
 DEFAULT_MODEL_ID="Qwen/Qwen3.5-4B-Base"
 MODEL_ID="${MODEL_ID:-${DEFAULT_MODEL_ID}}"
-RUN_NAME="${RUN_NAME:-ht-suite-qwen35-$(date -u +%Y%m%dT%H%M%SZ)}"
+ENV_NAME="${ENV_NAME:-ht_sequence}"
+RUN_NAME="${RUN_NAME:-${ENV_NAME}-suite-qwen35-$(date -u +%Y%m%dT%H%M%SZ)}"
 SUITE_OUTPUT_DIR="${OUTPUT_DIR:-/outputs/${RUN_NAME}}"
 
 mkdir -p "${SUITE_OUTPUT_DIR}" "${HF_HOME:-/cache/huggingface}" "${VLLM_CACHE_ROOT:-/cache/vllm}"
@@ -11,7 +12,7 @@ export VLLM_USE_V1="${VLLM_USE_V1:-0}"
 
 COMMON_ARGS=(
   --model-path "${MODEL_ID}"
-  --env ht_sequence
+  --env "${ENV_NAME}"
   --steps "${STEPS:-1}"
   --num-groups "${NUM_GROUPS:-2}"
   --group-size "${GROUP_SIZE:-8}"

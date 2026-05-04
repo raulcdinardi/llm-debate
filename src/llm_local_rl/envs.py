@@ -7,11 +7,14 @@ from llm_local_rl.chat_templates import get_chat_adapter
 from llm_local_rl.ht_sequence_format import parse_ht_sequence
 from llm_local_rl.interfaces import Tokenizer
 from llm_local_rl.prompts import format_prompt, load_prompt
-from llm_local_rl.types import CoinFlipInstance, HTSequenceInstance
+from llm_local_rl.short_story_format import contains_word, extract_solution
+from llm_local_rl.types import CoinFlipInstance, HTSequenceInstance, ShortStoryInstance
 
 _COIN_SYSTEM = load_prompt("tasks/coin_system.md")
 _COIN_USER = load_prompt("tasks/coin_user.md")
 _HT_USER = load_prompt("tasks/ht_sequence_user.md")
+_SHORT_STORY_R1 = load_prompt("tasks/short_story_r1.md")
+_SHORT_STORY_WORDS = ("opal", "cobalt", "saffron", "ember", "quill", "harbor", "glyph", "lilac")
 
 
 @dataclass(frozen=True)
@@ -170,5 +173,68 @@ class CoinFlipEnv:
             "choice_token_id": int(completion_token_ids[0]) if completion_token_ids else None,
             "candidate_token_ids": {"Red": int(red_tok[0]), "Blue": int(blue_tok[0])},
             "target": self.target_color,
+            "full_text": text,
+        }
+
+
+@dataclass(frozen=True)
+class ShortStoryEnv:
+    name: str = "short_story"
+
+    def sample_instances(self, *, n: int, seed: int | None) -> list[ShortStoryInstance]:
+        rng = random.Random(seed)
+        return [
+            ShortStoryInstance(
+                instance_id=f"short_story_{idx}",
+                secret_word=rng.choice(_SHORT_STORY_WORDS),
+            )
+            for idx in range(n)
+        ]
+
+    def build_initial_prompt(self, *, instance: ShortStoryInstance) -> str:
+        return format_prompt(_SHORT_STORY_R1, secret_word=instance.secret_word)
+
+    def build_initial_prompt_token_ids(
+        self,
+        *,
+        instance: ShortStoryInstance,
+        tokenizer: Tokenizer,
+        enable_thinking: bool | None = None,
+    ) -> list[int]:
+        prompt = self.build_initial_prompt(instance=instance)
+        if hasattr(tokenizer, "apply_chat_template"):
+            return get_chat_adapter(tokenizer).encode_messages(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        return tokenizer.encode(prompt, add_special_tokens=False)
+
+    def stop_token_ids(self, *, tokenizer: Tokenizer) -> list[int]:
+        if hasattr(tokenizer, "apply_chat_template"):
+            stop = get_chat_adapter(tokenizer).get_stop_sequences()
+            if stop is not None and len(stop) == 1:
+                return [int(stop[0])]
+        stop = tokenizer.encode("\n", add_special_tokens=False)
+        if len(stop) != 1:
+            raise ValueError("Expected newline stop sequence to tokenize to one token.")
+        return stop
+
+    def score_completion(
+        self,
+        *,
+        instance: ShortStoryInstance,
+        tokenizer: Tokenizer,
+        completion_token_ids: list[int],
+    ) -> tuple[float, dict]:
+        text = tokenizer.decode(completion_token_ids, skip_special_tokens=True)
+        solution = extract_solution(text)
+        parse_success = solution is not None
+        used_secret = contains_word(solution or "", instance.secret_word)
+        return 1.0 if used_secret else 0.0, {
+            "parse_success": 1.0 if parse_success else 0.0,
+            "used_secret": 1.0 if used_secret else 0.0,
+            "secret_word": instance.secret_word,
+            "solution": solution,
             "full_text": text,
         }
