@@ -17,6 +17,7 @@ from llm_local_rl.debate_parity import (
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
 from llm_local_rl.local_renderers import infer_chat_preamble
 from llm_local_rl.masking import make_train_example
+from llm_local_rl.metrics import mean_numeric_metrics
 from llm_local_rl.model_io_trace import configure_model_io_tracing, trace_context
 from llm_local_rl.registry import build_debate_task, build_environment, build_episode_builder
 from llm_local_rl.resource_monitor import ResourceMonitor
@@ -461,6 +462,7 @@ class TrainingDriver:
                             if samples
                             else 0.0
                         )
+                        mean_reward_metrics = mean_numeric_metrics([sample.reward_metrics for sample in samples])
                     else:
                         step_seed = None if self.config.rollout.seed is None else self.config.rollout.seed + step_idx
                         with self._stage("rollout_debate", step=step_num), trace_context(
@@ -507,8 +509,14 @@ class TrainingDriver:
                             for debate in debates
                             for traj in (debate.trajectory_a, debate.trajectory_b)
                         ]
+                        task_reward_metrics = [
+                            traj.metrics["task_reward_metrics"]
+                            for debate in debates
+                            for traj in (debate.trajectory_a, debate.trajectory_b)
+                        ]
                         mean_reward = mean(rewards) if rewards else 0.0
                         mean_parse_success = mean(parse_values) if parse_values else 0.0
+                        mean_reward_metrics = mean_numeric_metrics(task_reward_metrics)
                     if self._should_teardown_sampler_before_training():
                         self._teardown_sampler()
                     else:
@@ -565,11 +573,14 @@ class TrainingDriver:
                         "step": step_num,
                         "mean_reward": mean_reward,
                         "mean_parse_success": mean_parse_success,
+                        "mean_reward_metrics": mean_reward_metrics,
                         "train_metrics": train_metrics,
                         "sample_records": record_samples,
                         "adapter_dirs": dict(self.current_adapter_dirs),
                         **extra_record,
                     }
+                    if "mean_used_secret" in mean_reward_metrics:
+                        record["mean_reward_hacking"] = mean_reward_metrics["mean_used_secret"]
                     with self.step_records_path.open("a") as f:
                         f.write(json.dumps(record) + "\n")
                     self._write_manifest(current_step=step_num)
@@ -578,6 +589,7 @@ class TrainingDriver:
                         step=step_num,
                         mean_reward=mean_reward,
                         mean_parse_success=mean_parse_success,
+                        mean_reward_hacking=record.get("mean_reward_hacking"),
                     )
                     print(json.dumps(record, indent=2))
 

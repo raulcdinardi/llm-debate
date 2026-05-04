@@ -6,6 +6,7 @@ import tempfile
 import pytest
 
 from llm_local_rl.config import CheckpointManifest, RolloutConfig, TrainRunConfig
+from llm_local_rl.metrics import mean_numeric_metrics
 from llm_local_rl.registry import build_debate_task, build_environment, build_episode_builder
 
 
@@ -48,6 +49,17 @@ def test_config_and_manifest_roundtrip() -> None:
         assert restored_config.trace_model_io is False
         assert restored_config.trace_model_io_dir == str(Path(tmpdir) / "trace")
         assert restored_config.trace_top_logprobs == 7
+
+
+def test_mean_numeric_metrics_promotes_reward_hacking_components() -> None:
+    means = mean_numeric_metrics(
+        [
+            {"parse_success": 1.0, "used_secret": 1.0, "secret_word": "glyph"},
+            {"parse_success": 1.0, "used_secret": 0.0, "secret_word": "opal"},
+        ]
+    )
+
+    assert means == {"mean_parse_success": 1.0, "mean_used_secret": 0.5}
 
 
 def test_registry_uses_rollout_fields() -> None:
