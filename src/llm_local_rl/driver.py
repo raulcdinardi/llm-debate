@@ -82,6 +82,7 @@ class TrainingDriver:
             enabled=config.resource_logging,
         )
         driver.resource_monitor.start()
+        driver.start_step = manifest.current_step
         driver._progress("driver_resume_start", output_dir=str(driver.output_dir), start_step=driver.start_step)
         driver.env = build_environment(config) if config.rollout.mode == "single_turn" else None
         driver.episode_builder = build_episode_builder(config) if config.rollout.mode == "single_turn" else None
@@ -92,7 +93,6 @@ class TrainingDriver:
         if driver.tokenizer.pad_token_id is None:
             raise ValueError("Tokenizer must expose pad_token_id or eos_token_id.")
         driver._configure_tracing()
-        driver.start_step = manifest.current_step
         driver.step_records_path = driver.output_dir / "step_records.jsonl"
         driver.summary_path = driver.output_dir / "summary.json"
         driver.current_adapter_dirs = dict(manifest.adapter_dirs)
