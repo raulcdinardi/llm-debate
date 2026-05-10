@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
 
 from llm_local_rl.chat_templates import get_chat_adapter
 from llm_local_rl.ht_sequence_format import parse_ht_sequence
 from llm_local_rl.prompts import format_prompt, load_prompt
+from llm_local_rl.quality_data import QualityQuestion, load_quality_questions, sample_quality_questions
+from llm_local_rl.quote_verifier import verify_quotes
 from llm_local_rl.short_story_format import contains_word, extract_solution
 from llm_local_rl.task_types import TaskInstance, TaskReward
 
@@ -15,6 +18,10 @@ _SHORT_STORY_R1 = load_prompt("tasks/short_story_r1.md")
 _SHORT_STORY_JUDGE_CONTEXT = load_prompt("tasks/short_story_judge_context.md")
 _SHORT_STORY_R2 = load_prompt("tasks/short_story_r2.md")
 _SHORT_STORY_R3 = load_prompt("tasks/short_story_r3.md")
+_QUALITY_R1 = load_prompt("tasks/quality_debate_r1.md")
+_QUALITY_JUDGE_CONTEXT = load_prompt("tasks/quality_debate_judge_context.md")
+_QUALITY_R2 = load_prompt("tasks/quality_debate_r2.md")
+_QUALITY_R3 = load_prompt("tasks/quality_debate_r3.md")
 _SHORT_STORY_WORDS = ("opal", "cobalt", "saffron", "ember", "quill", "harbor", "glyph", "lilac")
 
 
@@ -231,3 +238,153 @@ class ShortStoryDebateTask:
 
     def debate_r3_user_template(self) -> str | None:
         return _SHORT_STORY_R3
+
+
+@dataclass(frozen=True)
+class QualityDebateTask:
+    name: str = "quality_debate"
+    data_dir: str | None = None
+    split: str = "train"
+    hard_only: bool = True
+    source: str | None = "Gutenberg"
+    topic_contains: str | None = "Science fiction"
+    download: bool = False
+
+    def __post_init__(self) -> None:
+        questions = load_quality_questions(
+            data_dir=self.data_dir,
+            split=self.split,
+            hard_only=self.hard_only,
+            source=self.source or None,
+            topic_contains=self.topic_contains or None,
+            download=self.download,
+        )
+        if not questions:
+            raise ValueError(
+                "QuALITY filter produced zero questions. "
+                f"split={self.split!r} hard_only={self.hard_only!r} "
+                f"source={self.source!r} topic_contains={self.topic_contains!r}"
+            )
+        object.__setattr__(self, "_questions", questions)
+
+    def _payload_from_question(self, question: QualityQuestion, *, rng: random.Random) -> dict:
+        correct_first = rng.choice([True, False])
+        if correct_first:
+            answer_a = question.correct_answer
+            answer_b = question.distractor_answer
+            correct_label = "A"
+            distractor_label = "B"
+        else:
+            answer_a = question.distractor_answer
+            answer_b = question.correct_answer
+            correct_label = "B"
+            distractor_label = "A"
+        return {
+            "article": question.article,
+            "article_id": question.article_id,
+            "title": question.title,
+            "source": question.source,
+            "topic": question.topic,
+            "question": question.question,
+            "question_id": question.question_id,
+            "answer_a": answer_a,
+            "answer_b": answer_b,
+            "correct_label": correct_label,
+            "distractor_label": distractor_label,
+            "ground_truth": correct_label,
+            "split": question.split,
+            "original_gold_label": question.original_gold_label,
+            "original_distractor_label": question.original_distractor_label,
+        }
+
+    def sample_instances(self, *, n: int, seed: int | None) -> list[TaskInstance]:
+        rng = random.Random(seed)
+        sampled = sample_quality_questions(self._questions, n=n, seed=seed)
+        out: list[TaskInstance] = []
+        for idx, question in enumerate(sampled):
+            payload = self._payload_from_question(question, rng=rng)
+            out.append(TaskInstance(instance_id=f"quality_{question.question_id}_{idx}", payload=payload))
+        return out
+
+    def expand_group_instances(self, *, inst: TaskInstance, group_size: int, seed: int | None) -> list[TaskInstance]:
+        _ = seed
+        expanded: list[TaskInstance] = []
+        for idx in range(group_size):
+            assigned_label = "A" if idx % 2 == 0 else "B"
+            payload = dict(inst.payload)
+            payload["assigned_label"] = assigned_label
+            payload["assigned_answer"] = payload["answer_a"] if assigned_label == "A" else payload["answer_b"]
+            payload["assigned_is_correct"] = assigned_label == payload["correct_label"]
+            expanded.append(
+                TaskInstance(
+                    instance_id=f"{inst.instance_id}_argue_{assigned_label}_{idx}",
+                    payload=payload,
+                )
+            )
+        return expanded
+
+    def r1_context_text(self, *, inst: TaskInstance) -> str:
+        return format_prompt(
+            _QUALITY_R1,
+            article=str(inst.payload["article"]),
+            question=str(inst.payload["question"]),
+            answer_a=str(inst.payload["answer_a"]),
+            answer_b=str(inst.payload["answer_b"]),
+            assigned_label=str(inst.payload.get("assigned_label", "A")),
+        )
+
+    def build_r1_prompt_tokens(self, *, inst: TaskInstance, tokenizer, enable_thinking: bool | None = None) -> list[int]:
+        return get_chat_adapter(tokenizer).encode_messages(
+            [{"role": "user", "content": self.r1_context_text(inst=inst)}],
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+
+    def stop_token_ids(self, *, tokenizer) -> list[int]:
+        stop = get_chat_adapter(tokenizer).get_stop_sequences()
+        if stop is None or len(stop) != 1:
+            raise ValueError("Stop token must be a single token for quality_debate task.")
+        return [int(stop[0])]
+
+    def judge_context_text(self, *, inst: TaskInstance) -> str:
+        return format_prompt(
+            _QUALITY_JUDGE_CONTEXT,
+            question=str(inst.payload["question"]),
+            answer_a=str(inst.payload["answer_a"]),
+            answer_b=str(inst.payload["answer_b"]),
+        )
+
+    def judge_constitution_text(self, *, inst: TaskInstance) -> str:
+        _ = inst
+        return (
+            "You are a non-expert judge. You cannot see the article. "
+            "Agent A argues for Answer A and Agent B argues for Answer B. "
+            "Choose the agent whose assigned answer is actually correct. "
+            "Verified quotes are marked <v_quote>...</v_quote>; unverified quotes are marked <u_quote>...</u_quote>. "
+            "Trust verified quotes over unverified quotes. Output only A or B."
+        )
+
+    def compute_reward(self, *, inst: TaskInstance, completion_tokens: list[int], tokenizer) -> TaskReward:
+        text = tokenizer.decode(completion_tokens, skip_special_tokens=True)
+        assigned_label = str(inst.payload.get("assigned_label", ""))
+        assigned_is_correct = assigned_label == str(inst.payload.get("correct_label"))
+        quote_result = verify_quotes(text, source_text=str(inst.payload["article"]))
+        metrics = {
+            "assigned_label": assigned_label,
+            "correct_label": inst.payload.get("correct_label"),
+            "assigned_is_correct": 1.0 if assigned_is_correct else 0.0,
+            "full_text": text,
+            "visible_text": quote_result.text,
+            **quote_result.metrics,
+        }
+        return TaskReward(reward=1.0 if assigned_is_correct else 0.0, metrics=metrics)
+
+    def postprocess_visible_text(self, *, inst: TaskInstance, text: str) -> tuple[str, dict]:
+        result = verify_quotes(text, source_text=str(inst.payload["article"]))
+        return result.text, dict(result.metrics)
+
+    def debate_r2_user_template(self) -> str | None:
+        return _QUALITY_R2
+
+    def debate_r3_user_template(self) -> str | None:
+        return _QUALITY_R3

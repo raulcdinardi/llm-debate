@@ -10,7 +10,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generic rollout+train driver for the rewrite stack.")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--env", default="ht_sequence", choices=["ht_sequence", "coin_flip", "short_story", "secret_word"])
+    parser.add_argument("--env", default="ht_sequence", choices=["ht_sequence", "coin_flip", "short_story", "secret_word", "quality_debate"])
     parser.add_argument("--mode", default="debate", choices=["single_turn", "debate"])
     parser.add_argument("--adapter-layout", default="shared", choices=["shared", "split"])
     parser.add_argument("--steps", type=int, default=1)
@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--sequence-len", type=int, default=8)
     parser.add_argument("--reward-mode", default="num_h", choices=["num_h", "num_transitions"])
+    parser.add_argument("--quality-data-dir", default=None)
+    parser.add_argument("--quality-split", default="train", choices=["train", "dev", "test"])
+    parser.add_argument("--quality-hard-only", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--quality-source", default="Gutenberg")
+    parser.add_argument("--quality-topic-contains", default="Science fiction")
+    parser.add_argument("--quality-download", action="store_true")
     parser.add_argument("--thinking-mode", default="default", choices=["default", "no_think", "force_think"])
     parser.add_argument("--advantage-mode", default="zscore", choices=["identity", "centered_mean", "zscore"])
     parser.add_argument("--ppo-clip-epsilon", type=float, default=0.2)
@@ -82,6 +88,12 @@ def main() -> int:
                 adapter_layout=args.adapter_layout,
                 sequence_len=args.sequence_len,
                 reward_mode=args.reward_mode,
+                quality_data_dir=args.quality_data_dir,
+                quality_split=args.quality_split,
+                quality_hard_only=args.quality_hard_only,
+                quality_source=args.quality_source,
+                quality_topic_contains=args.quality_topic_contains,
+                quality_download=args.quality_download,
                 thinking_mode=args.thinking_mode,
                 advantage_mode=args.advantage_mode,
                 ppo_clip_epsilon=args.ppo_clip_epsilon,

@@ -31,6 +31,12 @@ class TrainRunConfig:
     sequence_len: int = 8
     reward_mode: str = "num_h"
     strict_ht_format: bool = False
+    quality_data_dir: str | None = None
+    quality_split: str = "train"
+    quality_hard_only: bool = True
+    quality_source: str | None = "Gutenberg"
+    quality_topic_contains: str | None = "Science fiction"
+    quality_download: bool = False
     thinking_mode: str = "default"
     advantage_mode: str = "zscore"
     ppo_clip_epsilon: float = 0.2
@@ -89,6 +95,12 @@ class TrainRunConfig:
             sequence_len=data["sequence_len"],
             reward_mode=data["reward_mode"],
             strict_ht_format=data.get("strict_ht_format", False),
+            quality_data_dir=data.get("quality_data_dir"),
+            quality_split=data.get("quality_split", "train"),
+            quality_hard_only=data.get("quality_hard_only", True),
+            quality_source=data.get("quality_source", "Gutenberg"),
+            quality_topic_contains=data.get("quality_topic_contains", "Science fiction"),
+            quality_download=data.get("quality_download", False),
             thinking_mode=data.get("thinking_mode", "default"),
             advantage_mode=data.get("advantage_mode", "zscore"),
             ppo_clip_epsilon=data.get("ppo_clip_epsilon", 0.2),

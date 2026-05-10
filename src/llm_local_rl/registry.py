@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from llm_local_rl.config import TrainRunConfig
-from llm_local_rl.debate_tasks import CoinDebateTask, HTSequenceDebateTask, ShortStoryDebateTask
-from llm_local_rl.envs import CoinFlipEnv, HTSequenceEnv, ShortStoryEnv
+from llm_local_rl.debate_tasks import CoinDebateTask, HTSequenceDebateTask, QualityDebateTask, ShortStoryDebateTask
+from llm_local_rl.envs import CoinFlipEnv, HTSequenceEnv, QualityEnv, ShortStoryEnv
 from llm_local_rl.episodes import SingleTurnEpisodeBuilder
 
 
@@ -17,6 +17,15 @@ def build_environment(config: TrainRunConfig):
         return CoinFlipEnv()
     if config.rollout.env_name in {"short_story", "secret_word"}:
         return ShortStoryEnv()
+    if config.rollout.env_name == "quality_debate":
+        return QualityEnv(
+            data_dir=config.quality_data_dir,
+            split=config.quality_split,
+            hard_only=config.quality_hard_only,
+            source=config.quality_source,
+            topic_contains=config.quality_topic_contains,
+            download=config.quality_download,
+        )
     raise ValueError(f"Unknown env_name={config.rollout.env_name!r}")
 
 
@@ -38,4 +47,13 @@ def build_debate_task(config: TrainRunConfig):
         return CoinDebateTask()
     if config.rollout.env_name in {"short_story", "secret_word"}:
         return ShortStoryDebateTask()
+    if config.rollout.env_name == "quality_debate":
+        return QualityDebateTask(
+            data_dir=config.quality_data_dir,
+            split=config.quality_split,
+            hard_only=config.quality_hard_only,
+            source=config.quality_source,
+            topic_contains=config.quality_topic_contains,
+            download=config.quality_download,
+        )
     raise ValueError(f"Unknown env_name={config.rollout.env_name!r} for debate mode.")

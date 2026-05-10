@@ -29,7 +29,7 @@ cmd=(
   python3 scripts/run_train.py
   --model-path "${MODEL_ID}"
   --output-dir "${OUTPUT_DIR}"
-  --env ht_sequence
+  --env "${ENV_NAME:-ht_sequence}"
   --mode debate
   --adapter-layout "${ADAPTER_LAYOUT:-split}"
   --steps "${STEPS:-1}"
@@ -44,6 +44,7 @@ cmd=(
   --learning-rate "${LEARNING_RATE:-1e-5}"
   --sequence-len "${SEQUENCE_LEN:-8}"
   --reward-mode "${REWARD_MODE:-num_h}"
+  --quality-split "${QUALITY_SPLIT:-train}"
   --thinking-mode "${THINKING_MODE:-no_think}"
   --advantage-mode "${ADVANTAGE_MODE:-zscore}"
   --debate-rounds "${DEBATE_ROUNDS:-3}"
@@ -62,6 +63,26 @@ cmd=(
   --trace-top-logprobs "${TRACE_TOP_LOGPROBS:-5}"
   --resource-log-interval-s "${RESOURCE_LOG_INTERVAL_S:-5}"
 )
+
+if [[ -n "${QUALITY_DATA_DIR:-}" ]]; then
+  cmd+=(--quality-data-dir "${QUALITY_DATA_DIR}")
+fi
+
+if [[ "${QUALITY_HARD_ONLY:-1}" == "0" ]]; then
+  cmd+=(--no-quality-hard-only)
+fi
+
+if [[ -n "${QUALITY_SOURCE:-Gutenberg}" ]]; then
+  cmd+=(--quality-source "${QUALITY_SOURCE:-Gutenberg}")
+fi
+
+if [[ -n "${QUALITY_TOPIC_CONTAINS:-Science fiction}" ]]; then
+  cmd+=(--quality-topic-contains "${QUALITY_TOPIC_CONTAINS:-Science fiction}")
+fi
+
+if [[ "${QUALITY_DOWNLOAD:-0}" == "1" ]]; then
+  cmd+=(--quality-download)
+fi
 
 if [[ "${SAMPLER_ENFORCE_EAGER:-1}" == "0" || "${SAMPLER_ENFORCE_EAGER:-true}" == "false" ]]; then
   cmd+=(--no-sampler-enforce-eager)
@@ -88,8 +109,9 @@ if [[ -n "${EXTRA_ARGS:-}" ]]; then
   cmd+=("${EXTRA_ARGV[@]}")
 fi
 
-printf 'Running HT debate experiment:\n'
+printf 'Running debate experiment:\n'
 printf '  model: %s\n' "${MODEL_ID}"
+printf '  env: %s\n' "${ENV_NAME:-ht_sequence}"
 printf '  output: %s\n' "${OUTPUT_DIR}"
 printf '  command:'
 printf ' %q' "${cmd[@]}"

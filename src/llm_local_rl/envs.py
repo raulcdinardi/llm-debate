@@ -7,7 +7,9 @@ from llm_local_rl.chat_templates import get_chat_adapter
 from llm_local_rl.ht_sequence_format import parse_ht_sequence
 from llm_local_rl.interfaces import Tokenizer
 from llm_local_rl.prompts import format_prompt, load_prompt
+from llm_local_rl.quality_data import load_quality_questions, sample_quality_questions
 from llm_local_rl.short_story_format import contains_word, extract_solution
+from llm_local_rl.task_types import TaskInstance
 from llm_local_rl.types import CoinFlipInstance, HTSequenceInstance, ShortStoryInstance
 
 _COIN_SYSTEM = load_prompt("tasks/coin_system.md")
@@ -236,5 +238,99 @@ class ShortStoryEnv:
             "used_secret": 1.0 if used_secret else 0.0,
             "secret_word": instance.secret_word,
             "solution": solution,
+            "full_text": text,
+        }
+
+
+@dataclass(frozen=True)
+class QualityEnv:
+    name: str = "quality_debate"
+    data_dir: str | None = None
+    split: str = "train"
+    hard_only: bool = True
+    source: str | None = "Gutenberg"
+    topic_contains: str | None = "Science fiction"
+    download: bool = False
+
+    def __post_init__(self) -> None:
+        questions = load_quality_questions(
+            data_dir=self.data_dir,
+            split=self.split,
+            hard_only=self.hard_only,
+            source=self.source or None,
+            topic_contains=self.topic_contains or None,
+            download=self.download,
+        )
+        if not questions:
+            raise ValueError("QuALITY filter produced zero questions.")
+        object.__setattr__(self, "_questions", questions)
+
+    def sample_instances(self, *, n: int, seed: int | None) -> list[TaskInstance]:
+        rng = random.Random(seed)
+        instances: list[TaskInstance] = []
+        for idx, question in enumerate(sample_quality_questions(self._questions, n=n, seed=seed)):
+            correct_first = rng.choice([True, False])
+            payload = {
+                "article": question.article,
+                "question": question.question,
+                "answer_a": question.correct_answer if correct_first else question.distractor_answer,
+                "answer_b": question.distractor_answer if correct_first else question.correct_answer,
+                "correct_label": "A" if correct_first else "B",
+                "ground_truth": "A" if correct_first else "B",
+                "question_id": question.question_id,
+                "article_id": question.article_id,
+            }
+            instances.append(TaskInstance(instance_id=f"quality_{question.question_id}_{idx}", payload=payload))
+        return instances
+
+    def build_initial_prompt(self, *, instance: TaskInstance) -> str:
+        return (
+            f"Article:\n{instance.payload['article']}\n\n"
+            f"Question:\n{instance.payload['question']}\n\n"
+            f"Answer A:\n{instance.payload['answer_a']}\n\n"
+            f"Answer B:\n{instance.payload['answer_b']}\n\n"
+            "Choose the correct answer. Output only A or B."
+        )
+
+    def build_initial_prompt_token_ids(
+        self,
+        *,
+        instance: TaskInstance,
+        tokenizer: Tokenizer,
+        enable_thinking: bool | None = None,
+    ) -> list[int]:
+        prompt = self.build_initial_prompt(instance=instance)
+        if hasattr(tokenizer, "apply_chat_template"):
+            return get_chat_adapter(tokenizer).encode_messages(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        return tokenizer.encode(prompt, add_special_tokens=False)
+
+    def stop_token_ids(self, *, tokenizer: Tokenizer) -> list[int]:
+        if hasattr(tokenizer, "apply_chat_template"):
+            stop = get_chat_adapter(tokenizer).get_stop_sequences()
+            if stop is not None and len(stop) == 1:
+                return [int(stop[0])]
+        stop = tokenizer.encode("\n", add_special_tokens=False)
+        if len(stop) != 1:
+            raise ValueError("Expected newline stop sequence to tokenize to one token.")
+        return stop
+
+    def score_completion(
+        self,
+        *,
+        instance: TaskInstance,
+        tokenizer: Tokenizer,
+        completion_token_ids: list[int],
+    ) -> tuple[float, dict]:
+        text = tokenizer.decode(completion_token_ids, skip_special_tokens=True).strip()
+        match = text[:1].upper()
+        correct = match == instance.payload["correct_label"]
+        return 1.0 if correct else 0.0, {
+            "parse_success": 1.0 if match in {"A", "B"} else 0.0,
+            "choice": match if match in {"A", "B"} else None,
+            "correct_label": instance.payload["correct_label"],
             "full_text": text,
         }

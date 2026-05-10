@@ -222,8 +222,18 @@ class DebateRuntime:
             raise ValueError("Debate requires even group_size.")
         instances = self.task.sample_instances(n=self.runtime_config.num_groups, seed=step_seed)
         instances_repeated: list[TaskInstance] = []
-        for inst in instances:
-            instances_repeated.extend([inst] * self.runtime_config.group_size)
+        expander = getattr(self.task, "expand_group_instances", None)
+        for group_idx, inst in enumerate(instances):
+            if callable(expander):
+                instances_repeated.extend(
+                    expander(
+                        inst=inst,
+                        group_size=self.runtime_config.group_size,
+                        seed=None if step_seed is None else step_seed + group_idx,
+                    )
+                )
+            else:
+                instances_repeated.extend([inst] * self.runtime_config.group_size)
         if self.runtime_config.num_rounds == 1:
             return self._rollout_r1_only(instances_repeated=instances_repeated, step_seed=step_seed)
         if self.runtime_config.num_rounds == 2:
@@ -231,6 +241,25 @@ class DebateRuntime:
         if self.runtime_config.num_rounds != 3:
             raise ValueError(f"Unsupported num_rounds={self.runtime_config.num_rounds}")
         return self._rollout_three_rounds(instances_repeated=instances_repeated, step_seed=step_seed)
+
+    def _postprocess_visible_texts(self, *, instances: list[TaskInstance], texts: list[str]) -> tuple[list[str], list[dict]]:
+        postprocess = getattr(self.task, "postprocess_visible_text", None)
+        visible_texts: list[str] = []
+        metrics: list[dict] = []
+        for inst, text in zip(instances, texts, strict=True):
+            clean_text = _strip_think_blocks(text)
+            if callable(postprocess):
+                processed = postprocess(inst=inst, text=clean_text)
+                if isinstance(processed, tuple):
+                    visible_text, visible_metrics = processed
+                else:
+                    visible_text, visible_metrics = processed, {}
+                visible_texts.append(str(visible_text))
+                metrics.append(dict(visible_metrics))
+            else:
+                visible_texts.append(clean_text)
+                metrics.append({})
+        return visible_texts, metrics
 
     def sample_pointwise_judge_rewards(self, *, debates: list[DebateResult], step_seed: int | None) -> dict[int, float]:
         adapter = get_chat_adapter(self.tokenizer)
@@ -549,7 +578,7 @@ class DebateRuntime:
         r1_tokens = [comp for comp, _lps, _text, _raw in r1_results]
         r1_lps = [lps for _comp, lps, _text, _raw in r1_results]
         r1_text = [text for _comp, _lps, text, _raw in r1_results]
-        r1_visible_text = [_strip_think_blocks(text) for text in r1_text]
+        r1_visible_text, r1_visible_metrics = self._postprocess_visible_texts(instances=instances_repeated, texts=r1_text)
         r1_sol = [extract_solution(text) for text in r1_visible_text]
         r1_raw = [raw for _comp, _lps, _text, raw in r1_results]
         r1_task_rewards = []
@@ -605,7 +634,7 @@ class DebateRuntime:
         r2_tokens = [comp for comp, _lps, _text, _raw in r2_results]
         r2_lps = [lps for _comp, lps, _text, _raw in r2_results]
         r2_text = [text for _comp, _lps, text, _raw in r2_results]
-        r2_visible_text = [_strip_think_blocks(text) for text in r2_text]
+        r2_visible_text, r2_visible_metrics = self._postprocess_visible_texts(instances=instances_repeated, texts=r2_text)
         r2_raw = [raw for _comp, _lps, _text, raw in r2_results]
 
         r3_prompt_tokens = []
@@ -656,7 +685,7 @@ class DebateRuntime:
         r3_tokens = [comp for comp, _lps, _text, _raw in r3_results]
         r3_lps = [lps for _comp, lps, _text, _raw in r3_results]
         r3_text = [text for _comp, _lps, text, _raw in r3_results]
-        r3_visible_text = [_strip_think_blocks(text) for text in r3_text]
+        r3_visible_text, r3_visible_metrics = self._postprocess_visible_texts(instances=instances_repeated, texts=r3_text)
         r3_raw = [raw for _comp, _lps, _text, raw in r3_results]
 
         if self.judge_fn is not None:
@@ -681,9 +710,9 @@ class DebateRuntime:
             traj_a = DebateTrajectory(
                 agent="A",
                 transitions=[
-                    Transition(prompt_tokens=base_r1_prompt_tokens[a_idx], completion_tokens=r1_tokens[a_idx], completion_logprobs=r1_lps[a_idx], round_num=1, metrics={"solution": r1_sol[a_idx], "instance_id": inst_a.instance_id}, raw_response=r1_raw[a_idx]),
-                    Transition(prompt_tokens=r2_prompt_tokens[a_idx], completion_tokens=r2_tokens[a_idx], completion_logprobs=r2_lps[a_idx], round_num=2, raw_response=r2_raw[a_idx]),
-                    Transition(prompt_tokens=r3_prompt_tokens[a_idx], completion_tokens=r3_tokens[a_idx], completion_logprobs=r3_lps[a_idx], round_num=3, raw_response=r3_raw[a_idx]),
+                    Transition(prompt_tokens=base_r1_prompt_tokens[a_idx], completion_tokens=r1_tokens[a_idx], completion_logprobs=r1_lps[a_idx], round_num=1, metrics={"solution": r1_sol[a_idx], "instance_id": inst_a.instance_id, "visible_text_metrics": r1_visible_metrics[a_idx]}, raw_response=r1_raw[a_idx]),
+                    Transition(prompt_tokens=r2_prompt_tokens[a_idx], completion_tokens=r2_tokens[a_idx], completion_logprobs=r2_lps[a_idx], round_num=2, metrics={"visible_text_metrics": r2_visible_metrics[a_idx]}, raw_response=r2_raw[a_idx]),
+                    Transition(prompt_tokens=r3_prompt_tokens[a_idx], completion_tokens=r3_tokens[a_idx], completion_logprobs=r3_lps[a_idx], round_num=3, metrics={"visible_text_metrics": r3_visible_metrics[a_idx]}, raw_response=r3_raw[a_idx]),
                 ],
                 frozen_solution=r1_sol[a_idx],
                 metrics={"r1": r1_text[a_idx], "r2": r2_text[a_idx], "r3": r3_text[a_idx], "instance_id": inst_a.instance_id, "task_reward": r1_task_rewards[a_idx], "task_reward_metrics": r1_task_reward_metrics[a_idx]},
@@ -691,9 +720,9 @@ class DebateRuntime:
             traj_b = DebateTrajectory(
                 agent="B",
                 transitions=[
-                    Transition(prompt_tokens=base_r1_prompt_tokens[b_idx], completion_tokens=r1_tokens[b_idx], completion_logprobs=r1_lps[b_idx], round_num=1, metrics={"solution": r1_sol[b_idx], "instance_id": inst_b.instance_id}, raw_response=r1_raw[b_idx]),
-                    Transition(prompt_tokens=r2_prompt_tokens[b_idx], completion_tokens=r2_tokens[b_idx], completion_logprobs=r2_lps[b_idx], round_num=2, raw_response=r2_raw[b_idx]),
-                    Transition(prompt_tokens=r3_prompt_tokens[b_idx], completion_tokens=r3_tokens[b_idx], completion_logprobs=r3_lps[b_idx], round_num=3, raw_response=r3_raw[b_idx]),
+                    Transition(prompt_tokens=base_r1_prompt_tokens[b_idx], completion_tokens=r1_tokens[b_idx], completion_logprobs=r1_lps[b_idx], round_num=1, metrics={"solution": r1_sol[b_idx], "instance_id": inst_b.instance_id, "visible_text_metrics": r1_visible_metrics[b_idx]}, raw_response=r1_raw[b_idx]),
+                    Transition(prompt_tokens=r2_prompt_tokens[b_idx], completion_tokens=r2_tokens[b_idx], completion_logprobs=r2_lps[b_idx], round_num=2, metrics={"visible_text_metrics": r2_visible_metrics[b_idx]}, raw_response=r2_raw[b_idx]),
+                    Transition(prompt_tokens=r3_prompt_tokens[b_idx], completion_tokens=r3_tokens[b_idx], completion_logprobs=r3_lps[b_idx], round_num=3, metrics={"visible_text_metrics": r3_visible_metrics[b_idx]}, raw_response=r3_raw[b_idx]),
                 ],
                 frozen_solution=r1_sol[b_idx],
                 metrics={"r1": r1_text[b_idx], "r2": r2_text[b_idx], "r3": r3_text[b_idx], "instance_id": inst_b.instance_id, "task_reward": r1_task_rewards[b_idx], "task_reward_metrics": r1_task_reward_metrics[b_idx]},
@@ -756,7 +785,7 @@ class DebateRuntime:
         r1_tokens = [comp for comp, _lps, _text, _raw in r1_results]
         r1_lps = [lps for _comp, lps, _text, _raw in r1_results]
         r1_text = [text for _comp, _lps, text, _raw in r1_results]
-        r1_visible_text = [_strip_think_blocks(text) for text in r1_text]
+        r1_visible_text, r1_visible_metrics = self._postprocess_visible_texts(instances=instances_repeated, texts=r1_text)
         r1_sol = [extract_solution(text) for text in r1_visible_text]
         r1_raw = [raw for _comp, _lps, _text, raw in r1_results]
         r1_task_rewards = []
@@ -844,8 +873,8 @@ class DebateRuntime:
                 DebateResult(
                     question=self.task.judge_context_text(inst=inst_a),
                     ground_truth=inst_a.payload.get("ground_truth"),
-                    trajectory_a=DebateTrajectory(agent="A", transitions=[Transition(prompt_tokens=base_r1_prompt_tokens[a_idx], completion_tokens=r1_tokens[a_idx], completion_logprobs=r1_lps[a_idx], round_num=1, metrics={"solution": r1_sol[a_idx], "instance_id": inst_a.instance_id}, raw_response=r1_raw[a_idx])], frozen_solution=r1_sol[a_idx], metrics={"r1": r1_text[a_idx], "instance_id": inst_a.instance_id, "task_reward": r1_task_rewards[a_idx], "task_reward_metrics": r1_task_reward_metrics[a_idx]}),
-                    trajectory_b=DebateTrajectory(agent="B", transitions=[Transition(prompt_tokens=base_r1_prompt_tokens[b_idx], completion_tokens=r1_tokens[b_idx], completion_logprobs=r1_lps[b_idx], round_num=1, metrics={"solution": r1_sol[b_idx], "instance_id": inst_b.instance_id}, raw_response=r1_raw[b_idx])], frozen_solution=r1_sol[b_idx], metrics={"r1": r1_text[b_idx], "instance_id": inst_b.instance_id, "task_reward": r1_task_rewards[b_idx], "task_reward_metrics": r1_task_reward_metrics[b_idx]}),
+                    trajectory_a=DebateTrajectory(agent="A", transitions=[Transition(prompt_tokens=base_r1_prompt_tokens[a_idx], completion_tokens=r1_tokens[a_idx], completion_logprobs=r1_lps[a_idx], round_num=1, metrics={"solution": r1_sol[a_idx], "instance_id": inst_a.instance_id, "visible_text_metrics": r1_visible_metrics[a_idx]}, raw_response=r1_raw[a_idx])], frozen_solution=r1_sol[a_idx], metrics={"r1": r1_text[a_idx], "instance_id": inst_a.instance_id, "task_reward": r1_task_rewards[a_idx], "task_reward_metrics": r1_task_reward_metrics[a_idx]}),
+                    trajectory_b=DebateTrajectory(agent="B", transitions=[Transition(prompt_tokens=base_r1_prompt_tokens[b_idx], completion_tokens=r1_tokens[b_idx], completion_logprobs=r1_lps[b_idx], round_num=1, metrics={"solution": r1_sol[b_idx], "instance_id": inst_b.instance_id, "visible_text_metrics": r1_visible_metrics[b_idx]}, raw_response=r1_raw[b_idx])], frozen_solution=r1_sol[b_idx], metrics={"r1": r1_text[b_idx], "instance_id": inst_b.instance_id, "task_reward": r1_task_rewards[b_idx], "task_reward_metrics": r1_task_reward_metrics[b_idx]}),
                     verdict=verdicts[idx],
                     judge_reasoning=judge_reasonings[idx],
                     metrics={"token_only_rollout": True, "task": self.task.name, "judge_retry": False},
