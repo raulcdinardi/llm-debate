@@ -53,6 +53,7 @@ class TrainRunConfig:
     base_r2_prefill: str = "The reasons that my solution is better than my opponent's are:\n1)"
     base_r3_prefill: str = "Responding to my opponent's criticism:\n1)"
     train_minibatch_size: int = 0
+    train_max_tokens: int = 0
     sampler_gpu_memory_utilization: float = 0.55
     sampler_max_model_len: int = 512
     sampler_enforce_eager: bool = True
@@ -117,6 +118,7 @@ class TrainRunConfig:
             base_r2_prefill=data.get("base_r2_prefill", "The reasons that my solution is better than my opponent's are:\n1)"),
             base_r3_prefill=data.get("base_r3_prefill", "Responding to my opponent's criticism:\n1)"),
             train_minibatch_size=data.get("train_minibatch_size", 0),
+            train_max_tokens=data.get("train_max_tokens", 0),
             sampler_gpu_memory_utilization=data.get("sampler_gpu_memory_utilization", 0.55),
             sampler_max_model_len=data.get("sampler_max_model_len", 512),
             sampler_enforce_eager=data.get("sampler_enforce_eager", True),

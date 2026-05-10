@@ -147,6 +147,7 @@ class TrainingDriver:
             device=device,
             ppo_clip_epsilon=self.config.ppo_clip_epsilon,
             train_minibatch_size=self.config.train_minibatch_size,
+            train_max_tokens=self.config.train_max_tokens,
         )
 
     def _configure_tracing(self) -> None:

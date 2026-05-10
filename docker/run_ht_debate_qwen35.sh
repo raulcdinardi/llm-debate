@@ -58,6 +58,7 @@ cmd=(
   --base-r2-prefill "${BASE_R2_PREFILL:-${DEFAULT_BASE_R2_PREFILL}}"
   --base-r3-prefill "${BASE_R3_PREFILL:-${DEFAULT_BASE_R3_PREFILL}}"
   --train-minibatch-size "${TRAIN_MINIBATCH_SIZE:-1}"
+  --train-max-tokens "${TRAIN_MAX_TOKENS:-0}"
   --sampler-gpu-memory-utilization "${SAMPLER_GPU_MEMORY_UTILIZATION:-0.45}"
   --sampler-max-model-len "${SAMPLER_MAX_MODEL_LEN:-768}"
   --trace-top-logprobs "${TRACE_TOP_LOGPROBS:-5}"

@@ -26,6 +26,7 @@ class TrainerConfig:
     target_modules: tuple[str, ...] = ("q_proj", "v_proj")
     ppo_clip_epsilon: float = 0.2
     train_minibatch_size: int = 0
+    train_max_tokens: int = 0
 
 
 def _resolve_dtype(name: str):
@@ -41,8 +42,14 @@ def _pad_batch(
     batch: list[TrainExample],
     pad_token_id: int,
     device: str,
+    max_tokens: int = 0,
 ) -> dict[str, torch.Tensor]:
-    max_len = max(len(example.input_ids) for example in batch)
+    def _start(example: TrainExample) -> int:
+        if max_tokens <= 0 or len(example.input_ids) <= max_tokens:
+            return 0
+        return len(example.input_ids) - max_tokens
+
+    max_len = max(len(example.input_ids) - _start(example) for example in batch)
     batch_size = len(batch)
 
     input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long, device=device)
@@ -53,7 +60,8 @@ def _pad_batch(
     advantages = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
 
     for row_idx, example in enumerate(batch):
-        n = len(example.input_ids)
+        start = _start(example)
+        n = len(example.input_ids) - start
         if not (
             len(example.input_ids)
             == len(example.target_ids)
@@ -62,12 +70,12 @@ def _pad_batch(
             == len(example.advantages)
         ):
             raise ValueError("TrainExample fields must all have equal length.")
-        input_ids[row_idx, :n] = torch.tensor(example.input_ids, dtype=torch.long, device=device)
-        target_ids[row_idx, :n] = torch.tensor(example.target_ids, dtype=torch.long, device=device)
+        input_ids[row_idx, :n] = torch.tensor(example.input_ids[start:], dtype=torch.long, device=device)
+        target_ids[row_idx, :n] = torch.tensor(example.target_ids[start:], dtype=torch.long, device=device)
         attention_mask[row_idx, :n] = 1
-        loss_mask[row_idx, :n] = torch.tensor(example.loss_mask, dtype=torch.bool, device=device)
-        old_logprobs[row_idx, :n] = torch.tensor(example.old_logprobs, dtype=torch.float32, device=device)
-        advantages[row_idx, :n] = torch.tensor(example.advantages, dtype=torch.float32, device=device)
+        loss_mask[row_idx, :n] = torch.tensor(example.loss_mask[start:], dtype=torch.bool, device=device)
+        old_logprobs[row_idx, :n] = torch.tensor(example.old_logprobs[start:], dtype=torch.float32, device=device)
+        advantages[row_idx, :n] = torch.tensor(example.advantages[start:], dtype=torch.float32, device=device)
 
     return {
         "input_ids": input_ids,
@@ -193,7 +201,12 @@ class MultiAdapterTrainer:
         self.wake_up()
         self.set_adapter(adapter_name)
         self.model.eval()
-        tensors = _pad_batch(batch=batch, pad_token_id=int(self.tokenizer.pad_token_id), device=self.current_device)
+        tensors = _pad_batch(
+            batch=batch,
+            pad_token_id=int(self.tokenizer.pad_token_id),
+            device=self.current_device,
+            max_tokens=self.config.train_max_tokens,
+        )
         with torch.no_grad():
             outputs = self.model(
                 input_ids=tensors["input_ids"],
@@ -251,6 +264,7 @@ class MultiAdapterTrainer:
                 batch=minibatch,
                 pad_token_id=int(self.tokenizer.pad_token_id),
                 device=self.current_device,
+                max_tokens=self.config.train_max_tokens,
             )
             outputs = self.model(
                 input_ids=tensors["input_ids"],

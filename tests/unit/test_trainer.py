@@ -13,7 +13,7 @@ transformers_spec = importlib.util.find_spec("transformers")
 if torch is None or peft_spec is None or transformers_spec is None:
     pytest.skip("trainer unit tests require torch, peft, and transformers", allow_module_level=True)
 
-from llm_local_rl.trainer import MultiAdapterTrainer, TrainerConfig
+from llm_local_rl.trainer import MultiAdapterTrainer, TrainerConfig, _pad_batch
 from llm_local_rl.types import TrainExample
 
 
@@ -27,6 +27,23 @@ def _test_scratch_root() -> Path:
     root = Path.cwd() / ".tmp_test_artifacts"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def test_pad_batch_can_keep_loss_suffix_when_truncating() -> None:
+    example = TrainExample(
+        adapter_name="shared",
+        input_ids=[10, 11, 12, 13, 14],
+        target_ids=[11, 12, 13, 14, 15],
+        loss_mask=[0, 0, 0, 1, 1],
+        old_logprobs=[0.0, 0.0, 0.0, -0.3, -0.2],
+        advantages=[0.0, 0.0, 0.0, 0.5, 0.5],
+    )
+
+    tensors = _pad_batch(batch=[example], pad_token_id=0, device="cpu", max_tokens=3)
+
+    assert tensors["input_ids"].tolist() == [[12, 13, 14]]
+    assert tensors["target_ids"].tolist() == [[13, 14, 15]]
+    assert tensors["loss_mask"].tolist() == [[False, True, True]]
 
 
 def test_trainer_smoke_requires_model_env() -> None:

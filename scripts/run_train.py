@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-r2-prefill", default="The reasons that my solution is better than my opponent's are:\n1)")
     parser.add_argument("--base-r3-prefill", default="Responding to my opponent's criticism:\n1)")
     parser.add_argument("--train-minibatch-size", type=int, default=0)
+    parser.add_argument("--train-max-tokens", type=int, default=0)
     parser.add_argument("--sampler-gpu-memory-utilization", type=float, default=0.55)
     parser.add_argument("--sampler-max-model-len", type=int, default=512)
     parser.add_argument("--sampler-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
@@ -110,6 +111,7 @@ def main() -> int:
                 base_r2_prefill=args.base_r2_prefill,
                 base_r3_prefill=args.base_r3_prefill,
                 train_minibatch_size=args.train_minibatch_size,
+                train_max_tokens=args.train_max_tokens,
                 sampler_gpu_memory_utilization=args.sampler_gpu_memory_utilization,
                 sampler_max_model_len=args.sampler_max_model_len,
                 sampler_enforce_eager=args.sampler_enforce_eager,
