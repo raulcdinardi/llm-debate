@@ -135,6 +135,10 @@ class MultiAdapterTrainer:
             torch_dtype=_resolve_dtype(self.config.torch_dtype),
         )
         base_model.config.use_cache = False
+        if hasattr(base_model, "gradient_checkpointing_enable"):
+            base_model.gradient_checkpointing_enable()
+        if hasattr(base_model, "enable_input_require_grads"):
+            base_model.enable_input_require_grads()
         base_model.to(torch.device("cpu"))
         return base_model
 
