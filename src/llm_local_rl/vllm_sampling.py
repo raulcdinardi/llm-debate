@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 from llm_local_rl.model_io_trace import get_model_io_tracer, get_trace_top_logprobs
 from llm_local_rl.types import SamplingRequest, SamplingResult
@@ -93,6 +94,7 @@ class VllmRuntimeConfig:
 
 
 def _import_vllm_symbols():
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
 
