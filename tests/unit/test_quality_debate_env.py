@@ -83,6 +83,20 @@ def test_quality_debate_task_hides_article_from_judge_and_expands_answer_sides(t
     assert expanded[0].payload["correct_label"] in {"A", "B"}
 
 
+def test_quality_debate_task_reward_metrics_include_parse_success(tmp_path: Path) -> None:
+    _write_quality_fixture(tmp_path)
+    task = build_debate_task(_quality_config(tmp_path))
+    inst = task.expand_group_instances(inst=task.sample_instances(n=1, seed=0)[0], group_size=2, seed=0)[0]
+    reward = task.compute_reward(
+        inst=inst,
+        tokenizer=TinyTokenizer(),
+        completion_tokens=TinyTokenizer().encode("<quote>Captain Mira opened the silver door.</quote>"),
+    )
+
+    assert reward.metrics["parse_success"] == 1.0
+    assert reward.metrics["assigned_label"] in {"A", "B"}
+
+
 def test_quality_base_prompt_uses_private_article_but_judge_context_does_not(tmp_path: Path) -> None:
     _write_quality_fixture(tmp_path)
     task = build_debate_task(_quality_config(tmp_path))

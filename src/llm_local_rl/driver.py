@@ -505,7 +505,7 @@ class TrainingDriver:
                             for traj in (debate.trajectory_a, debate.trajectory_b)
                         ]
                         parse_values = [
-                            float(traj.metrics["task_reward_metrics"]["parse_success"])
+                            float(traj.metrics["task_reward_metrics"].get("parse_success", 1.0))
                             for debate in debates
                             for traj in (debate.trajectory_a, debate.trajectory_b)
                         ]

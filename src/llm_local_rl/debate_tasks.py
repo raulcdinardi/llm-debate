@@ -370,6 +370,7 @@ class QualityDebateTask:
         assigned_is_correct = assigned_label == str(inst.payload.get("correct_label"))
         quote_result = verify_quotes(text, source_text=str(inst.payload["article"]))
         metrics = {
+            "parse_success": 1.0,
             "assigned_label": assigned_label,
             "correct_label": inst.payload.get("correct_label"),
             "assigned_is_correct": 1.0 if assigned_is_correct else 0.0,
