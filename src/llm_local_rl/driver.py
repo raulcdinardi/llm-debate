@@ -411,12 +411,40 @@ class TrainingDriver:
             task_reward_fn=task_reward_fn,
             pointwise_reward_map=pointwise_reward_map,
         )
-        return grouped, {
+        projection_record: dict[str, object] = {
             "source_exact_shared_equivalent": False,
             "reason": "split_layout_per_round_projection",
             "judge_adapter_policy": self.config.debate_judge_adapter,
             "num_debates": len(debates),
         }
+        if self.config.debate_r1_reward == "judge_rejection_task":
+            r1_adapter_name = self.config.debate_round_adapter_names[0]
+            selected_examples = grouped.get(r1_adapter_name, [])
+            group_ids = {
+                int(example.metadata["r1_group_index"])
+                for example in selected_examples
+            }
+            live_group_ids = {
+                int(example.metadata["r1_group_index"])
+                for example in selected_examples
+                if bool(example.metadata["r1_group_live"])
+            }
+            valid_verdict_count = sum(debate.verdict in ("A", "B") for debate in debates)
+            projection_record["r1_projection"] = {
+                "mode": "judge_rejection_task",
+                "selection": "judge_winner_only",
+                "reward": "objective_task_reward",
+                "normalization": "population_zscore_over_selected_winners_per_question",
+                "selected_winner_count": len(selected_examples),
+                "rejected_loser_count": valid_verdict_count,
+                "loser_r1_example_count": 0,
+                "invalid_verdict_count": len(debates) - valid_verdict_count,
+                "group_count": len(group_ids),
+                "live_group_count": len(live_group_ids),
+                "zero_variance_group_count": len(group_ids - live_group_ids),
+                "r23_mode": self.config.debate_r23_mode,
+            }
+        return grouped, projection_record
 
     def run(self, *, max_steps: int | None = None) -> dict:
         try:

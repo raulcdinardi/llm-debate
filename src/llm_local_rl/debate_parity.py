@@ -855,6 +855,14 @@ def assemble_split_train_examples(
             )
         return grouped
 
+    selected_r1_trajectory_ids: set[int] | None = None
+    if r1_reward_mode == "judge_rejection_task":
+        if round_adapter_names[0] in round_adapter_names[1:num_rounds]:
+            raise ValueError(
+                "judge_rejection_task requires an R1 adapter distinct from all later-round adapters"
+            )
+        selected_r1_trajectory_ids = set()
+
     groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
     for debate in debates:
         if debate.verdict not in ("A", "B"):
@@ -864,6 +872,15 @@ def assemble_split_train_examples(
         if r1_reward_mode == "task":
             r1_a = task_reward_fn(traj_a, debate)
             r1_b = task_reward_fn(traj_b, debate)
+        elif r1_reward_mode == "judge_rejection_task":
+            winner = debate.get_winner_trajectory()
+            winner_task_reward = float(task_reward_fn(winner, debate))
+            if not math.isfinite(winner_task_reward):
+                raise ValueError(f"Non-finite winner task reward for question={debate.question!r}")
+            assert selected_r1_trajectory_ids is not None
+            selected_r1_trajectory_ids.add(id(winner))
+            r1_a = winner_task_reward if winner.agent == traj_a.agent else 0.0
+            r1_b = winner_task_reward if winner.agent == traj_b.agent else 0.0
         elif r1_reward_mode == "judge_pointwise":
             if pointwise_reward_map is None:
                 raise ValueError("judge_pointwise requires pointwise_reward_map")
@@ -880,9 +897,14 @@ def assemble_split_train_examples(
             r1_b = 0.0
         groups.setdefault(debate.question, []).extend([(traj_a, debate, float(r1_a)), (traj_b, debate, float(r1_b))])
 
-    for question, group in groups.items():
+    for group_index, (question, group) in enumerate(groups.items()):
         _ = question
-        rewards = [reward for _traj, _debate, reward in group]
+        selected_group = [
+            (traj, debate, reward)
+            for traj, debate, reward in group
+            if selected_r1_trajectory_ids is None or id(traj) in selected_r1_trajectory_ids
+        ]
+        rewards = [reward for _traj, _debate, reward in selected_group]
         mean_reward = sum(rewards) / len(rewards)
         var = sum((reward - mean_reward) ** 2 for reward in rewards) / len(rewards)
         std = math.sqrt(var)
@@ -890,33 +912,60 @@ def assemble_split_train_examples(
         loser_reward = -winner_reward if r23_symmetric else 0.0
 
         for traj, debate, r1_reward in group:
-            t1 = traj.transitions[0]
-            if len(t1.completion_tokens) == 0:
-                raise ValueError("R1 completion tokens empty.")
-            if r1_reward_mode == "judge":
-                r1_value = r1_reward
-                r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
-            else:
-                r1_value = (r1_reward - mean_reward) / std if std > 0 else 0.0
-                r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
-            _append_turn(
-                adapter_name="solution",
-                prompt_tokens=t1.prompt_tokens,
-                completion_tokens=t1.completion_tokens,
-                completion_logprobs=t1.completion_logprobs,
-                advantages=r1_advantages,
-                metadata={
-                    "question": debate.question[:100],
-                    "agent": traj.agent,
-                    "verdict": debate.verdict,
-                    "source_exact_shared_equivalent": False,
-                    "reason": "split_layout_per_round_projection",
-                    "round_num": 1,
-                    "r1_reward": r1_reward,
-                    "r1_compare": r1_reward_mode == "judge",
-                    "r1_centered_reward": None if r1_reward_mode == "judge" else r1_value,
-                },
-            )
+            r1_selected = selected_r1_trajectory_ids is None or id(traj) in selected_r1_trajectory_ids
+            if r1_selected:
+                t1 = traj.transitions[0]
+                if len(t1.completion_tokens) == 0:
+                    raise ValueError("R1 completion tokens empty.")
+                if r1_reward_mode == "judge":
+                    r1_value = r1_reward
+                    r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
+                else:
+                    r1_value = (r1_reward - mean_reward) / std if std > 0 else 0.0
+                    r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
+                if r1_reward_mode == "judge_rejection_task":
+                    r1_metadata = {
+                        "question": debate.question[:100],
+                        "agent": traj.agent,
+                        "verdict": debate.verdict,
+                        "source_exact_shared_equivalent": False,
+                        "reason": "split_layout_judge_rejection_task_projection",
+                        "round_num": 1,
+                        "r1_reward_mode": "judge_rejection_task",
+                        "r1_selected_by_judge": True,
+                        "r1_rejected_agent": debate.get_loser_trajectory().agent,
+                        "r1_task_reward": r1_reward,
+                        "r1_group_index": group_index,
+                        "r1_selected_group_size": len(selected_group),
+                        "r1_group_mean_reward": mean_reward,
+                        "r1_group_std_reward": std,
+                        "r1_group_live": std > 0.0,
+                        "r1_zscore": r1_value,
+                    }
+                else:
+                    r1_metadata = {
+                        "question": debate.question[:100],
+                        "agent": traj.agent,
+                        "verdict": debate.verdict,
+                        "source_exact_shared_equivalent": False,
+                        "reason": "split_layout_per_round_projection",
+                        "round_num": 1,
+                        "r1_reward": r1_reward,
+                        "r1_compare": r1_reward_mode == "judge",
+                        "r1_centered_reward": None if r1_reward_mode == "judge" else r1_value,
+                    }
+                _append_turn(
+                    adapter_name=(
+                        round_adapter_names[0]
+                        if r1_reward_mode == "judge_rejection_task"
+                        else "solution"
+                    ),
+                    prompt_tokens=t1.prompt_tokens,
+                    completion_tokens=t1.completion_tokens,
+                    completion_logprobs=t1.completion_logprobs,
+                    advantages=r1_advantages,
+                    metadata=r1_metadata,
+                )
             if num_rounds >= 2:
                 t2 = traj.transitions[1]
                 signed = winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward

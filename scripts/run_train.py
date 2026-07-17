@@ -3,10 +3,9 @@ from __future__ import annotations
 import argparse
 
 from llm_local_rl.config import RolloutConfig, TrainRunConfig
-from llm_local_rl.driver import TrainingDriver
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generic rollout+train driver for the rewrite stack.")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -36,7 +35,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--advantage-mode", default="zscore", choices=["identity", "centered_mean", "zscore"])
     parser.add_argument("--ppo-clip-epsilon", type=float, default=0.2)
     parser.add_argument("--debate-rounds", type=int, default=3, choices=[1, 2, 3])
-    parser.add_argument("--debate-r1-reward", default="task", choices=["task", "judge_pointwise", "judge", "none"])
+    parser.add_argument(
+        "--debate-r1-reward",
+        default="task",
+        choices=["task", "judge_pointwise", "judge", "judge_rejection_task", "none"],
+    )
     parser.add_argument("--debate-r23-reward", default="constant", choices=["constant", "none"])
     parser.add_argument("--debate-r23-constant", type=float, default=1.0)
     parser.add_argument("--debate-r23-mode", default="symmetric", choices=["symmetric", "winner_only"])
@@ -59,10 +62,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-resource-logging", action="store_true")
     parser.add_argument("--resource-log-interval-s", type=float, default=5.0)
     parser.add_argument("--resume", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
+    from llm_local_rl.driver import TrainingDriver
+
     args = parse_args()
     if args.resume:
         driver = TrainingDriver.resume(output_dir=args.output_dir)

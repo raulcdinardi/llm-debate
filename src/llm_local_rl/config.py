@@ -68,6 +68,21 @@ class TrainRunConfig:
     resource_logging: bool = True
     resource_log_interval_s: float = 5.0
 
+    def __post_init__(self) -> None:
+        if self.debate_r1_reward != "judge_rejection_task":
+            return
+        if self.rollout.mode != "debate":
+            raise ValueError("judge_rejection_task is only valid for debate rollouts")
+        if self.adapter_layout != "split":
+            raise ValueError("judge_rejection_task requires adapter_layout='split'")
+        expected_round_adapters = ("solution",) + ("debate",) * (self.debate_rounds - 1)
+        configured_round_adapters = self.debate_round_adapter_names[: self.debate_rounds]
+        if configured_round_adapters != expected_round_adapters:
+            raise ValueError(
+                "judge_rejection_task requires round adapters "
+                f"{expected_round_adapters!r}, got {configured_round_adapters!r}"
+            )
+
     def to_dict(self) -> dict:
         return asdict(self)
 
