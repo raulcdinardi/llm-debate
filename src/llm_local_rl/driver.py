@@ -12,6 +12,7 @@ from llm_local_rl.config import CheckpointManifest, TrainRunConfig
 from llm_local_rl.debate_parity import (
     assemble_split_train_examples,
     assemble_training_data_by_mode,
+    summarize_judge_rejection_r1_projection,
     training_datum_to_train_example,
 )
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
@@ -419,29 +420,15 @@ class TrainingDriver:
         }
         if self.config.debate_r1_reward == "judge_rejection_task":
             r1_adapter_name = self.config.debate_round_adapter_names[0]
-            selected_examples = grouped.get(r1_adapter_name, [])
-            group_ids = {
-                int(example.metadata["r1_group_index"])
-                for example in selected_examples
-            }
-            live_group_ids = {
-                int(example.metadata["r1_group_index"])
-                for example in selected_examples
-                if bool(example.metadata["r1_group_live"])
-            }
-            valid_verdict_count = sum(debate.verdict in ("A", "B") for debate in debates)
             projection_record["r1_projection"] = {
                 "mode": "judge_rejection_task",
                 "selection": "judge_winner_only",
                 "reward": "objective_task_reward",
                 "normalization": "population_zscore_over_selected_winners_per_question",
-                "selected_winner_count": len(selected_examples),
-                "rejected_loser_count": valid_verdict_count,
-                "loser_r1_example_count": 0,
-                "invalid_verdict_count": len(debates) - valid_verdict_count,
-                "group_count": len(group_ids),
-                "live_group_count": len(live_group_ids),
-                "zero_variance_group_count": len(group_ids - live_group_ids),
+                **summarize_judge_rejection_r1_projection(
+                    r1_examples=grouped.get(r1_adapter_name, []),
+                    debates=debates,
+                ),
                 "r23_mode": self.config.debate_r23_mode,
             }
         return grouped, projection_record

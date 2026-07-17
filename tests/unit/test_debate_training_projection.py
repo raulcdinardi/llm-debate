@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from llm_local_rl.debate_parity import (
@@ -9,6 +11,7 @@ from llm_local_rl.debate_parity import (
     assemble_split_train_examples,
     assemble_training_data_by_mode,
     assemble_training_data_r1_r23,
+    summarize_judge_rejection_r1_projection,
 )
 
 
@@ -200,3 +203,57 @@ def test_judge_rejection_task_requires_distinct_r1_and_debate_adapters() -> None
             r23_symmetric=True,
             task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
         )
+
+
+def test_judge_rejection_projection_summary_measures_emitted_losers() -> None:
+    debates = [
+        _make_debate(verdict="A", reward_a=1.0),
+        _make_debate(verdict="B", reward_b=3.0, token_offset=100),
+    ]
+    split = assemble_split_train_examples(
+        debates=debates,
+        num_rounds=3,
+        round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="judge_rejection_task",
+        r23_reward_mode="constant",
+        r23_constant=0.5,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+    )
+
+    summary = summarize_judge_rejection_r1_projection(
+        r1_examples=split["solution"],
+        debates=debates,
+    )
+    assert summary["winner_r1_example_count"] == 2
+    assert summary["loser_r1_example_count"] == 0
+    assert summary["rejected_loser_count"] == 2
+
+    emitted_loser_metadata = dict(split["solution"][0].metadata)
+    emitted_loser_metadata.update({"agent": "B", "verdict": "A"})
+    emitted_loser = replace(split["solution"][0], metadata=emitted_loser_metadata)
+    measured = summarize_judge_rejection_r1_projection(
+        r1_examples=[emitted_loser, split["solution"][1]],
+        debates=debates,
+    )
+    assert measured["winner_r1_example_count"] == 1
+    assert measured["winner_r1_example_count_delta"] == -1
+    assert measured["loser_r1_example_count"] == 1
+    assert measured["rejected_loser_count"] == 1
+
+
+def test_split_projection_uses_configured_r1_adapter_for_every_reward_mode() -> None:
+    split = assemble_split_train_examples(
+        debates=[_make_debate()],
+        num_rounds=3,
+        round_adapter_names=("custom_solution", "debate", "debate"),
+        r1_reward_mode="task",
+        r23_reward_mode="constant",
+        r23_constant=0.5,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+    )
+
+    assert len(split["custom_solution"]) == 2
+    assert all(example.adapter_name == "custom_solution" for example in split["custom_solution"])
+    assert "solution" not in split

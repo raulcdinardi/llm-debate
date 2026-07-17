@@ -955,11 +955,7 @@ def assemble_split_train_examples(
                         "r1_centered_reward": None if r1_reward_mode == "judge" else r1_value,
                     }
                 _append_turn(
-                    adapter_name=(
-                        round_adapter_names[0]
-                        if r1_reward_mode == "judge_rejection_task"
-                        else "solution"
-                    ),
+                    adapter_name=round_adapter_names[0],
                     prompt_tokens=t1.prompt_tokens,
                     completion_tokens=t1.completion_tokens,
                     completion_logprobs=t1.completion_logprobs,
@@ -1009,3 +1005,54 @@ def assemble_split_train_examples(
                     },
                 )
     return grouped
+
+
+def summarize_judge_rejection_r1_projection(
+    *,
+    r1_examples: list[TrainExample],
+    debates: list[DebateResult],
+) -> dict[str, int]:
+    valid_verdict_count = sum(debate.verdict in ("A", "B") for debate in debates)
+    winner_r1_example_count = 0
+    loser_r1_example_count = 0
+    for example in r1_examples:
+        agent = example.metadata.get("agent")
+        verdict = example.metadata.get("verdict")
+        if agent not in ("A", "B") or verdict not in ("A", "B"):
+            continue
+        if agent == verdict:
+            winner_r1_example_count += 1
+        else:
+            loser_r1_example_count += 1
+
+    classified_r1_example_count = winner_r1_example_count + loser_r1_example_count
+    indexed_examples = [
+        example
+        for example in r1_examples
+        if "r1_group_index" in example.metadata
+    ]
+    group_ids = {
+        int(example.metadata["r1_group_index"])
+        for example in indexed_examples
+    }
+    live_group_ids = {
+        int(example.metadata["r1_group_index"])
+        for example in indexed_examples
+        if bool(example.metadata.get("r1_group_live", False))
+    }
+    return {
+        "valid_verdict_count": valid_verdict_count,
+        "invalid_verdict_count": len(debates) - valid_verdict_count,
+        "expected_emitted_r1_example_count": valid_verdict_count,
+        "emitted_r1_example_count": len(r1_examples),
+        "emitted_r1_example_count_delta": len(r1_examples) - valid_verdict_count,
+        "winner_r1_example_count": winner_r1_example_count,
+        "winner_r1_example_count_delta": winner_r1_example_count - valid_verdict_count,
+        "loser_r1_example_count": loser_r1_example_count,
+        "rejected_loser_count": valid_verdict_count - loser_r1_example_count,
+        "unclassified_r1_example_count": len(r1_examples) - classified_r1_example_count,
+        "missing_group_metadata_count": len(r1_examples) - len(indexed_examples),
+        "group_count": len(group_ids),
+        "live_group_count": len(live_group_ids),
+        "zero_variance_group_count": len(group_ids - live_group_ids),
+    }
