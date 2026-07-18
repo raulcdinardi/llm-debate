@@ -51,6 +51,42 @@ def test_config_and_manifest_roundtrip() -> None:
         assert restored_config.trace_top_logprobs == 7
 
 
+def test_judge_rejection_task_config_roundtrip() -> None:
+    config = TrainRunConfig(
+        model_path="/tmp/nonexistent_model_for_shape_only",
+        output_dir="/tmp/out",
+        adapter_layout="split",
+        debate_r1_reward="judge_rejection_task",
+    )
+
+    restored = TrainRunConfig.from_dict(config.to_dict())
+
+    assert restored.debate_r1_reward == "judge_rejection_task"
+    assert restored.debate_round_adapter_names == ("solution", "debate", "debate")
+
+
+def test_judge_rejection_task_config_fails_closed() -> None:
+    common = {
+        "model_path": "/tmp/nonexistent_model_for_shape_only",
+        "output_dir": "/tmp/out",
+        "debate_r1_reward": "judge_rejection_task",
+    }
+    with pytest.raises(ValueError, match="debate rollouts"):
+        TrainRunConfig(
+            **common,
+            rollout=RolloutConfig(mode="single_turn"),
+            adapter_layout="split",
+        )
+    with pytest.raises(ValueError, match="adapter_layout='split'"):
+        TrainRunConfig(**common, adapter_layout="shared")
+    with pytest.raises(ValueError, match="requires round adapters"):
+        TrainRunConfig(
+            **common,
+            adapter_layout="split",
+            debate_round_adapter_names=("solution", "solution", "debate"),
+        )
+
+
 def test_mean_numeric_metrics_promotes_reward_hacking_components() -> None:
     means = mean_numeric_metrics(
         [

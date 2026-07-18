@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
+
 from llm_local_rl.debate_parity import (
     DebateResult,
     DebateTrajectory,
@@ -7,36 +11,44 @@ from llm_local_rl.debate_parity import (
     assemble_split_train_examples,
     assemble_training_data_by_mode,
     assemble_training_data_r1_r23,
+    summarize_judge_rejection_r1_projection,
 )
 
 
-def _make_debate() -> DebateResult:
+def _make_debate(
+    *,
+    question: str = "Q",
+    verdict: str = "A",
+    reward_a: float = 1.0,
+    reward_b: float = 0.0,
+    token_offset: int = 0,
+) -> DebateResult:
     traj_a = DebateTrajectory(
         agent="A",
         transitions=[
-            Transition(prompt_tokens=[1, 2], completion_tokens=[3, 4], completion_logprobs=[-0.1, -0.2], round_num=1),
-            Transition(prompt_tokens=[1, 2, 3, 4, 5], completion_tokens=[6, 7], completion_logprobs=[-0.3, -0.4], round_num=2),
-            Transition(prompt_tokens=[1, 2, 3, 4, 5, 6, 7, 8], completion_tokens=[9, 10], completion_logprobs=[-0.5, -0.6], round_num=3),
+            Transition(prompt_tokens=[1, 2], completion_tokens=[3 + token_offset, 4 + token_offset], completion_logprobs=[-0.1, -0.2], round_num=1),
+            Transition(prompt_tokens=[1, 2, 3, 4, 5], completion_tokens=[6 + token_offset, 7 + token_offset], completion_logprobs=[-0.3, -0.4], round_num=2),
+            Transition(prompt_tokens=[1, 2, 3, 4, 5, 6, 7, 8], completion_tokens=[9 + token_offset, 10 + token_offset], completion_logprobs=[-0.5, -0.6], round_num=3),
         ],
         frozen_solution="A",
-        metrics={"task_reward": 1.0},
+        metrics={"task_reward": reward_a},
     )
     traj_b = DebateTrajectory(
         agent="B",
         transitions=[
-            Transition(prompt_tokens=[1, 2], completion_tokens=[11, 12], completion_logprobs=[-0.1, -0.2], round_num=1),
-            Transition(prompt_tokens=[1, 2, 11, 12, 13], completion_tokens=[14, 15], completion_logprobs=[-0.3, -0.4], round_num=2),
-            Transition(prompt_tokens=[1, 2, 11, 12, 13, 14, 15, 16], completion_tokens=[17, 18], completion_logprobs=[-0.5, -0.6], round_num=3),
+            Transition(prompt_tokens=[1, 2], completion_tokens=[11 + token_offset, 12 + token_offset], completion_logprobs=[-0.1, -0.2], round_num=1),
+            Transition(prompt_tokens=[1, 2, 11, 12, 13], completion_tokens=[14 + token_offset, 15 + token_offset], completion_logprobs=[-0.3, -0.4], round_num=2),
+            Transition(prompt_tokens=[1, 2, 11, 12, 13, 14, 15, 16], completion_tokens=[17 + token_offset, 18 + token_offset], completion_logprobs=[-0.5, -0.6], round_num=3),
         ],
         frozen_solution="B",
-        metrics={"task_reward": 0.0},
+        metrics={"task_reward": reward_b},
     )
     return DebateResult(
-        question="Q",
+        question=question,
         ground_truth=None,
         trajectory_a=traj_a,
         trajectory_b=traj_b,
-        verdict="A",
+        verdict=verdict,
         judge_reasoning="judge",
     )
 
@@ -113,3 +125,135 @@ def test_split_training_data_supports_judge_compare_for_three_rounds() -> None:
     assert split["debate"][1].advantages[-2:] == [0.25, 0.25]
     assert split["debate"][2].advantages[-2:] == [-0.25, -0.25]
     assert split["debate"][3].advantages[-2:] == [-0.25, -0.25]
+
+
+def test_judge_rejection_task_selects_only_winners_and_zscores_their_task_rewards() -> None:
+    debates = [
+        _make_debate(verdict="A", reward_a=1.0, reward_b=1000.0),
+        _make_debate(verdict="B", reward_a=-1000.0, reward_b=3.0, token_offset=100),
+    ]
+
+    split = assemble_split_train_examples(
+        debates=debates,
+        num_rounds=3,
+        round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="judge_rejection_task",
+        r23_reward_mode="constant",
+        r23_constant=0.5,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+    )
+
+    assert len(split["solution"]) == 2
+    assert [example.metadata["agent"] for example in split["solution"]] == ["A", "B"]
+    assert [example.metadata["r1_rejected_agent"] for example in split["solution"]] == ["B", "A"]
+    assert [example.metadata["r1_task_reward"] for example in split["solution"]] == [1.0, 3.0]
+    assert [example.metadata["r1_zscore"] for example in split["solution"]] == [-1.0, 1.0]
+    assert split["solution"][0].advantages[-2:] == [-0.5, -0.5]
+    assert split["solution"][1].advantages[-2:] == [0.5, 0.5]
+
+    # R2/R3 remain symmetric and include both speakers from both debates.
+    assert len(split["debate"]) == 8
+    assert [example.advantages[-2:] for example in split["debate"]] == [
+        [0.25, 0.25],
+        [0.25, 0.25],
+        [-0.25, -0.25],
+        [-0.25, -0.25],
+        [-0.25, -0.25],
+        [-0.25, -0.25],
+        [0.25, 0.25],
+        [0.25, 0.25],
+    ]
+
+
+def test_judge_rejection_task_zeroes_equal_winner_rewards_and_drops_invalid_debates() -> None:
+    debates = [
+        _make_debate(verdict="A", reward_a=2.0),
+        _make_debate(verdict="B", reward_b=2.0, token_offset=100),
+        _make_debate(verdict="INVALID", reward_a=999.0, reward_b=999.0, token_offset=200),
+    ]
+
+    split = assemble_split_train_examples(
+        debates=debates,
+        num_rounds=3,
+        round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="judge_rejection_task",
+        r23_reward_mode="constant",
+        r23_constant=0.5,
+        r23_symmetric=False,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+    )
+
+    assert len(split["solution"]) == 2
+    assert all(example.metadata["r1_group_live"] is False for example in split["solution"])
+    assert all(example.advantages[-2:] == [0.0, 0.0] for example in split["solution"])
+    assert len(split["debate"]) == 8
+    assert sum(example.metadata["r23_reward"] == 0.0 for example in split["debate"]) == 4
+
+
+def test_judge_rejection_task_requires_distinct_r1_and_debate_adapters() -> None:
+    with pytest.raises(ValueError, match="R1 adapter distinct"):
+        assemble_split_train_examples(
+            debates=[_make_debate()],
+            num_rounds=3,
+            round_adapter_names=("solution", "solution", "solution"),
+            r1_reward_mode="judge_rejection_task",
+            r23_reward_mode="constant",
+            r23_constant=0.5,
+            r23_symmetric=True,
+            task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        )
+
+
+def test_judge_rejection_projection_summary_measures_emitted_losers() -> None:
+    debates = [
+        _make_debate(verdict="A", reward_a=1.0),
+        _make_debate(verdict="B", reward_b=3.0, token_offset=100),
+    ]
+    split = assemble_split_train_examples(
+        debates=debates,
+        num_rounds=3,
+        round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="judge_rejection_task",
+        r23_reward_mode="constant",
+        r23_constant=0.5,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+    )
+
+    summary = summarize_judge_rejection_r1_projection(
+        r1_examples=split["solution"],
+        debates=debates,
+    )
+    assert summary["winner_r1_example_count"] == 2
+    assert summary["loser_r1_example_count"] == 0
+    assert summary["rejected_loser_count"] == 2
+
+    emitted_loser_metadata = dict(split["solution"][0].metadata)
+    emitted_loser_metadata.update({"agent": "B", "verdict": "A"})
+    emitted_loser = replace(split["solution"][0], metadata=emitted_loser_metadata)
+    measured = summarize_judge_rejection_r1_projection(
+        r1_examples=[emitted_loser, split["solution"][1]],
+        debates=debates,
+    )
+    assert measured["winner_r1_example_count"] == 1
+    assert measured["winner_r1_example_count_delta"] == -1
+    assert measured["loser_r1_example_count"] == 1
+    assert measured["rejected_loser_count"] == 1
+
+
+def test_split_projection_uses_configured_r1_adapter_for_every_reward_mode() -> None:
+    split = assemble_split_train_examples(
+        debates=[_make_debate()],
+        num_rounds=3,
+        round_adapter_names=("custom_solution", "debate", "debate"),
+        r1_reward_mode="task",
+        r23_reward_mode="constant",
+        r23_constant=0.5,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+    )
+
+    assert len(split["custom_solution"]) == 2
+    assert all(example.adapter_name == "custom_solution" for example in split["custom_solution"])
+    assert "solution" not in split
