@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import importlib
+import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,7 +15,16 @@ transformers_spec = importlib.util.find_spec("transformers")
 if torch is None or peft_spec is None or transformers_spec is None:
     pytest.skip("trainer unit tests require torch, peft, and transformers", allow_module_level=True)
 
-from llm_local_rl.trainer import MultiAdapterTrainer, TrainerConfig, _pad_batch
+from llm_local_rl.trainer import (
+    MultiAdapterTrainer,
+    TrainerConfig,
+    _is_configured_adapter_parameter,
+    _order_batch_for_minibatching,
+    _pad_batch,
+    _selected_lm_head_token_logprobs,
+    _target_token_logprobs,
+    _truncated_row_length,
+)
 from llm_local_rl.types import TrainExample
 
 
@@ -29,7 +40,47 @@ def _test_scratch_root() -> Path:
     return root
 
 
-def test_pad_batch_can_keep_loss_suffix_when_truncating() -> None:
+class _FakeTokenizer:
+    pad_token_id = 0
+
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
+        _ = skip_special_tokens
+        return " ".join(str(token_id) for token_id in token_ids)
+
+
+class _FakeModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bias = torch.nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, *, input_ids, attention_mask):
+        _ = attention_mask
+        positive = torch.zeros((*input_ids.shape, 1), dtype=torch.float32, device=input_ids.device) + self.bias
+        negative = torch.zeros((*input_ids.shape, 1), dtype=torch.float32, device=input_ids.device)
+        return SimpleNamespace(logits=torch.cat([positive, negative], dim=-1))
+
+
+def _fake_trainer(*, train_max_tokens: int = 0) -> MultiAdapterTrainer:
+    trainer = object.__new__(MultiAdapterTrainer)
+    trainer.config = TrainerConfig(
+        base_model_path="/tmp/nonexistent_model_for_shape_only",
+        device="cpu",
+        torch_dtype="float32",
+        learning_rate=0.0,
+        train_max_tokens=train_max_tokens,
+    )
+    trainer.compute_device = "cpu"
+    trainer.current_device = "cpu"
+    trainer.tokenizer = _FakeTokenizer()
+    trainer.model = _FakeModel()
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.0)
+    trainer._mem_rec = None
+    trainer.wake_up = lambda: None
+    trainer.set_adapter = lambda adapter_name: None
+    return trainer
+
+
+def test_pad_batch_rejects_overlength_instead_of_truncating() -> None:
     example = TrainExample(
         adapter_name="shared",
         input_ids=[10, 11, 12, 13, 14],
@@ -39,11 +90,240 @@ def test_pad_batch_can_keep_loss_suffix_when_truncating() -> None:
         advantages=[0.0, 0.0, 0.0, 0.5, 0.5],
     )
 
-    tensors = _pad_batch(batch=[example], pad_token_id=0, device="cpu", max_tokens=3)
+    with pytest.raises(ValueError, match="Over-length TrainExample"):
+        _pad_batch(batch=[example], pad_token_id=0, device="cpu", max_tokens=3)
 
-    assert tensors["input_ids"].tolist() == [[12, 13, 14]]
-    assert tensors["target_ids"].tolist() == [[13, 14, 15]]
-    assert tensors["loss_mask"].tolist() == [[False, True, True]]
+
+def test_truncated_row_length_matches_pad_batch_effective_length() -> None:
+    example = TrainExample(
+        adapter_name="shared",
+        input_ids=[10, 11, 12, 13, 14],
+        target_ids=[11, 12, 13, 14, 15],
+        loss_mask=[0, 0, 0, 1, 1],
+        old_logprobs=[0.0, 0.0, 0.0, -0.3, -0.2],
+        advantages=[0.0, 0.0, 0.0, 0.5, 0.5],
+    )
+
+    assert _truncated_row_length(example=example, max_tokens=0) == 5
+    with pytest.raises(ValueError, match="Over-length examples"):
+        _truncated_row_length(example=example, max_tokens=3)
+
+
+def test_train_batch_loss_is_normalized_by_kept_sample_count() -> None:
+    old_logprob = -math.log(2.0)
+    example = TrainExample(
+        adapter_name="shared",
+        input_ids=[0],
+        target_ids=[1],
+        loss_mask=[1],
+        old_logprobs=[old_logprob],
+        advantages=[1.0],
+    )
+
+    one_metrics = _fake_trainer().train_batch(adapter_name="shared", batch=[example])
+    two_metrics = _fake_trainer().train_batch(adapter_name="shared", batch=[example, example])
+
+    assert one_metrics["loss"] == pytest.approx(-1.0, abs=1e-6)
+    assert two_metrics["loss"] == pytest.approx(-1.0, abs=1e-6)
+    assert two_metrics["num_examples"] == 2.0
+    assert two_metrics["num_dropped_overlength"] == 0.0
+
+
+def test_train_batch_drops_overlength_samples_and_reports_counter() -> None:
+    old_logprob = -math.log(2.0)
+    kept = TrainExample(
+        adapter_name="shared",
+        input_ids=[0, 0],
+        target_ids=[1, 1],
+        loss_mask=[0, 1],
+        old_logprobs=[0.0, old_logprob],
+        advantages=[0.0, 1.0],
+    )
+    overlength = TrainExample(
+        adapter_name="shared",
+        input_ids=[0, 0, 0],
+        target_ids=[1, 1, 1],
+        loss_mask=[0, 1, 1],
+        old_logprobs=[0.0, old_logprob, old_logprob],
+        advantages=[0.0, 1.0, 1.0],
+    )
+
+    metrics = _fake_trainer(train_max_tokens=2).train_batch(
+        adapter_name="shared",
+        batch=[kept, overlength],
+    )
+
+    assert metrics["num_input_examples"] == 2.0
+    assert metrics["num_examples"] == 1.0
+    assert metrics["num_dropped_overlength"] == 1.0
+    assert metrics["num_forward_input_tokens"] == 2.0
+
+
+def test_train_batch_raises_when_all_samples_are_overlength() -> None:
+    example = TrainExample(
+        adapter_name="shared",
+        input_ids=[0, 0, 0],
+        target_ids=[1, 1, 1],
+        loss_mask=[0, 1, 1],
+        old_logprobs=[0.0, -math.log(2.0), -math.log(2.0)],
+        advantages=[0.0, 1.0, 1.0],
+    )
+
+    with pytest.raises(ValueError, match="All train samples exceed train_max_tokens"):
+        _fake_trainer(train_max_tokens=2).train_batch(adapter_name="shared", batch=[example])
+
+
+def test_target_token_logprobs_match_full_log_softmax_gather() -> None:
+    generator = torch.Generator(device="cpu").manual_seed(20260625)
+    logits = torch.randn((3, 5, 17), generator=generator, dtype=torch.float32)
+    target_ids = torch.randint(0, 17, (3, 5), generator=generator)
+
+    expected = torch.log_softmax(logits, dim=-1).gather(
+        dim=-1,
+        index=target_ids.unsqueeze(-1),
+    ).squeeze(-1)
+    actual = _target_token_logprobs(logits=logits, target_ids=target_ids)
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_target_token_logprobs_match_full_log_softmax_gather_with_small_chunks() -> None:
+    generator = torch.Generator(device="cpu").manual_seed(20260628)
+    logits = torch.randn((3, 7, 19), generator=generator, dtype=torch.float32)
+    target_ids = torch.randint(0, 19, (3, 7), generator=generator)
+
+    expected = torch.log_softmax(logits, dim=-1).gather(
+        dim=-1,
+        index=target_ids.unsqueeze(-1),
+    ).squeeze(-1)
+    actual = _target_token_logprobs(logits=logits, target_ids=target_ids, max_positions_per_chunk=4)
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_selected_lm_head_token_logprobs_match_full_lm_head_logits() -> None:
+    generator = torch.Generator(device="cpu").manual_seed(20260629)
+    hidden_states = torch.randn((2, 4, 5), generator=generator, dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(5, 11, bias=True)
+    with torch.no_grad():
+        lm_head.weight.copy_(torch.randn((11, 5), generator=generator, dtype=torch.float32))
+        lm_head.bias.copy_(torch.randn((11,), generator=generator, dtype=torch.float32))
+    target_ids = torch.randint(0, 11, (2, 4), generator=generator)
+    trained_positions = torch.tensor(
+        [
+            [True, False, True, False],
+            [False, True, False, True],
+        ],
+        dtype=torch.bool,
+    )
+
+    full_logits = lm_head(hidden_states)
+    full_logprobs = _target_token_logprobs(logits=full_logits, target_ids=target_ids)
+    expected_logprobs = full_logprobs[trained_positions]
+    expected_log_probs = torch.log_softmax(full_logits[trained_positions].float(), dim=-1)
+    expected_entropy = float(
+        (-(expected_log_probs.exp() * expected_log_probs).sum(dim=-1)).sum().detach().cpu().item()
+    )
+
+    actual_logprobs, actual_entropy = _selected_lm_head_token_logprobs(
+        hidden_states=hidden_states,
+        lm_head=lm_head,
+        target_ids=target_ids,
+        trained_positions=trained_positions,
+        max_positions_per_chunk=2,
+    )
+
+    assert torch.allclose(actual_logprobs, expected_logprobs, atol=1e-6)
+    assert actual_entropy == pytest.approx(expected_entropy, abs=1e-6)
+
+
+def test_selected_lm_head_token_logprobs_handles_empty_trained_positions() -> None:
+    generator = torch.Generator(device="cpu").manual_seed(20260630)
+    hidden_states = torch.randn((2, 4, 5), generator=generator, dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(5, 11, bias=False)
+    target_ids = torch.randint(0, 11, (2, 4), generator=generator)
+    trained_positions = torch.zeros((2, 4), dtype=torch.bool)
+
+    actual_logprobs, actual_entropy = _selected_lm_head_token_logprobs(
+        hidden_states=hidden_states,
+        lm_head=lm_head,
+        target_ids=target_ids,
+        trained_positions=trained_positions,
+    )
+
+    assert actual_logprobs.shape == (0,)
+    assert actual_logprobs.dtype == torch.float32
+    assert actual_entropy == 0.0
+
+
+def test_trainer_config_records_moe_target_parameters() -> None:
+    config = TrainerConfig(
+        base_model_path="/tmp/nonexistent_model_for_shape_only",
+        target_parameters=("experts.gate_up_proj", "experts.down_proj"),
+    )
+
+    assert config.target_parameters == ("experts.gate_up_proj", "experts.down_proj")
+
+
+def test_configured_adapter_parameter_detection_catches_inactive_split_adapter() -> None:
+    assert _is_configured_adapter_parameter(
+        parameter_name="base_model.model.layers.0.self_attn.q_proj.lora_A.debate.weight",
+        adapter_names=("solution", "debate", "judge"),
+    )
+    assert not _is_configured_adapter_parameter(
+        parameter_name="base_model.model.layers.0.self_attn.q_proj.base_layer.weight",
+        adapter_names=("solution", "debate", "judge"),
+    )
+
+
+def test_length_bucketed_minibatches_sort_by_effective_length() -> None:
+    examples = [
+        TrainExample("shared", [1] * 8, [1] * 8, [1] * 8, [0.0] * 8, [1.0] * 8),
+        TrainExample("shared", [1] * 3, [1] * 3, [1] * 3, [0.0] * 3, [1.0] * 3),
+        TrainExample("shared", [1] * 6, [1] * 6, [1] * 6, [0.0] * 6, [1.0] * 6),
+        TrainExample("shared", [1] * 2, [1] * 2, [1] * 2, [0.0] * 2, [1.0] * 2),
+    ]
+
+    ordered = _order_batch_for_minibatching(
+        batch=examples,
+        max_tokens=0,
+        length_bucket_batches=True,
+    )
+
+    assert [len(example.input_ids) for example in ordered] == [2, 3, 6, 8]
+
+
+def test_unbucketed_minibatches_preserve_order_without_aliasing() -> None:
+    examples = [
+        TrainExample("shared", [1] * 8, [1] * 8, [1] * 8, [0.0] * 8, [1.0] * 8),
+        TrainExample("shared", [1] * 3, [1] * 3, [1] * 3, [0.0] * 3, [1.0] * 3),
+        TrainExample("shared", [1] * 6, [1] * 6, [1] * 6, [0.0] * 6, [1.0] * 6),
+    ]
+
+    ordered = _order_batch_for_minibatching(
+        batch=examples,
+        max_tokens=0,
+        length_bucket_batches=False,
+    )
+
+    assert ordered == examples
+    assert ordered is not examples
+
+
+def test_length_bucketed_minibatches_use_truncated_effective_length() -> None:
+    examples = [
+        TrainExample("shared", [1] * 100, [1] * 100, [1] * 100, [0.0] * 100, [1.0] * 100),
+        TrainExample("shared", [1] * 8, [1] * 8, [1] * 8, [0.0] * 8, [1.0] * 8),
+        TrainExample("shared", [1] * 60, [1] * 60, [1] * 60, [0.0] * 60, [1.0] * 60),
+    ]
+
+    ordered = _order_batch_for_minibatching(
+        batch=examples,
+        max_tokens=32,
+        length_bucket_batches=True,
+    )
+
+    assert [len(example.input_ids) for example in ordered] == [8, 100, 60]
 
 
 def test_trainer_smoke_requires_model_env() -> None:
@@ -140,6 +420,7 @@ def test_train_minibatch_matches_full_batch_update() -> None:
             config=TrainerConfig(
                 **common_kwargs,
                 train_minibatch_size=1,
+                train_length_bucket_batches=True,
             ),
             adapter_dirs={"shared": saved_dir},
         )
@@ -168,3 +449,143 @@ def test_train_minibatch_matches_full_batch_update() -> None:
     assert full_after.keys() == mini_after.keys()
     for key in full_after:
         assert torch.allclose(full_after[key], mini_after[key], atol=1e-4)
+
+
+def test_selective_lm_head_train_batch_matches_full_logits_update() -> None:
+    if torch is None:
+        return
+    path = _base_model_path()
+    if path is None:
+        return
+    common_kwargs = dict(
+        base_model_path=path,
+        adapter_names=("shared",),
+        device="cpu",
+        torch_dtype="float32",
+        learning_rate=1e-5,
+        on_policy_logprob_check=True,
+        on_policy_logprob_abs_tol=1e9,
+    )
+    trainer_full = MultiAdapterTrainer(
+        config=TrainerConfig(
+            **common_kwargs,
+            train_logprob_backend="full_logits",
+        )
+    )
+    with tempfile.TemporaryDirectory(dir=_test_scratch_root()) as tmpdir:
+        saved_dir = trainer_full.save_adapter(adapter_name="shared", output_dir=tmpdir)
+        trainer_selective = MultiAdapterTrainer.from_saved_adapters(
+            config=TrainerConfig(
+                **common_kwargs,
+                train_logprob_backend="selective_lm_head",
+            ),
+            adapter_dirs={"shared": saved_dir},
+        )
+    batch = [
+        TrainExample(
+            adapter_name="shared",
+            input_ids=[1, 2, 3, 4],
+            target_ids=[2, 3, 4, 5],
+            loss_mask=[0, 1, 1, 1],
+            old_logprobs=[0.0, -123.0, -1.0, -1.0],
+            advantages=[0.0, 0.0, 0.5, -0.5],
+        ),
+        TrainExample(
+            adapter_name="shared",
+            input_ids=[1, 2, 5],
+            target_ids=[2, 5, 6],
+            loss_mask=[0, 1, 1],
+            old_logprobs=[0.0, -1.0, -456.0],
+            advantages=[0.0, -0.25, 0.0],
+        ),
+    ]
+
+    full_metrics = trainer_full.train_batch(adapter_name="shared", batch=batch)
+    selective_metrics = trainer_selective.train_batch(adapter_name="shared", batch=batch)
+
+    for key in (
+        "loss",
+        "loss_per_trained_token",
+        "approx_kl",
+        "ratio_mean",
+        "ratio_p95",
+        "ratio_p99",
+        "clipfrac",
+        "entropy",
+        "num_trained_tokens",
+        "trained_tokens_checked",
+        "zero_advantage_loss_mask_tokens_skipped",
+    ):
+        assert selective_metrics[key] == pytest.approx(full_metrics[key], abs=1e-5)
+    assert selective_metrics["trained_tokens_checked"] == 3.0
+    assert selective_metrics["zero_advantage_loss_mask_tokens_skipped"] == 2.0
+    assert full_metrics["lm_head_positions"] == full_metrics["num_padded_input_tokens"]
+    assert selective_metrics["lm_head_positions"] == selective_metrics["num_trained_tokens"]
+    assert selective_metrics["lm_head_positions_avoided"] == (
+        selective_metrics["num_padded_input_tokens"] - selective_metrics["num_trained_tokens"]
+    )
+
+    full_after = trainer_full.adapter_parameter_snapshot(adapter_name="shared")
+    selective_after = trainer_selective.adapter_parameter_snapshot(adapter_name="shared")
+    assert full_after.keys() == selective_after.keys()
+    for key in full_after:
+        assert torch.allclose(full_after[key], selective_after[key], atol=1e-5)
+
+
+def test_selective_lm_head_compute_logprobs_matches_full_logits_on_trained_positions() -> None:
+    if torch is None:
+        return
+    path = _base_model_path()
+    if path is None:
+        return
+    common_kwargs = dict(
+        base_model_path=path,
+        adapter_names=("shared",),
+        device="cpu",
+        torch_dtype="float32",
+    )
+    trainer_full = MultiAdapterTrainer(
+        config=TrainerConfig(
+            **common_kwargs,
+            train_logprob_backend="full_logits",
+        )
+    )
+    with tempfile.TemporaryDirectory(dir=_test_scratch_root()) as tmpdir:
+        saved_dir = trainer_full.save_adapter(adapter_name="shared", output_dir=tmpdir)
+        trainer_selective = MultiAdapterTrainer.from_saved_adapters(
+            config=TrainerConfig(
+                **common_kwargs,
+                train_logprob_backend="selective_lm_head",
+            ),
+            adapter_dirs={"shared": saved_dir},
+        )
+    batch = [
+        TrainExample(
+            adapter_name="shared",
+            input_ids=[1, 2, 3, 4],
+            target_ids=[2, 3, 4, 5],
+            loss_mask=[0, 1, 1, 1],
+            old_logprobs=[0.0, -123.0, -1.0, -1.0],
+            advantages=[0.0, 0.0, 0.5, -0.5],
+        ),
+        TrainExample(
+            adapter_name="shared",
+            input_ids=[1, 2, 5],
+            target_ids=[2, 5, 6],
+            loss_mask=[0, 1, 1],
+            old_logprobs=[0.0, -1.0, -456.0],
+            advantages=[0.0, -0.25, 0.0],
+        ),
+    ]
+
+    full_rows = trainer_full.compute_logprobs(adapter_name="shared", batch=batch)
+    selective_rows = trainer_selective.compute_logprobs(adapter_name="shared", batch=batch)
+
+    assert len(selective_rows) == len(full_rows)
+    for example, full_row, selective_row in zip(batch, full_rows, selective_rows, strict=True):
+        assert len(selective_row) == len(full_row)
+        for idx, (full_logprob, selective_logprob) in enumerate(zip(full_row, selective_row, strict=True)):
+            if example.loss_mask[idx] and example.advantages[idx] != 0.0:
+                assert selective_logprob == pytest.approx(full_logprob, abs=1e-5)
+            else:
+                assert selective_logprob == 0.0

@@ -5,7 +5,11 @@ __pycache__/
 build/
 dist/
 .coverage
+.env
+.env.*
+!.env.example
 checkpoints/
 artifacts/
+logs/
 hf_home/
 .mypy_cache/

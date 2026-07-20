@@ -34,7 +34,7 @@ Heavy integration tests are opt-in and require a local model path.
 For split-adapter debate runs, `--debate-r1-reward judge_rejection_task`
 implements literal winner rejection for R1: the judge-selected trajectory keeps
 its objective task reward, the losing R1 trajectory is omitted, and selected
-winner rewards are population-z-scored within each question group. R2/R3 remain
+winner rewards are population-z-scored within each task-instance group. R2/R3 remain
 independent: `--debate-r23-mode symmetric` still trains both speakers with
 positive/negative constant rewards. The mode requires the round mapping
 `solution, debate, ...` and is not supported by the shared-adapter layout.

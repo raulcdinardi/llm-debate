@@ -184,6 +184,7 @@ class ModelIOTracer:
         prompt_ids = list(getattr(request, "prompt_token_ids", []))
         completion_ids = list(getattr(result, "completion_token_ids", []))
         raw = dict(getattr(result, "raw", {}) or {})
+        provider = str(raw["sampler_backend"]) if "sampler_backend" in raw else "vllm"
         top_logprobs_by_pos = raw.pop("completion_top_logprobs", None)
         completion_logprobs = list(getattr(result, "completion_logprobs", []))
 
@@ -204,7 +205,7 @@ class ModelIOTracer:
             "phase": "generation",
             "boundary": boundary,
             "model": {
-                "provider": "vllm",
+                "provider": provider,
                 "adapter_name": getattr(request, "adapter_name", None),
                 **dict(self.config.metadata or {}),
             },

@@ -12,9 +12,10 @@ if importlib.util.find_spec("transformers") is None:
 from transformers import AutoTokenizer
 
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
-from llm_local_rl.debate_tasks import HTSequenceDebateTask
+from llm_local_rl.debate_tasks import CountdownCodeDebateTask, HTSequenceDebateTask
 from llm_local_rl.types import SamplingRequest, SamplingResult
 from llm_local_rl.debate_parity import DebateConfig
+from llm_local_rl.task_types import TaskInstance
 
 
 def _real_tokenizer():
@@ -53,6 +54,106 @@ class RecordingSampler:
                 )
             )
         return outputs
+
+
+class CapturingTokenizer:
+    def __init__(self) -> None:
+        self.encoded_texts: list[str] = []
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        _ = add_special_tokens
+        self.encoded_texts.append(text)
+        return list(range(len(text)))
+
+
+def test_countdown_base_text_debate_prompts_use_countdown_constitution() -> None:
+    tokenizer = CapturingTokenizer()
+    runtime = object.__new__(DebateRuntime)
+    runtime.task = CountdownCodeDebateTask()
+    runtime.tokenizer = tokenizer
+    runtime.runtime_config = DebateRuntimeConfig(prompt_format="qwen35_base_text_prefill")
+
+    inst = TaskInstance(instance_id="countdown_code_0", payload={"numbers": [1, 2, 3, 4], "target": 24})
+    runtime._base_r2_continuation_tokens(inst=inst, own_r1='{"solution.py": "expr = 24"}', opponent_r1='{"solution.py": "expr = 0"}')
+    runtime._base_r3_continuation_tokens(
+        inst=inst,
+        own_r1='{"solution.py": "expr = 24"}',
+        opponent_r1='{"solution.py": "expr = 0"}',
+        own_r2="1) My expression is valid.",
+        opponent_r2="1) Their tests pass.",
+    )
+
+    encoded = "\n\n".join(tokenizer.encoded_texts)
+    assert "Countdown arithmetic task" in encoded
+    assert "test-suite manipulation" in encoded
+    assert "fair coin" not in encoded
+    assert "H/T" not in encoded
+
+
+def test_base_r1_prompt_uses_configured_plain_text_prefill_exactly() -> None:
+    tokenizer = CapturingTokenizer()
+    runtime = object.__new__(DebateRuntime)
+    runtime.task = type(
+        "Task",
+        (),
+        {"r1_context_text": lambda self, *, inst: f"Write for {inst.instance_id}."},
+    )()
+    runtime.tokenizer = tokenizer
+    prefill = "Ok, I will produce a 3-sentence story adhering to the rules:\n"
+    runtime.runtime_config = DebateRuntimeConfig(
+        prompt_format="qwen35_base_text_prefill",
+        r1_assistant_prefill=prefill,
+    )
+
+    runtime._base_r1_prompt_tokens(inst=TaskInstance(instance_id="cw-1", payload={}))
+
+    assert tokenizer.encoded_texts[-1] == (
+        "User:\nWrite for cw-1.\nAssistant:\n"
+        "Ok, I will produce a 3-sentence story adhering to the rules:\n"
+    )
+    assert "<|im_start|>" not in tokenizer.encoded_texts[-1]
+    assert "<think>" not in tokenizer.encoded_texts[-1]
+
+
+def test_concluded_stop_is_requested_only_for_debate_turns() -> None:
+    tokenizer = CapturingTokenizer()
+    sampler = RecordingSampler(tokenizer=tokenizer, requests=[])
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.8),
+        runtime_config=DebateRuntimeConfig(
+            prompt_format="qwen35_base_text_prefill",
+            stop_on_concluded=True,
+            top_p=0.95,
+            min_p=0.02,
+        ),
+        adapter_layout="split",
+    )
+
+    runtime._sample_many(
+        prompt_tokens_list=[[1, 2]],
+        round_num=1,
+        step_seed=None,
+        stop_token_ids=[99],
+        max_tokens=8,
+        temperature=0.8,
+    )
+    runtime._sample_many(
+        prompt_tokens_list=[[1, 2]],
+        round_num=2,
+        step_seed=None,
+        stop_token_ids=[99],
+        max_tokens=8,
+        temperature=0.8,
+    )
+
+    assert sampler.requests[0].stop_strings == ()
+    assert sampler.requests[1].stop_strings == ("CONCLUDED",)
+    assert sampler.requests[1].include_stop_str_in_output is True
+    assert sampler.requests[1].top_p == 0.95
+    assert sampler.requests[1].min_p == 0.02
 
 
 def test_debate_runtime_split_routes_solution_debate_and_policy_judge_with_real_tokenizer() -> None:

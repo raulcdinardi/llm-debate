@@ -4,6 +4,16 @@ from dataclasses import dataclass
 import random
 
 from llm_local_rl.chat_templates import get_chat_adapter
+from llm_local_rl.countdown_code import (
+    countdown_messages,
+    sample_countdown_instances,
+    score_countdown_completion,
+)
+from llm_local_rl.qwen35_base_format import (
+    base_text_prompt,
+    countdown_user_text,
+    encode_base_text,
+)
 from llm_local_rl.ht_sequence_format import parse_ht_sequence
 from llm_local_rl.interfaces import Tokenizer
 from llm_local_rl.prompts import format_prompt, load_prompt
@@ -240,6 +250,88 @@ class ShortStoryEnv:
             "solution": solution,
             "full_text": text,
         }
+
+
+@dataclass(frozen=True)
+class CountdownCodeEnv:
+    name: str = "countdown_code"
+    num_numbers: int = 4
+    prompt_format: str = "chat"
+
+    def sample_instances(self, *, n: int, seed: int | None) -> list[TaskInstance]:
+        return sample_countdown_instances(n=n, seed=seed, num_numbers=self.num_numbers)
+
+    def build_initial_prompt(self, *, instance: TaskInstance) -> str:
+        numbers = [int(n) for n in instance.payload["numbers"]]
+        target = int(instance.payload["target"])
+        if self.prompt_format == "qwen35_base_text_prefill":
+            return base_text_prompt(
+                system_text=None,
+                user_text=countdown_user_text(numbers=numbers, target=target),
+                assistant_prefill="",
+            )
+        messages = countdown_messages(numbers=numbers, target=target)
+        return messages[-1]["content"]
+
+    def build_initial_prompt_token_ids(
+        self,
+        *,
+        instance: TaskInstance,
+        tokenizer: Tokenizer,
+        enable_thinking: bool | None = None,
+    ) -> list[int]:
+        numbers = [int(n) for n in instance.payload["numbers"]]
+        target = int(instance.payload["target"])
+        if self.prompt_format == "qwen35_base_text_prefill":
+            return encode_base_text(
+                tokenizer=tokenizer,
+                text=base_text_prompt(
+                    system_text=None,
+                    user_text=countdown_user_text(numbers=numbers, target=target),
+                    assistant_prefill="",
+                ),
+            )
+        messages = countdown_messages(numbers=numbers, target=target)
+        if hasattr(tokenizer, "apply_chat_template"):
+            return get_chat_adapter(tokenizer).encode_messages(
+                messages,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        return tokenizer.encode(messages[-1]["content"], add_special_tokens=False)
+
+    def stop_token_ids(self, *, tokenizer: Tokenizer) -> list[int]:
+        if self.prompt_format == "qwen35_base_text_prefill":
+            eos_token_id = getattr(tokenizer, "eos_token_id", None)
+            if eos_token_id is None:
+                raise ValueError("Countdown base-text rollouts require tokenizer.eos_token_id.")
+            return [int(eos_token_id)]
+        if self.prompt_format == "chat":
+            if hasattr(tokenizer, "apply_chat_template"):
+                stop = get_chat_adapter(tokenizer).get_stop_sequences()
+                if stop is not None and len(stop) == 1:
+                    return [int(stop[0])]
+            stop = tokenizer.encode("\n", add_special_tokens=False)
+            if len(stop) != 1:
+                raise ValueError("Expected newline stop sequence to tokenize to one token.")
+            return stop
+        raise ValueError(f"Unsupported Countdown prompt_format={self.prompt_format!r}.")
+
+    def score_completion(
+        self,
+        *,
+        instance: TaskInstance,
+        tokenizer: Tokenizer,
+        completion_token_ids: list[int],
+    ) -> tuple[float, dict]:
+        text = tokenizer.decode(completion_token_ids, skip_special_tokens=True)
+        score = score_countdown_completion(
+            numbers=[int(n) for n in instance.payload["numbers"]],
+            target=int(instance.payload["target"]),
+            completion_text=text,
+            require_strict_format=True,
+        )
+        return score.reward, score.metrics
 
 
 @dataclass(frozen=True)

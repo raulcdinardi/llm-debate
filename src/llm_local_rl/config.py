@@ -7,14 +7,24 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class RolloutConfig:
+    """Rollout sizing.
+
+    For single-turn rollouts, num_samples is the total number of sampled
+    completions per step. num_rollouts_per_instance controls how many
+    completions are sampled for each distinct instance, so the driver draws
+    num_samples // num_rollouts_per_instance instances.
+    """
+
     env_name: str = "ht_sequence"
     mode: str = "debate"
     num_samples: int = 16
+    num_rollouts_per_instance: int = 1
     num_groups: int = 2
     group_size: int = 8
     rollout_batch_size: int = 0
     max_tokens: int = 1024
     temperature: float = 0.7
+    top_p: float = 1.0
     min_p: float = 0.0
     seed: int | None = None
     request_seed_mode: str = "none"
@@ -24,13 +34,23 @@ class RolloutConfig:
 class TrainRunConfig:
     model_path: str
     output_dir: str
+    tokenizer_path: str | None = None
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     steps: int = 1
     learning_rate: float = 1e-5
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
     adapter_layout: str = "shared"
     sequence_len: int = 8
     reward_mode: str = "num_h"
     strict_ht_format: bool = False
+    constrained_writing_rules_per_speaker: int = 2
+    constrained_writing_reward_scope: str = "both"
+    constrained_writing_sides: str = "both"
+    constrained_writing_rule_family: str = "generic"
+    constrained_writing_reward_mode: str = "additive"
+    constrained_writing_letter_temperature: float = 1.0
+    constrained_writing_anchors: str = "on"
     quality_data_dir: str | None = None
     quality_split: str = "train"
     quality_hard_only: bool = True
@@ -45,22 +65,51 @@ class TrainRunConfig:
     debate_r23_reward: str = "constant"
     debate_r23_constant: float = 1.0
     debate_r23_mode: str = "symmetric"
+    debate_r23_advantage_scope: str = "per_round"
     debate_judge_adapter: str = "policy"
     debate_external_judge_url: str | None = None
+    debate_judge_server_url: str | None = None
+    debate_judge_server_adapter_path: str | None = None
+    debate_mock_judge_seed: int | None = None
     debate_external_judge_timeout_s: float = 600.0
     debate_round_adapter_names: tuple[str, ...] = ("solution", "debate", "debate")
     debate_prompt_format: str = "chat"
+    debate_stop_on_concluded: bool = False
     base_r2_prefill: str = "The reasons that my solution is better than my opponent's are:\n1)"
     base_r3_prefill: str = "Responding to my opponent's criticism:\n1)"
+    debate_r1_max_tokens: int = 0
+    debate_r23_max_tokens: int = 0
+    rollout_grad_accum_steps: int = 1
+    rollout_assistant_prefill: str | None = None
     train_minibatch_size: int = 0
     train_max_tokens: int = 0
+    train_length_bucket_batches: bool = False
+    train_logprob_backend: str = "full_logits"
+    compile_train_logprob_helper: bool = False
+    train_adapter_names: tuple[str, ...] = ()
+    stop_parsed_reward_hacking_min: float | None = None
+    stop_parsed_reward_hacking_max: float | None = None
+    gradient_checkpointing: bool = True
+    on_policy_logprob_check: bool = False
+    on_policy_logprob_abs_tol: float = 1e-3
+    on_policy_logprob_warning_path: str | None = None
+    on_policy_logprob_max_records_per_batch: int = 8
     sampler_gpu_memory_utilization: float = 0.55
     sampler_max_model_len: int = 512
+    sampler_max_num_seqs: int = 0
     sampler_enforce_eager: bool = True
     sampler_max_lora_rank: int = 32
     sampler_max_loras: int = 4
     sampler_teardown_before_training: bool = False
+    sampler_sleep_before_training: bool = False
+    sampler_backend: str = "vllm"
+    sampler_sglang_base_url: str = "http://127.0.0.1:30000"
+    sampler_sglang_timeout_s: float = 600.0
+    sampler_sglang_pin_loras: bool = False
+    sampler_sglang_unload_stale_adapters: bool = True
+    init_adapter_dirs: dict[str, str] | None = None
     target_modules: tuple[str, ...] = ("q_proj", "v_proj")
+    target_parameters: tuple[str, ...] = ()
     lora_rank: int = 32
     trace_model_io: bool = True
     trace_model_io_dir: str | None = None
@@ -68,23 +117,50 @@ class TrainRunConfig:
     resource_logging: bool = True
     resource_log_interval_s: float = 5.0
 
-    def __post_init__(self) -> None:
-        if self.debate_r1_reward != "judge_rejection_task":
-            return
-        if self.rollout.mode != "debate":
-            raise ValueError("judge_rejection_task is only valid for debate rollouts")
-        if self.adapter_layout != "split":
-            raise ValueError("judge_rejection_task requires adapter_layout='split'")
-        expected_round_adapters = ("solution",) + ("debate",) * (self.debate_rounds - 1)
-        configured_round_adapters = self.debate_round_adapter_names[: self.debate_rounds]
-        if configured_round_adapters != expected_round_adapters:
-            raise ValueError(
-                "judge_rejection_task requires round adapters "
-                f"{expected_round_adapters!r}, got {configured_round_adapters!r}"
-            )
-
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def __post_init__(self) -> None:
+        judge_modes = sum(
+            value is not None
+            for value in (
+                self.debate_external_judge_url,
+                self.debate_judge_server_url,
+                self.debate_mock_judge_seed,
+            )
+        )
+        if judge_modes > 1:
+            raise ValueError(
+                "debate_external_judge_url, debate_judge_server_url, and debate_mock_judge_seed "
+                "are mutually exclusive."
+            )
+        if not 0.0 < float(self.rollout.top_p) <= 1.0:
+            raise ValueError(f"rollout.top_p must be in (0, 1], got {self.rollout.top_p}")
+
+        if self.debate_stop_on_concluded:
+            if self.rollout.mode != "debate":
+                raise ValueError("debate_stop_on_concluded is only valid for debate rollouts")
+            if self.debate_rounds < 2:
+                raise ValueError("debate_stop_on_concluded requires at least two debate rounds")
+            if self.debate_prompt_format != "qwen35_base_text_prefill":
+                raise ValueError(
+                    "debate_stop_on_concluded requires debate_prompt_format='qwen35_base_text_prefill'"
+                )
+            if self.sampler_backend != "sglang":
+                raise ValueError("debate_stop_on_concluded requires sampler_backend='sglang'")
+
+        if self.debate_r1_reward == "judge_rejection_task":
+            if self.rollout.mode != "debate":
+                raise ValueError("judge_rejection_task is only valid for debate rollouts")
+            if self.adapter_layout != "split":
+                raise ValueError("judge_rejection_task requires adapter_layout='split'")
+            expected_round_adapters = ("solution",) + ("debate",) * (self.debate_rounds - 1)
+            configured_round_adapters = self.debate_round_adapter_names[: self.debate_rounds]
+            if configured_round_adapters != expected_round_adapters:
+                raise ValueError(
+                    "judge_rejection_task requires round adapters "
+                    f"{expected_round_adapters!r}, got {configured_round_adapters!r}"
+                )
 
     @classmethod
     def from_dict(cls, data: dict) -> "TrainRunConfig":
@@ -92,25 +168,37 @@ class TrainRunConfig:
         return cls(
             model_path=data["model_path"],
             output_dir=data["output_dir"],
+            tokenizer_path=data.get("tokenizer_path"),
             rollout=RolloutConfig(
                 env_name=rollout_data.get("env_name", "ht_sequence"),
                 mode=rollout_data.get("mode", "debate"),
                 num_samples=rollout_data.get("num_samples", 16),
+                num_rollouts_per_instance=rollout_data.get("num_rollouts_per_instance", 1),
                 num_groups=rollout_data.get("num_groups", 2),
                 group_size=rollout_data.get("group_size", 8),
                 rollout_batch_size=rollout_data.get("rollout_batch_size", 0),
                 max_tokens=rollout_data.get("max_tokens", 1024),
                 temperature=rollout_data.get("temperature", 0.7),
+                top_p=rollout_data.get("top_p", 1.0),
                 min_p=rollout_data.get("min_p", 0.0),
                 seed=rollout_data.get("seed"),
                 request_seed_mode=rollout_data.get("request_seed_mode", "none"),
             ),
             steps=data["steps"],
             learning_rate=data["learning_rate"],
+            weight_decay=data.get("weight_decay", 0.01),
+            max_grad_norm=data.get("max_grad_norm", 1.0),
             adapter_layout=data["adapter_layout"],
             sequence_len=data["sequence_len"],
             reward_mode=data["reward_mode"],
             strict_ht_format=data.get("strict_ht_format", False),
+            constrained_writing_rules_per_speaker=int(data.get("constrained_writing_rules_per_speaker", 2)),
+            constrained_writing_reward_scope=data.get("constrained_writing_reward_scope", "both"),
+            constrained_writing_sides=data.get("constrained_writing_sides", "both"),
+            constrained_writing_rule_family=data.get("constrained_writing_rule_family", "generic"),
+            constrained_writing_reward_mode=data.get("constrained_writing_reward_mode", "additive"),
+            constrained_writing_letter_temperature=float(data.get("constrained_writing_letter_temperature", 1.0)),
+            constrained_writing_anchors=data.get("constrained_writing_anchors", "on"),
             quality_data_dir=data.get("quality_data_dir"),
             quality_split=data.get("quality_split", "train"),
             quality_hard_only=data.get("quality_hard_only", True),
@@ -125,22 +213,53 @@ class TrainRunConfig:
             debate_r23_reward=data.get("debate_r23_reward", "constant"),
             debate_r23_constant=data.get("debate_r23_constant", 1.0),
             debate_r23_mode=data.get("debate_r23_mode", "symmetric"),
+            debate_r23_advantage_scope=data.get("debate_r23_advantage_scope", "per_round"),
             debate_judge_adapter=data.get("debate_judge_adapter", "policy"),
             debate_external_judge_url=data.get("debate_external_judge_url"),
+            debate_judge_server_url=data.get("debate_judge_server_url"),
+            debate_judge_server_adapter_path=data.get("debate_judge_server_adapter_path"),
+            debate_mock_judge_seed=data.get("debate_mock_judge_seed"),
             debate_external_judge_timeout_s=data.get("debate_external_judge_timeout_s", 600.0),
             debate_round_adapter_names=tuple(data.get("debate_round_adapter_names", ("solution", "debate", "debate"))),
             debate_prompt_format=data.get("debate_prompt_format", "chat"),
+            debate_stop_on_concluded=data.get("debate_stop_on_concluded", False),
             base_r2_prefill=data.get("base_r2_prefill", "The reasons that my solution is better than my opponent's are:\n1)"),
             base_r3_prefill=data.get("base_r3_prefill", "Responding to my opponent's criticism:\n1)"),
+            debate_r1_max_tokens=data.get("debate_r1_max_tokens", 0),
+            debate_r23_max_tokens=data.get("debate_r23_max_tokens", 0),
+            rollout_grad_accum_steps=data.get("rollout_grad_accum_steps", 1),
+            rollout_assistant_prefill=(
+                data["rollout_assistant_prefill"] if "rollout_assistant_prefill" in data else ""
+            ),
             train_minibatch_size=data.get("train_minibatch_size", 0),
             train_max_tokens=data.get("train_max_tokens", 0),
+            train_length_bucket_batches=data.get("train_length_bucket_batches", False),
+            train_logprob_backend=data.get("train_logprob_backend", "full_logits"),
+            compile_train_logprob_helper=data.get("compile_train_logprob_helper", False),
+            train_adapter_names=tuple(data.get("train_adapter_names", ())),
+            stop_parsed_reward_hacking_min=data.get("stop_parsed_reward_hacking_min"),
+            stop_parsed_reward_hacking_max=data.get("stop_parsed_reward_hacking_max"),
+            gradient_checkpointing=data.get("gradient_checkpointing", True),
+            on_policy_logprob_check=data.get("on_policy_logprob_check", False),
+            on_policy_logprob_abs_tol=data.get("on_policy_logprob_abs_tol", 1e-3),
+            on_policy_logprob_warning_path=data.get("on_policy_logprob_warning_path"),
+            on_policy_logprob_max_records_per_batch=data.get("on_policy_logprob_max_records_per_batch", 8),
             sampler_gpu_memory_utilization=data.get("sampler_gpu_memory_utilization", 0.55),
             sampler_max_model_len=data.get("sampler_max_model_len", 512),
+            sampler_max_num_seqs=data.get("sampler_max_num_seqs", 0),
             sampler_enforce_eager=data.get("sampler_enforce_eager", True),
             sampler_max_lora_rank=data.get("sampler_max_lora_rank", 32),
             sampler_max_loras=data.get("sampler_max_loras", 4),
             sampler_teardown_before_training=data.get("sampler_teardown_before_training", False),
+            sampler_sleep_before_training=data.get("sampler_sleep_before_training", False),
+            sampler_backend=data.get("sampler_backend", "vllm"),
+            sampler_sglang_base_url=data.get("sampler_sglang_base_url", "http://127.0.0.1:30000"),
+            sampler_sglang_timeout_s=data.get("sampler_sglang_timeout_s", 600.0),
+            sampler_sglang_pin_loras=data.get("sampler_sglang_pin_loras", False),
+            sampler_sglang_unload_stale_adapters=data.get("sampler_sglang_unload_stale_adapters", True),
+            init_adapter_dirs=data.get("init_adapter_dirs"),
             target_modules=tuple(data["target_modules"]),
+            target_parameters=tuple(data.get("target_parameters", ())),
             lora_rank=data["lora_rank"],
             trace_model_io=data.get("trace_model_io", True),
             trace_model_io_dir=data.get("trace_model_io_dir"),

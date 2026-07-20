@@ -66,6 +66,8 @@ class DebateConfig:
     num_rounds: int = 3
     enable_thinking: bool | None = None
     max_tokens_per_turn: int | None = None
+    max_tokens_r1: int | None = None
+    max_tokens_r23: int | None = None
     temperature: float = 0.8
     kl_coef: float = 0.01
     learning_rate: float = 1e-5
@@ -309,6 +311,60 @@ def _merge_two_rounds_with_adv_values(
 
     return TrainingDatum(
         prompt_tokens=t1.prompt_tokens,
+        completion_tokens=merged_completion,
+        completion_logprobs=merged_logprobs,
+        completion_advantages=merged_advantages,
+        metadata={
+            "question": debate.question[:100],
+            "agent": traj.agent,
+            "verdict": debate.verdict,
+            **metadata,
+        },
+    )
+
+
+def _merge_transition_pair_with_adv_values(
+    *,
+    debate: DebateResult,
+    traj: DebateTrajectory,
+    first: Transition,
+    second: Transition,
+    first_adv_value: float,
+    second_adv_value: float,
+    metadata: dict[str, Any],
+) -> TrainingDatum:
+    for t in (first, second):
+        if len(t.completion_tokens) != len(t.completion_logprobs):
+            raise ValueError(
+                f"Completion/logprob length mismatch in round {t.round_num}: "
+                f"{len(t.completion_tokens)} vs {len(t.completion_logprobs)}"
+            )
+    if first_adv_value != 0.0 and len(first.completion_tokens) == 0:
+        raise ValueError(f"Non-zero R{first.round_num} advantage with zero completion tokens.")
+    if second_adv_value != 0.0 and len(second.completion_tokens) == 0:
+        raise ValueError(f"Non-zero R{second.round_num} advantage with zero completion tokens.")
+
+    first_full_len = len(first.prompt_tokens) + len(first.completion_tokens)
+    if len(second.prompt_tokens) < first_full_len:
+        raise ValueError(
+            f"R{second.round_num} prompt shorter than R{first.round_num} history; "
+            "extension property violated."
+        )
+    continuation_tokens = second.prompt_tokens[first_full_len:]
+    merged_completion = first.completion_tokens + continuation_tokens + second.completion_tokens
+    merged_logprobs = (
+        list(first.completion_logprobs)
+        + [0.0] * len(continuation_tokens)
+        + list(second.completion_logprobs)
+    )
+    merged_advantages = (
+        [first_adv_value] * len(first.completion_tokens)
+        + [0.0] * len(continuation_tokens)
+        + [second_adv_value] * len(second.completion_tokens)
+    )
+
+    return TrainingDatum(
+        prompt_tokens=first.prompt_tokens,
         completion_tokens=merged_completion,
         completion_logprobs=merged_logprobs,
         completion_advantages=merged_advantages,
@@ -820,9 +876,12 @@ def assemble_split_train_examples(
     r23_symmetric: bool,
     task_reward_fn: Callable[[DebateTrajectory, DebateResult], float],
     pointwise_reward_map: dict[int, float] | None = None,
+    r23_advantage_scope: Literal["per_round", "merged_r23"] = "per_round",
 ) -> dict[str, list[TrainExample]]:
     if len(round_adapter_names) < num_rounds:
         raise ValueError(f"Need at least {num_rounds} round adapter names, got {len(round_adapter_names)}")
+    if r23_advantage_scope not in ("per_round", "merged_r23"):
+        raise ValueError(f"Unsupported r23_advantage_scope={r23_advantage_scope!r}.")
     grouped: dict[str, list[TrainExample]] = {}
 
     def _append_turn(*, adapter_name: str, prompt_tokens: list[int], completion_tokens: list[int], completion_logprobs: list[float], advantages: list[float], metadata: dict[str, Any]) -> None:
@@ -895,7 +954,16 @@ def assemble_split_train_examples(
         else:
             r1_a = 0.0
             r1_b = 0.0
-        groups.setdefault(debate.question, []).extend([(traj_a, debate, float(r1_a)), (traj_b, debate, float(r1_b))])
+        instance_id_a = traj_a.metrics.get("instance_id")
+        instance_id_b = traj_b.metrics.get("instance_id")
+        if instance_id_a is not None and instance_id_b is not None and instance_id_a != instance_id_b:
+            raise ValueError(
+                "Debate trajectories disagree on instance_id: "
+                f"A={instance_id_a!r}, B={instance_id_b!r}"
+            )
+        instance_id = instance_id_a if instance_id_a is not None else instance_id_b
+        group_key = debate.question if instance_id is None else f"{debate.question}\0{instance_id}"
+        groups.setdefault(group_key, []).extend([(traj_a, debate, float(r1_a)), (traj_b, debate, float(r1_b))])
 
     for group_index, (question, group) in enumerate(groups.items()):
         _ = question
@@ -967,6 +1035,42 @@ def assemble_split_train_examples(
                 signed = winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
                 if len(t2.completion_tokens) == 0:
                     raise ValueError("R2 completion tokens empty.")
+                if num_rounds >= 3 and round_adapter_names[1] == round_adapter_names[2]:
+                    t3 = traj.transitions[2]
+                    if len(t3.completion_tokens) == 0:
+                        raise ValueError("R3 completion tokens empty.")
+                    if r23_advantage_scope == "per_round":
+                        first_adv_value = signed / len(t2.completion_tokens)
+                        second_adv_value = signed / len(t3.completion_tokens)
+                    else:
+                        r23_token_count = len(t2.completion_tokens) + len(t3.completion_tokens)
+                        first_adv_value = signed / r23_token_count
+                        second_adv_value = signed / r23_token_count
+                    datum = _merge_transition_pair_with_adv_values(
+                        debate=debate,
+                        traj=traj,
+                        first=t2,
+                        second=t3,
+                        first_adv_value=first_adv_value,
+                        second_adv_value=second_adv_value,
+                        metadata={
+                            "question": debate.question[:100],
+                            "agent": traj.agent,
+                            "verdict": debate.verdict,
+                            "source_exact_shared_equivalent": False,
+                            "reason": "split_layout_same_adapter_round_merge",
+                            "round_nums": [2, 3],
+                            "rounds_merged": 2,
+                            "r23_reward": signed,
+                            "r23_advantage_scope": r23_advantage_scope,
+                            "r23_first_adv_value": first_adv_value,
+                            "r23_second_adv_value": second_adv_value,
+                        },
+                    )
+                    grouped.setdefault(round_adapter_names[1], []).append(
+                        training_datum_to_train_example(datum=datum, adapter_name=round_adapter_names[1])
+                    )
+                    continue
                 _append_turn(
                     adapter_name=round_adapter_names[1],
                     prompt_tokens=t2.prompt_tokens,
@@ -981,6 +1085,7 @@ def assemble_split_train_examples(
                         "reason": "split_layout_per_round_projection",
                         "round_num": 2,
                         "r23_reward": signed,
+                        "r23_advantage_scope": r23_advantage_scope,
                     },
                 )
             if num_rounds >= 3:
@@ -1002,6 +1107,7 @@ def assemble_split_train_examples(
                         "reason": "split_layout_per_round_projection",
                         "round_num": 3,
                         "r23_reward": signed,
+                        "r23_advantage_scope": r23_advantage_scope,
                     },
                 )
     return grouped
