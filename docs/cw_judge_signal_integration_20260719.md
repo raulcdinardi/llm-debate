@@ -2,10 +2,12 @@
 
 ## Purpose and provenance
 
-This source-only integration makes the reviewed `judge_rejection_task` R1
-projection usable with the newer constrained-writing, SGLang, trainer, and
-sampling runtime. It deliberately stops before an experiment freeze, image
-build, GPU rental, Phase 0, or Phase 1.
+This integration makes the reviewed `judge_rejection_task` R1 projection
+usable with the newer constrained-writing, SGLang, trainer, and sampling
+runtime. Commit `cdc1d89` was the source-only boundary. The subsequent
+Phase-0 preparation adds the bounded diagnostic, one-step four-arm launcher,
+immutable-image recipe, artifact finalizer, and tests. It still stops before
+GPU rental, Phase-0 execution, or Phase 1.
 
 The integration branch starts at merge commit `36d6bc1` (PR #2), whose first
 parent is `990f784`. The newer runtime was an uncommitted working-tree snapshot
@@ -103,12 +105,27 @@ recorded.
 | `driver.py` and config tests | Keep newer runtime/sampler/trainer wiring; pass the effective R1 prefill and explicit stop flag; retain reviewed fail-closed reward-mode validation. |
 | `debate_runtime.py` | Use only the existing internal Base-text renderer; remove the competing official-template path; decouple real stopping from renderer identity. |
 
-## Explicitly excluded from this PR
+## Bounded Phase-0 follow-up
 
-- No Phase-0 launcher, experiment spec, acceptance decision, or freeze manifest.
-- No Docker/image build or registry push.
-- No cloud instance, GPU run, model download, or billable action.
-- No authorization of the four 100-step Phase-1 arms.
+- The diagnostic tests the exact D036 R2/R3 token-prefix extension and the
+  exact newline-terminated R1 prefill, plus scorer correctness, zero-B parity,
+  real `CONCLUDED` stopping, and reduced-seed robustness.
+- Only after every diagnostic gate passes does the launcher run one optimizer
+  step for each of the four judge arms.
+- The finalizer measures actual winner/loser emissions, non-zero R1
+  advantages, adapter deltas, on-policy logprob agreement, resource headroom,
+  and arm completion. It always emits `phase1_forbidden=true`.
+- The image is based on the immutable SGLang runtime digest and contains all
+  Python dependencies; runtime pip installation is prohibited.
+
+## Explicitly excluded
+
+- No cloud instance, GPU run, model download, or billable action has occurred
+  as part of source preparation.
+- No automatic Phase-1 continuation exists.
+- No authorization of the four 100-step Phase-1 arms is implied by a
+  quantitative Phase-0 pass; local archive validation, manual review, Fable
+  critique, and a later explicit human release decision remain mandatory.
 
 ## Remaining empirical risks
 
@@ -126,6 +143,6 @@ recorded.
 ## Local verification
 
 - Python compile check over `src`, `scripts/run_train.py`, and unit tests.
-- Complete unit suite: `137 passed, 3 skipped` after the compatibility fix
-  described in the PR.
+- Complete unit suite: `148 passed, 5 skipped` after the D036 and Phase-0
+  lifecycle additions.
 - Constrained-writing scorer gold suite: `24/24` passed.

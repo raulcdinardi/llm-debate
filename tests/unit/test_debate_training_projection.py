@@ -289,6 +289,8 @@ def test_judge_rejection_projection_summary_measures_emitted_losers() -> None:
     summary = summarize_judge_rejection_r1_projection(r1_examples=split["solution"], debates=debates)
     assert summary["winner_r1_example_count"] == 2
     assert summary["loser_r1_example_count"] == 0
+    assert summary["nonzero_advantage_r1_example_count"] == 2
+    assert summary["zero_advantage_r1_example_count"] == 0
     assert summary["rejected_loser_count"] == 2
 
     loser_metadata = dict(split["solution"][0].metadata)
@@ -300,6 +302,7 @@ def test_judge_rejection_projection_summary_measures_emitted_losers() -> None:
     assert measured["winner_r1_example_count"] == 1
     assert measured["winner_r1_example_count_delta"] == -1
     assert measured["loser_r1_example_count"] == 1
+    assert measured["nonzero_advantage_r1_example_count"] == 2
 
 
 def test_split_projection_uses_configured_r1_adapter_for_every_reward_mode() -> None:

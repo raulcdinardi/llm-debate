@@ -1121,6 +1121,8 @@ def summarize_judge_rejection_r1_projection(
     valid_verdict_count = sum(debate.verdict in ("A", "B") for debate in debates)
     winner_r1_example_count = 0
     loser_r1_example_count = 0
+    nonzero_advantage_r1_example_count = 0
+    zero_advantage_r1_example_count = 0
     for example in r1_examples:
         agent = example.metadata.get("agent")
         verdict = example.metadata.get("verdict")
@@ -1130,6 +1132,10 @@ def summarize_judge_rejection_r1_projection(
             winner_r1_example_count += 1
         else:
             loser_r1_example_count += 1
+        if any(float(value) != 0.0 for value in example.advantages):
+            nonzero_advantage_r1_example_count += 1
+        else:
+            zero_advantage_r1_example_count += 1
 
     classified_r1_example_count = winner_r1_example_count + loser_r1_example_count
     indexed_examples = [
@@ -1155,6 +1161,8 @@ def summarize_judge_rejection_r1_projection(
         "winner_r1_example_count": winner_r1_example_count,
         "winner_r1_example_count_delta": winner_r1_example_count - valid_verdict_count,
         "loser_r1_example_count": loser_r1_example_count,
+        "nonzero_advantage_r1_example_count": nonzero_advantage_r1_example_count,
+        "zero_advantage_r1_example_count": zero_advantage_r1_example_count,
         "rejected_loser_count": valid_verdict_count - loser_r1_example_count,
         "unclassified_r1_example_count": len(r1_examples) - classified_r1_example_count,
         "missing_group_metadata_count": len(r1_examples) - len(indexed_examples),
