@@ -8,7 +8,7 @@ from typing import Any
 from llm_local_rl.chat_templates import get_chat_adapter
 from llm_local_rl.prompts import format_prompt, load_prompt
 
-from llm_local_rl.task_types import TaskInstance, TaskReward
+from llm_local_rl.task_types import BaseTextDebateExtension, TaskInstance, TaskReward
 
 
 _RULE_I_ONLY = "i_only"
@@ -846,6 +846,28 @@ class ConstrainedWritingDebateTask:
 
     def debate_r3_user_template(self) -> str | None:
         return None
+
+    def build_base_text_debate_extension(
+        self,
+        *,
+        inst: TaskInstance,
+        opponent_round: int,
+        opponent_answer: str,
+    ) -> BaseTextDebateExtension:
+        if opponent_round not in {1, 2}:
+            raise ValueError(f"opponent_round must be 1 or 2, got {opponent_round}")
+        return BaseTextDebateExtension(
+            user_text=(
+                f"Constitution: {self.judge_constitution_text(inst=inst)}\n"
+                f"Opponent Round {opponent_round} answer:\n"
+                f"{opponent_answer}\n"
+                "Continue arguing that your fixed answer should win under the constitution. "
+                "Address the opponent directly and use concrete evidence from the task and answers.\n\n"
+                "Write exactly 3 short numbered points. After point 3, immediately output "
+                "CONCLUDED and nothing else.\n"
+            ),
+            assistant_prefill="The reasons that my solution is better than my opponent's are:\n1)",
+        )
 
 
 @dataclass(frozen=True)

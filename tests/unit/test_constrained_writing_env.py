@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from llm_local_rl.constrained_writing import ConstrainedWritingDebateTask, ConstrainedWritingEnv
 from llm_local_rl.task_types import TaskInstance
 
@@ -127,6 +129,44 @@ def test_debate_protocol_surface():
     assert "A or B" in constitution
     assert task.debate_r2_user_template() is None
     assert task.debate_r3_user_template() is None
+
+
+def test_base_text_debate_extension_contract_is_exact_and_round_specific():
+    task = make_task()
+    inst = make_instance(["i_only", "no_commas"], ["past_tense_ed", "end_word"])
+    constitution = task.judge_constitution_text(inst=inst)
+    expected_prefill = "The reasons that my solution is better than my opponent's are:\n1)"
+
+    r2 = task.build_base_text_debate_extension(
+        inst=inst,
+        opponent_round=1,
+        opponent_answer="Opponent story.",
+    )
+    assert r2.user_text == (
+        f"Constitution: {constitution}\n"
+        "Opponent Round 1 answer:\n"
+        "Opponent story.\n"
+        "Continue arguing that your fixed answer should win under the constitution. "
+        "Address the opponent directly and use concrete evidence from the task and answers.\n\n"
+        "Write exactly 3 short numbered points. After point 3, immediately output "
+        "CONCLUDED and nothing else.\n"
+    )
+    assert r2.assistant_prefill == expected_prefill
+
+    r3 = task.build_base_text_debate_extension(
+        inst=inst,
+        opponent_round=2,
+        opponent_answer="Opponent argument.",
+    )
+    assert "Opponent Round 2 answer:\nOpponent argument.\n" in r3.user_text
+    assert r3.assistant_prefill == expected_prefill
+
+    with pytest.raises(ValueError, match="opponent_round must be 1 or 2"):
+        task.build_base_text_debate_extension(
+            inst=inst,
+            opponent_round=3,
+            opponent_answer="invalid",
+        )
 
 
 def test_env_wrapper_shadow_scoring():

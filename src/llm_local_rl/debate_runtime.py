@@ -10,7 +10,7 @@ from llm_local_rl.debate_parity import DebateConfig, DebateResult, DebateTraject
 from llm_local_rl.model_io_trace import trace_context
 from llm_local_rl.prompts import load_prompt
 from llm_local_rl.sglang_sampling import SglangRuntimeConfig, SglangSampler
-from llm_local_rl.task_types import TaskInstance, TaskSpec
+from llm_local_rl.task_types import BaseTextDebateExtension, TaskInstance, TaskSpec
 from llm_local_rl.types import RolloutSampler, SamplingRequest
 
 JudgeAdapterMode = str
@@ -400,6 +400,42 @@ class DebateRuntime:
             )
         )
 
+    def _task_base_text_debate_extension(
+        self,
+        *,
+        inst: TaskInstance,
+        opponent_round: int,
+        opponent_answer: str,
+    ) -> BaseTextDebateExtension | None:
+        builder = getattr(self.task, "build_base_text_debate_extension", None)
+        if not callable(builder):
+            return None
+        extension = builder(
+            inst=inst,
+            opponent_round=opponent_round,
+            opponent_answer=opponent_answer,
+        )
+        if extension is not None and not isinstance(extension, BaseTextDebateExtension):
+            raise TypeError(
+                "build_base_text_debate_extension must return BaseTextDebateExtension or None"
+            )
+        return extension
+
+    def _base_text_debate_prefill(
+        self,
+        *,
+        inst: TaskInstance,
+        opponent_round: int,
+        opponent_answer: str,
+        fallback: str,
+    ) -> str:
+        extension = self._task_base_text_debate_extension(
+            inst=inst,
+            opponent_round=opponent_round,
+            opponent_answer=opponent_answer,
+        )
+        return extension.assistant_prefill if extension is not None else fallback
+
     def _base_r2_continuation_tokens(
         self,
         *,
@@ -407,6 +443,20 @@ class DebateRuntime:
         own_r1: str,
         opponent_r1: str,
     ) -> list[int]:
+        extension = self._task_base_text_debate_extension(
+            inst=inst,
+            opponent_round=1,
+            opponent_answer=opponent_r1,
+        )
+        if extension is not None:
+            return self._encode_base_text(
+                "\n\n"
+                + _base_text_prompt(
+                    system_text=None,
+                    user_text=extension.user_text,
+                    assistant_prefill=extension.assistant_prefill,
+                )
+            )
         task_template = self.task.debate_r2_user_template()
         if task_template is None:
             user_text = (
@@ -446,6 +496,20 @@ class DebateRuntime:
         own_r2: str,
         opponent_r2: str,
     ) -> list[int]:
+        extension = self._task_base_text_debate_extension(
+            inst=inst,
+            opponent_round=2,
+            opponent_answer=opponent_r2,
+        )
+        if extension is not None:
+            return self._encode_base_text(
+                "\n\n"
+                + _base_text_prompt(
+                    system_text=None,
+                    user_text=extension.user_text,
+                    assistant_prefill=extension.assistant_prefill,
+                )
+            )
         task_template = self.task.debate_r3_user_template()
         if task_template is None:
             user_text = (
@@ -676,10 +740,19 @@ class DebateRuntime:
         n_debates = len(instances_repeated) // 2
         inst_pairs = [(instances_repeated[2 * idx], instances_repeated[2 * idx + 1]) for idx in range(n_debates)]
         r2_prompt_tokens = []
+        r2_argument_prefills: list[str] = []
         for idx in range(n_debates):
             a_idx = 2 * idx
             b_idx = 2 * idx + 1
             if use_base_text_prefill:
+                r2_argument_prefills.append(
+                    self._base_text_debate_prefill(
+                        inst=instances_repeated[a_idx],
+                        opponent_round=1,
+                        opponent_answer=r1_visible_text[b_idx],
+                        fallback=self.runtime_config.base_r2_prefill,
+                    )
+                )
                 r2_prompt_tokens.append(
                     base_r1_prompt_tokens[a_idx]
                     + r1_tokens[a_idx]
@@ -687,6 +760,14 @@ class DebateRuntime:
                         inst=instances_repeated[a_idx],
                         own_r1=r1_visible_text[a_idx],
                         opponent_r1=r1_visible_text[b_idx],
+                    )
+                )
+                r2_argument_prefills.append(
+                    self._base_text_debate_prefill(
+                        inst=instances_repeated[b_idx],
+                        opponent_round=1,
+                        opponent_answer=r1_visible_text[a_idx],
+                        fallback=self.runtime_config.base_r2_prefill,
                     )
                 )
                 r2_prompt_tokens.append(
@@ -724,17 +805,30 @@ class DebateRuntime:
             texts=r2_text,
             strip_stop_sentinel=self.runtime_config.stop_on_concluded,
         )
-        r2_argument_text = [
-            self.runtime_config.base_r2_prefill + text if use_base_text_prefill else text
-            for text in r2_visible_text
-        ]
+        r2_argument_text = (
+            [
+                prefill + text
+                for prefill, text in zip(r2_argument_prefills, r2_visible_text, strict=True)
+            ]
+            if use_base_text_prefill
+            else list(r2_visible_text)
+        )
         r2_raw = [raw for _comp, _lps, _text, raw in r2_results]
 
         r3_prompt_tokens = []
+        r3_argument_prefills: list[str] = []
         for idx in range(n_debates):
             a_idx = 2 * idx
             b_idx = 2 * idx + 1
             if use_base_text_prefill:
+                r3_argument_prefills.append(
+                    self._base_text_debate_prefill(
+                        inst=instances_repeated[a_idx],
+                        opponent_round=2,
+                        opponent_answer=r2_argument_text[b_idx],
+                        fallback=self.runtime_config.base_r3_prefill,
+                    )
+                )
                 r3_prompt_tokens.append(
                     r2_prompt_tokens[a_idx]
                     + r2_tokens[a_idx]
@@ -744,6 +838,14 @@ class DebateRuntime:
                         opponent_r1=r1_visible_text[b_idx],
                         own_r2=r2_argument_text[a_idx],
                         opponent_r2=r2_argument_text[b_idx],
+                    )
+                )
+                r3_argument_prefills.append(
+                    self._base_text_debate_prefill(
+                        inst=instances_repeated[b_idx],
+                        opponent_round=2,
+                        opponent_answer=r2_argument_text[a_idx],
+                        fallback=self.runtime_config.base_r3_prefill,
                     )
                 )
                 r3_prompt_tokens.append(
@@ -783,10 +885,14 @@ class DebateRuntime:
             texts=r3_text,
             strip_stop_sentinel=self.runtime_config.stop_on_concluded,
         )
-        r3_argument_text = [
-            self.runtime_config.base_r3_prefill + text if use_base_text_prefill else text
-            for text in r3_visible_text
-        ]
+        r3_argument_text = (
+            [
+                prefill + text
+                for prefill, text in zip(r3_argument_prefills, r3_visible_text, strict=True)
+            ]
+            if use_base_text_prefill
+            else list(r3_visible_text)
+        )
         r3_raw = [raw for _comp, _lps, _text, raw in r3_results]
 
         if self.judge_fn is not None:
