@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from scripts.cw_judge_signal_phase0_finalize import (
     evaluate_invariants,
+    measured_invariants,
     metric_name,
     select_review_rows,
 )
@@ -34,6 +35,19 @@ def test_invariant_evaluation_uses_declared_direction() -> None:
         ("probe_a_target_cap_hit_rate_max", "scorer_gold_pass_rate_min"),
     )
     assert all(result["pass"] for result in results.values())
+
+
+def test_measured_invariants_uses_report_gate_keys() -> None:
+    assert measured_invariants(
+        {
+            "probe_a_target_cap_hit_rate": 0.025,
+            "scorer_gold_pass_rate": 1.0,
+        },
+        ("probe_a_target_cap_hit_rate_max", "scorer_gold_pass_rate_min"),
+    ) == {
+        "probe_a_target_cap_hit_rate_max": 0.025,
+        "scorer_gold_pass_rate_min": 1.0,
+    }
 
 
 def test_review_selection_is_bounded_to_six_per_arm() -> None:

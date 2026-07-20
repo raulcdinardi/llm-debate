@@ -141,6 +141,16 @@ def evaluate_invariants(metrics: dict[str, float], names: Iterable[str]) -> dict
     return results
 
 
+def measured_invariants(
+    metrics: dict[str, float], names: Iterable[str]
+) -> dict[str, float | None]:
+    """Project metric values onto the invariant-key schema used by exp_report.py."""
+    return {
+        invariant_name: metrics.get(metric_name(invariant_name)[0])
+        for invariant_name in names
+    }
+
+
 def max_checkpoint_delta(initial_path: Path, final_path: Path) -> float:
     from safetensors.torch import load_file
 
@@ -406,6 +416,7 @@ def main() -> int:
         "schema": "cw_judge_signal_phase0_preflight_v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "metrics": metrics,
+        "measured": measured_invariants(metrics, INVARIANTS),
         "invariants": INVARIANTS,
         "automatic_gate": {"pass": automatic_pass, "results": automatic_results},
         "post_collection_gate": {"pass": lifecycle_complete, "results": manual_results},
