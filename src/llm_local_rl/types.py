@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 AdapterName = Literal["shared", "solution", "debate", "judge"]
 
@@ -15,6 +15,9 @@ class SamplingRequest:
     temperature: float
     seed: int | None = None
     min_p: float = 0.0
+    top_p: float = 1.0
+    stop_strings: tuple[str, ...] = ()
+    include_stop_str_in_output: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,3 +76,15 @@ class CoinFlipInstance:
 class ShortStoryInstance:
     instance_id: str
     secret_word: str
+
+
+class RolloutSampler(Protocol):
+    def set_adapter_paths(self, *, adapter_paths: dict[str, str]) -> None: ...
+
+    def wake_up(self, *, level: int = 1) -> None: ...
+
+    def sleep(self, *, level: int = 1) -> None: ...
+
+    def close(self) -> None: ...
+
+    def sample_many(self, requests: list[SamplingRequest]) -> list[SamplingResult]: ...

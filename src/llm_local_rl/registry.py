@@ -1,9 +1,28 @@
 from __future__ import annotations
 
 from llm_local_rl.config import TrainRunConfig
-from llm_local_rl.debate_tasks import CoinDebateTask, HTSequenceDebateTask, QualityDebateTask, ShortStoryDebateTask
-from llm_local_rl.envs import CoinFlipEnv, HTSequenceEnv, QualityEnv, ShortStoryEnv
+from llm_local_rl.debate_tasks import (
+    CoinDebateTask,
+    CountdownCodeDebateTask,
+    HTSequenceDebateTask,
+    QualityDebateTask,
+    ShortStoryDebateTask,
+)
+from llm_local_rl.envs import CoinFlipEnv, CountdownCodeEnv, HTSequenceEnv, QualityEnv, ShortStoryEnv
+from llm_local_rl.constrained_writing import ConstrainedWritingDebateTask, ConstrainedWritingEnv
 from llm_local_rl.episodes import SingleTurnEpisodeBuilder
+
+
+def _build_constrained_writing_task(config: TrainRunConfig) -> ConstrainedWritingDebateTask:
+    return ConstrainedWritingDebateTask.from_args(
+        rules_per_speaker=config.constrained_writing_rules_per_speaker,
+        reward_scope=config.constrained_writing_reward_scope,
+        sides=config.constrained_writing_sides,
+        rule_family=config.constrained_writing_rule_family,
+        reward_mode=config.constrained_writing_reward_mode,
+        letter_temperature=config.constrained_writing_letter_temperature,
+        anchors=config.constrained_writing_anchors,
+    )
 
 
 def build_environment(config: TrainRunConfig):
@@ -17,6 +36,10 @@ def build_environment(config: TrainRunConfig):
         return CoinFlipEnv()
     if config.rollout.env_name in {"short_story", "secret_word"}:
         return ShortStoryEnv()
+    if config.rollout.env_name == "countdown_code":
+        return CountdownCodeEnv(prompt_format=config.debate_prompt_format)
+    if config.rollout.env_name == "constrained_writing":
+        return ConstrainedWritingEnv(task=_build_constrained_writing_task(config))
     if config.rollout.env_name == "quality_debate":
         return QualityEnv(
             data_dir=config.quality_data_dir,
@@ -47,6 +70,10 @@ def build_debate_task(config: TrainRunConfig):
         return CoinDebateTask()
     if config.rollout.env_name in {"short_story", "secret_word"}:
         return ShortStoryDebateTask()
+    if config.rollout.env_name == "countdown_code":
+        return CountdownCodeDebateTask()
+    if config.rollout.env_name == "constrained_writing":
+        return _build_constrained_writing_task(config)
     if config.rollout.env_name == "quality_debate":
         return QualityDebateTask(
             data_dir=config.quality_data_dir,

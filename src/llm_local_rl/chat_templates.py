@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import weakref
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,15 +66,31 @@ class ChatTemplateAdapter:
         )
 
 
-_ADAPTER_CACHE: dict[int, ChatTemplateAdapter] = {}
+_ADAPTER_CACHE: weakref.WeakKeyDictionary[Any, ChatTemplateAdapter] = weakref.WeakKeyDictionary()
 
 
 def get_chat_adapter(tokenizer: Any) -> ChatTemplateAdapter:
-    key = id(tokenizer)
-    if key in _ADAPTER_CACHE:
-        return _ADAPTER_CACHE[key]
+    try:
+        return _ADAPTER_CACHE[tokenizer]
+    except KeyError:
+        pass
+    except TypeError:
+        return _build_chat_adapter(tokenizer=tokenizer, adapter_tokenizer=tokenizer)
+    try:
+        adapter_tokenizer = weakref.proxy(tokenizer)
+    except TypeError:
+        return _build_chat_adapter(tokenizer=tokenizer, adapter_tokenizer=tokenizer)
+    adapter = _build_chat_adapter(tokenizer=tokenizer, adapter_tokenizer=adapter_tokenizer)
+    try:
+        _ADAPTER_CACHE[tokenizer] = adapter
+    except TypeError:
+        return _build_chat_adapter(tokenizer=tokenizer, adapter_tokenizer=tokenizer)
+    return adapter
+
+
+def _build_chat_adapter(*, tokenizer: Any, adapter_tokenizer: Any) -> ChatTemplateAdapter:
     adapter = ChatTemplateAdapter(
-        tokenizer=tokenizer,
+        tokenizer=adapter_tokenizer,
         name=str(getattr(tokenizer, "name_or_path", "unknown")),
         stop_token_id=_infer_stop_token_id(tokenizer),
         sentinel_tokens=None,
@@ -84,7 +101,6 @@ def get_chat_adapter(tokenizer: Any) -> ChatTemplateAdapter:
     if sentinel is not None:
         object.__setattr__(adapter, "sentinel_tokens", (sentinel[0][0], sentinel[1][0]))
         object.__setattr__(adapter, "sentinel_token_ids", (sentinel[0][1], sentinel[1][1]))
-    _ADAPTER_CACHE[key] = adapter
     return adapter
 
 
@@ -157,6 +173,6 @@ def _continuation_chatml(
     user_pre: str,
     user_post: str,
 ) -> tuple[list[int], list[int]]:
-    prefix = adapter.tokenizer.encode("<|im_end|><|im_start|>user\n" + user_pre, add_special_tokens=False)
-    suffix = adapter.tokenizer.encode(user_post + "\n<|im_end|><|im_start|>assistant", add_special_tokens=False)
+    prefix = adapter.tokenizer.encode("<|im_end|>\n<|im_start|>user\n" + user_pre, add_special_tokens=False)
+    suffix = adapter.tokenizer.encode(user_post + "\n<|im_end|>\n<|im_start|>assistant\n", add_special_tokens=False)
     return list(prefix), list(suffix)

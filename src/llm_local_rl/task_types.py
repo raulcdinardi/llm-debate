@@ -16,6 +16,12 @@ class TaskReward:
     metrics: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class BaseTextDebateExtension:
+    user_text: str
+    assistant_prefill: str
+
+
 class TaskSpec(Protocol):
     name: str
 

@@ -1,18 +1,36 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import math
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from llm_local_rl.memory_trace import (
+    MemoryTraceRecorder,
+    current_alloc_bytes,
+    maybe_create_recorder,
+    now_seconds,
+    peak_alloc_bytes,
+    reset_peak,
+    reserved_bytes,
+)
 from llm_local_rl.model_io_trace import (
     get_model_io_tracer,
     get_trace_top_logprobs,
     is_model_io_tracing_enabled,
 )
+from llm_local_rl.on_policy_logprobs import check_on_policy_logprobs
 from llm_local_rl.types import AdapterName, TrainExample
+
+
+TRAIN_LOGPROB_BACKEND_FULL_LOGITS = "full_logits"
+TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD = "selective_lm_head"
+TRAIN_LOGPROB_BACKENDS = (TRAIN_LOGPROB_BACKEND_FULL_LOGITS, TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD)
 
 
 @dataclass(frozen=True)
@@ -21,12 +39,30 @@ class TrainerConfig:
     adapter_names: tuple[AdapterName, ...] = ("shared",)
     lora_rank: int = 32
     learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
     device: str = "cuda"
     torch_dtype: str = "bfloat16"
     target_modules: tuple[str, ...] = ("q_proj", "v_proj")
+    target_parameters: tuple[str, ...] = ()
     ppo_clip_epsilon: float = 0.2
     train_minibatch_size: int = 0
     train_max_tokens: int = 0
+    train_length_bucket_batches: bool = False
+    train_logprob_backend: str = TRAIN_LOGPROB_BACKEND_FULL_LOGITS
+    compile_train_logprob_helper: bool = False
+    gradient_checkpointing: bool = True
+    on_policy_logprob_check: bool = False
+    on_policy_logprob_abs_tol: float = 1e-3
+    on_policy_logprob_warning_path: str | None = None
+    on_policy_logprob_max_records_per_batch: int = 8
+
+    def __post_init__(self) -> None:
+        if self.train_logprob_backend not in TRAIN_LOGPROB_BACKENDS:
+            raise ValueError(
+                f"Unsupported train_logprob_backend={self.train_logprob_backend!r}; "
+                f"expected one of {TRAIN_LOGPROB_BACKENDS!r}."
+            )
 
 
 def _resolve_dtype(name: str):
@@ -37,6 +73,32 @@ def _resolve_dtype(name: str):
     raise ValueError(f"Unsupported torch_dtype={name!r}")
 
 
+def _validate_example_lengths(example: TrainExample) -> None:
+    if not (
+        len(example.input_ids)
+        == len(example.target_ids)
+        == len(example.loss_mask)
+        == len(example.old_logprobs)
+        == len(example.advantages)
+    ):
+        raise ValueError("TrainExample fields must all have equal length.")
+
+
+def _is_overlength(*, example: TrainExample, max_tokens: int = 0) -> bool:
+    return max_tokens > 0 and len(example.input_ids) > max_tokens
+
+
+def _drop_overlength_examples(
+    *,
+    batch: list[TrainExample],
+    max_tokens: int = 0,
+) -> tuple[list[TrainExample], int]:
+    if max_tokens <= 0:
+        return list(batch), 0
+    kept = [example for example in batch if not _is_overlength(example=example, max_tokens=max_tokens)]
+    return kept, len(batch) - len(kept)
+
+
 def _pad_batch(
     *,
     batch: list[TrainExample],
@@ -44,12 +106,15 @@ def _pad_batch(
     device: str,
     max_tokens: int = 0,
 ) -> dict[str, torch.Tensor]:
-    def _start(example: TrainExample) -> int:
-        if max_tokens <= 0 or len(example.input_ids) <= max_tokens:
-            return 0
-        return len(example.input_ids) - max_tokens
+    for example in batch:
+        _validate_example_lengths(example)
+        if _is_overlength(example=example, max_tokens=max_tokens):
+            raise ValueError(
+                "Over-length TrainExample reached _pad_batch; drop over-length samples before padding "
+                f"(len={len(example.input_ids)}, max_tokens={max_tokens})."
+            )
 
-    max_len = max(len(example.input_ids) - _start(example) for example in batch)
+    max_len = max(len(example.input_ids) for example in batch)
     batch_size = len(batch)
 
     input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long, device=device)
@@ -60,22 +125,13 @@ def _pad_batch(
     advantages = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
 
     for row_idx, example in enumerate(batch):
-        start = _start(example)
-        n = len(example.input_ids) - start
-        if not (
-            len(example.input_ids)
-            == len(example.target_ids)
-            == len(example.loss_mask)
-            == len(example.old_logprobs)
-            == len(example.advantages)
-        ):
-            raise ValueError("TrainExample fields must all have equal length.")
-        input_ids[row_idx, :n] = torch.tensor(example.input_ids[start:], dtype=torch.long, device=device)
-        target_ids[row_idx, :n] = torch.tensor(example.target_ids[start:], dtype=torch.long, device=device)
+        n = len(example.input_ids)
+        input_ids[row_idx, :n] = torch.tensor(example.input_ids, dtype=torch.long, device=device)
+        target_ids[row_idx, :n] = torch.tensor(example.target_ids, dtype=torch.long, device=device)
         attention_mask[row_idx, :n] = 1
-        loss_mask[row_idx, :n] = torch.tensor(example.loss_mask[start:], dtype=torch.bool, device=device)
-        old_logprobs[row_idx, :n] = torch.tensor(example.old_logprobs[start:], dtype=torch.float32, device=device)
-        advantages[row_idx, :n] = torch.tensor(example.advantages[start:], dtype=torch.float32, device=device)
+        loss_mask[row_idx, :n] = torch.tensor(example.loss_mask, dtype=torch.bool, device=device)
+        old_logprobs[row_idx, :n] = torch.tensor(example.old_logprobs, dtype=torch.float32, device=device)
+        advantages[row_idx, :n] = torch.tensor(example.advantages, dtype=torch.float32, device=device)
 
     return {
         "input_ids": input_ids,
@@ -87,14 +143,309 @@ def _pad_batch(
     }
 
 
+_TARGET_LOGPROB_POSITIONS_PER_CHUNK = 2048
+_COMPILED_LM_HEAD_LOGITS_NO_BIAS = None
+
+
+def _target_token_logprobs(
+    *,
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    max_positions_per_chunk: int = _TARGET_LOGPROB_POSITIONS_PER_CHUNK,
+) -> torch.Tensor:
+    if logits.ndim != 3:
+        raise ValueError(f"logits must have shape [batch, seq, vocab], got {tuple(logits.shape)}")
+    if target_ids.shape != logits.shape[:2]:
+        raise ValueError(f"target_ids shape {tuple(target_ids.shape)} does not match logits prefix {tuple(logits.shape[:2])}")
+    if max_positions_per_chunk <= 0:
+        raise ValueError("max_positions_per_chunk must be positive")
+    vocab_size = int(logits.shape[-1])
+    flat_logits = logits.reshape(-1, vocab_size)
+    flat_target_ids = target_ids.reshape(-1)
+    chunks = []
+    for start in range(0, int(flat_target_ids.numel()), max_positions_per_chunk):
+        end = min(start + max_positions_per_chunk, int(flat_target_ids.numel()))
+        chunks.append(
+            -F.cross_entropy(
+                flat_logits[start:end].float(),
+                flat_target_ids[start:end],
+                reduction="none",
+            )
+        )
+    return torch.cat(chunks, dim=0).reshape(target_ids.shape)
+
+
+def _lm_head_logits_no_bias(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return hidden_states.matmul(weight.t())
+
+
+def _compiled_lm_head_logits_no_bias(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    global _COMPILED_LM_HEAD_LOGITS_NO_BIAS
+    if _COMPILED_LM_HEAD_LOGITS_NO_BIAS is None:
+        if not hasattr(torch, "compile"):
+            raise ValueError("compile_train_logprob_helper=True requires torch.compile.")
+        _COMPILED_LM_HEAD_LOGITS_NO_BIAS = torch.compile(_lm_head_logits_no_bias, dynamic=True)
+    return _COMPILED_LM_HEAD_LOGITS_NO_BIAS(hidden_states, weight)
+
+
+def _lm_head_logits(
+    *,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    compile_helper: bool,
+) -> torch.Tensor:
+    if compile_helper:
+        if bias is not None:
+            raise ValueError("compile_train_logprob_helper=True currently supports bias-free lm_head only.")
+        return _compiled_lm_head_logits_no_bias(hidden_states, weight)
+    logits = _lm_head_logits_no_bias(hidden_states, weight)
+    if bias is not None:
+        logits = logits + bias
+    return logits
+
+
+def _selected_lm_head_token_logprobs(
+    *,
+    hidden_states: torch.Tensor,
+    lm_head,
+    target_ids: torch.Tensor,
+    trained_positions: torch.Tensor,
+    max_positions_per_chunk: int = _TARGET_LOGPROB_POSITIONS_PER_CHUNK,
+    compile_helper: bool = False,
+) -> tuple[torch.Tensor, float]:
+    if hidden_states.ndim != 3:
+        raise ValueError(f"hidden_states must have shape [batch, seq, hidden], got {tuple(hidden_states.shape)}")
+    if target_ids.shape != hidden_states.shape[:2]:
+        raise ValueError(
+            f"target_ids shape {tuple(target_ids.shape)} does not match hidden prefix {tuple(hidden_states.shape[:2])}"
+        )
+    if trained_positions.shape != target_ids.shape:
+        raise ValueError(
+            f"trained_positions shape {tuple(trained_positions.shape)} does not match target_ids {tuple(target_ids.shape)}"
+        )
+    if trained_positions.dtype != torch.bool:
+        raise ValueError(f"trained_positions must be bool, got {trained_positions.dtype}")
+    if max_positions_per_chunk <= 0:
+        raise ValueError("max_positions_per_chunk must be positive")
+    if not hasattr(lm_head, "weight"):
+        raise ValueError("lm_head must expose a weight tensor.")
+
+    selected_target_ids = target_ids[trained_positions]
+    if int(selected_target_ids.numel()) == 0:
+        return hidden_states.new_empty((0,), dtype=torch.float32), 0.0
+
+    selected_hidden_states = hidden_states[trained_positions]
+    weight = lm_head.weight
+    bias = getattr(lm_head, "bias", None)
+    if int(weight.shape[1]) != int(selected_hidden_states.shape[-1]):
+        raise ValueError(
+            f"lm_head weight hidden dim {int(weight.shape[1])} does not match hidden dim "
+            f"{int(selected_hidden_states.shape[-1])}."
+        )
+
+    logprob_chunks = []
+    entropy_sum = 0.0
+    for start in range(0, int(selected_target_ids.numel()), max_positions_per_chunk):
+        end = min(start + max_positions_per_chunk, int(selected_target_ids.numel()))
+        logits = _lm_head_logits(
+            hidden_states=selected_hidden_states[start:end],
+            weight=weight,
+            bias=bias,
+            compile_helper=compile_helper,
+        )
+        logits_float = logits.float()
+        logprob_chunks.append(
+            -F.cross_entropy(
+                logits_float,
+                selected_target_ids[start:end],
+                reduction="none",
+            )
+        )
+        with torch.no_grad():
+            log_probs = torch.log_softmax(logits_float.detach(), dim=-1)
+            entropy_sum += float((-(log_probs.exp() * log_probs).sum(dim=-1)).sum().detach().cpu().item())
+
+    return torch.cat(logprob_chunks, dim=0), entropy_sum
+
+
+def _effective_train_length(*, example: TrainExample, max_tokens: int = 0) -> int:
+    if max_tokens <= 0 or len(example.input_ids) <= max_tokens:
+        return len(example.input_ids)
+    return max_tokens
+
+
+def _truncated_row_length(*, example: TrainExample, max_tokens: int = 0) -> int:
+    if _is_overlength(example=example, max_tokens=max_tokens):
+        raise ValueError("Over-length examples should be dropped before logprob row construction.")
+    return len(example.input_ids)
+
+
+def _current_logprob_rows_from_token_logprobs(
+    *,
+    token_logprobs: torch.Tensor,
+    batch: list[TrainExample],
+    max_tokens: int = 0,
+) -> list[list[float]]:
+    token_logprobs_cpu = token_logprobs.detach().float().cpu()
+    current_logprob_rows = []
+    for row_idx, example in enumerate(batch):
+        row_len = _truncated_row_length(example=example, max_tokens=max_tokens)
+        current_logprob_rows.append(token_logprobs_cpu[row_idx, :row_len].tolist())
+    return current_logprob_rows
+
+
+def _current_logprob_rows_from_selected_logprobs(
+    *,
+    selected_logprobs: torch.Tensor,
+    trained_positions: torch.Tensor,
+    batch: list[TrainExample],
+    max_tokens: int = 0,
+) -> list[list[float]]:
+    selected_logprobs_cpu = selected_logprobs.detach().float().cpu().tolist()
+    trained_positions_cpu = trained_positions.detach().cpu()
+    current_logprob_rows: list[list[float]] = []
+    selected_idx = 0
+    for row_idx, example in enumerate(batch):
+        row_len = _truncated_row_length(example=example, max_tokens=max_tokens)
+        row = [0.0] * row_len
+        active_positions = torch.nonzero(trained_positions_cpu[row_idx, :row_len], as_tuple=False).flatten().tolist()
+        for position in active_positions:
+            row[int(position)] = float(selected_logprobs_cpu[selected_idx])
+            selected_idx += 1
+        current_logprob_rows.append(row)
+    assert selected_idx == len(selected_logprobs_cpu)
+    return current_logprob_rows
+
+
+def _order_batch_for_minibatching(
+    *,
+    batch: list[TrainExample],
+    max_tokens: int = 0,
+    length_bucket_batches: bool = False,
+) -> list[TrainExample]:
+    if not length_bucket_batches:
+        return list(batch)
+    return sorted(batch, key=lambda example: _effective_train_length(example=example, max_tokens=max_tokens))
+
+
+def _patch_weight_converter_compat() -> None:
+    import inspect
+
+    try:
+        import peft.utils.transformers_weight_conversion as weight_conversion
+    except ModuleNotFoundError as exc:
+        if exc.name == "peft.utils.transformers_weight_conversion":
+            return
+        raise
+
+    converter_cls = weight_conversion.WeightConverter
+    signature = inspect.signature(converter_cls.__init__)
+    if "distributed_operation" in signature.parameters:
+        return
+    if getattr(converter_cls, "_llm_local_rl_accepts_peft_ops", False):
+        return
+
+    original_init = converter_cls.__init__
+
+    def patched_init(
+        self,
+        source_patterns,
+        target_patterns,
+        operations,
+        distributed_operation=None,
+        quantization_operation=None,
+    ):
+        original_init(
+            self,
+            source_patterns=source_patterns,
+            target_patterns=target_patterns,
+            operations=operations,
+        )
+        self.distributed_operation = distributed_operation
+        self.quantization_operation = quantization_operation
+
+    converter_cls.__init__ = patched_init
+    converter_cls._llm_local_rl_accepts_peft_ops = True
+
+
+def _is_configured_adapter_parameter(*, parameter_name: str, adapter_names: tuple[AdapterName, ...]) -> bool:
+    name_parts = parameter_name.split(".")
+    return any(adapter_name in name_parts for adapter_name in adapter_names)
+
+
 class MultiAdapterTrainer:
     def __init__(self, *, config: TrainerConfig) -> None:
         self.config = config
         self.compute_device = "cuda" if config.device == "cuda" and torch.cuda.is_available() else "cpu"
         self.current_device = "cpu"
         self.tokenizer = self._load_tokenizer(base_model_path=config.base_model_path)
+        self.saved_adapter_dirs: dict[AdapterName, str] = {}
+        self.single_target_parameter_adapter_mode = False
+        self.loaded_adapter_name: AdapterName | None = None
+        _patch_weight_converter_compat()
         self.model = self._build_new_model()
         self.optimizer = self._build_optimizer()
+        self._mem_rec: MemoryTraceRecorder | None = maybe_create_recorder()
+
+    def _mem_trace_active(self) -> bool:
+        return self._mem_rec is not None and self.compute_device == "cuda"
+
+    def _write_on_policy_logprob_records(self, *, records: list[dict]) -> None:
+        if self.config.on_policy_logprob_warning_path is None:
+            return
+        path = Path(self.config.on_policy_logprob_warning_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            for record in records:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _causal_lm_for_selective_lm_head(self):
+        causal_lm = self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
+        if not hasattr(causal_lm, "model"):
+            raise ValueError(
+                "train_logprob_backend='selective_lm_head' requires a Hugging Face causal LM with a .model backbone."
+            )
+        if not hasattr(causal_lm, "get_output_embeddings"):
+            raise ValueError(
+                "train_logprob_backend='selective_lm_head' requires get_output_embeddings() for lm_head access."
+            )
+        lm_head = causal_lm.get_output_embeddings()
+        if lm_head is None:
+            raise ValueError("train_logprob_backend='selective_lm_head' could not resolve lm_head.")
+        return causal_lm
+
+    def _selective_lm_head_hidden_states(self, *, tensors: dict[str, torch.Tensor]) -> torch.Tensor:
+        causal_lm = self._causal_lm_for_selective_lm_head()
+        outputs = causal_lm.model(
+            input_ids=tensors["input_ids"],
+            attention_mask=tensors["attention_mask"],
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden_states = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+        if hidden_states.shape[:2] != tensors["input_ids"].shape:
+            raise ValueError(
+                f"Backbone hidden prefix {tuple(hidden_states.shape[:2])} does not match input_ids "
+                f"{tuple(tensors['input_ids'].shape)}."
+            )
+        return hidden_states
+
+    def _selective_lm_head_logprobs(
+        self,
+        *,
+        tensors: dict[str, torch.Tensor],
+        trained_positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, float]:
+        hidden_states = self._selective_lm_head_hidden_states(tensors=tensors)
+        lm_head = self._causal_lm_for_selective_lm_head().get_output_embeddings()
+        return _selected_lm_head_token_logprobs(
+            hidden_states=hidden_states,
+            lm_head=lm_head,
+            target_ids=tensors["target_ids"],
+            trained_positions=trained_positions,
+            compile_helper=self.config.compile_train_logprob_helper,
+        )
 
     @classmethod
     def from_saved_adapters(
@@ -108,6 +459,10 @@ class MultiAdapterTrainer:
         trainer.compute_device = "cuda" if config.device == "cuda" and torch.cuda.is_available() else "cpu"
         trainer.current_device = "cpu"
         trainer.tokenizer = trainer._load_tokenizer(base_model_path=config.base_model_path)
+        trainer.saved_adapter_dirs = dict(adapter_dirs)
+        trainer.single_target_parameter_adapter_mode = _uses_target_parameter_adapters(adapter_dirs=adapter_dirs)
+        trainer.loaded_adapter_name = None
+        _patch_weight_converter_compat()
         first_name = config.adapter_names[0]
         first_dir = adapter_dirs[first_name]
 
@@ -119,13 +474,16 @@ class MultiAdapterTrainer:
             adapter_name=first_name,
             is_trainable=True,
         )
-        for adapter_name in config.adapter_names[1:]:
-            model.load_adapter(adapter_dirs[adapter_name], adapter_name=adapter_name, is_trainable=True)
+        if not trainer.single_target_parameter_adapter_mode:
+            for adapter_name in config.adapter_names[1:]:
+                model.load_adapter(adapter_dirs[adapter_name], adapter_name=adapter_name, is_trainable=True)
         model.set_adapter(first_name)
         model.train()
         model.to(torch.device("cpu"))
         trainer.model = model
+        trainer.loaded_adapter_name = first_name
         trainer.optimizer = trainer._build_optimizer()
+        trainer._mem_rec: MemoryTraceRecorder | None = maybe_create_recorder()
         return trainer
 
     @staticmethod
@@ -143,7 +501,7 @@ class MultiAdapterTrainer:
             torch_dtype=_resolve_dtype(self.config.torch_dtype),
         )
         base_model.config.use_cache = False
-        if hasattr(base_model, "gradient_checkpointing_enable"):
+        if self.config.gradient_checkpointing and hasattr(base_model, "gradient_checkpointing_enable"):
             base_model.gradient_checkpointing_enable()
         if hasattr(base_model, "enable_input_require_grads"):
             base_model.enable_input_require_grads()
@@ -159,6 +517,7 @@ class MultiAdapterTrainer:
             bias="none",
             task_type="CAUSAL_LM",
             target_modules=list(self.config.target_modules),
+            target_parameters=list(self.config.target_parameters),
         )
         model = get_peft_model(base_model, lora_config, adapter_name=self.config.adapter_names[0])
         for adapter_name in self.config.adapter_names[1:]:
@@ -169,8 +528,16 @@ class MultiAdapterTrainer:
         return model
 
     def _build_optimizer(self):
-        params = [param for param in self.model.parameters() if param.requires_grad]
-        return torch.optim.AdamW(params, lr=self.config.learning_rate)
+        params = [
+            param
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+            or _is_configured_adapter_parameter(
+                parameter_name=name,
+                adapter_names=self.config.adapter_names,
+            )
+        ]
+        return torch.optim.AdamW(params, lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
 
     def _move_optimizer_state(self, *, device: str) -> None:
         for state in self.optimizer.state.values():
@@ -195,12 +562,32 @@ class MultiAdapterTrainer:
         self.current_device = "cpu"
 
     def set_adapter(self, adapter_name: AdapterName) -> None:
+        if self.single_target_parameter_adapter_mode:
+            self._load_single_target_parameter_adapter(adapter_name=adapter_name)
         self.model.set_adapter(adapter_name)
+
+    def _load_single_target_parameter_adapter(self, *, adapter_name: AdapterName) -> None:
+        if self.loaded_adapter_name == adapter_name:
+            return
+        if self.loaded_adapter_name is not None and self.loaded_adapter_name in self.model.peft_config:
+            self.model.delete_adapter(self.loaded_adapter_name)
+        self.model.load_adapter(self.saved_adapter_dirs[adapter_name], adapter_name=adapter_name, is_trainable=True)
+        self.model.set_adapter(adapter_name)
+        self.loaded_adapter_name = adapter_name
+        self.optimizer = self._build_optimizer()
 
     def compute_logprobs(self, *, adapter_name: AdapterName, batch: list[TrainExample]) -> list[list[float]]:
         self.wake_up()
         self.set_adapter(adapter_name)
         self.model.eval()
+        if (
+            self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD
+            and is_model_io_tracing_enabled()
+        ):
+            raise ValueError(
+                "train_logprob_backend='selective_lm_head' does not support model I/O tracing; "
+                "disable trace_model_io before calling compute_logprobs."
+            )
         tensors = _pad_batch(
             batch=batch,
             pad_token_id=int(self.tokenizer.pad_token_id),
@@ -208,114 +595,370 @@ class MultiAdapterTrainer:
             max_tokens=self.config.train_max_tokens,
         )
         with torch.no_grad():
-            outputs = self.model(
-                input_ids=tensors["input_ids"],
-                attention_mask=tensors["attention_mask"],
-            )
-            log_probs = torch.log_softmax(outputs.logits.float(), dim=-1)
-            token_logprobs = log_probs.gather(
-                dim=-1,
-                index=tensors["target_ids"].unsqueeze(-1),
-            ).squeeze(-1)
-            if is_model_io_tracing_enabled():
-                trace_top_k = get_trace_top_logprobs()
-                top_values = None
-                top_indices = None
-                if trace_top_k > 0:
-                    top_values, top_indices = torch.topk(
-                        log_probs,
-                        k=min(trace_top_k, int(log_probs.shape[-1])),
-                        dim=-1,
-                    )
-                get_model_io_tracer().record_trainer_forward(
-                    phase="trainer_logprobs",
-                    boundary="llm_local_rl.trainer.MultiAdapterTrainer.compute_logprobs",
-                    adapter_name=adapter_name,
-                    batch=batch,
-                    tensors=tensors,
-                    minibatch_start=0,
-                    token_logprobs=token_logprobs,
-                    top_token_ids=top_indices,
-                    top_logprobs=top_values,
+            if self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_FULL_LOGITS:
+                outputs = self.model(
+                    input_ids=tensors["input_ids"],
+                    attention_mask=tensors["attention_mask"],
                 )
-
-        out: list[list[float]] = []
-        for row_idx, example in enumerate(batch):
-            n = len(example.input_ids)
-            out.append(token_logprobs[row_idx, :n].detach().cpu().tolist())
+                token_logprobs = _target_token_logprobs(logits=outputs.logits, target_ids=tensors["target_ids"])
+                if is_model_io_tracing_enabled():
+                    trace_top_k = get_trace_top_logprobs()
+                    top_values = None
+                    top_indices = None
+                    if trace_top_k > 0:
+                        log_probs = torch.log_softmax(outputs.logits.float(), dim=-1)
+                        top_values, top_indices = torch.topk(
+                            log_probs,
+                            k=min(trace_top_k, int(log_probs.shape[-1])),
+                            dim=-1,
+                        )
+                    get_model_io_tracer().record_trainer_forward(
+                        phase="trainer_logprobs",
+                        boundary="llm_local_rl.trainer.MultiAdapterTrainer.compute_logprobs",
+                        adapter_name=adapter_name,
+                        batch=batch,
+                        tensors=tensors,
+                        minibatch_start=0,
+                        token_logprobs=token_logprobs,
+                        top_token_ids=top_indices,
+                        top_logprobs=top_values,
+                    )
+                out = _current_logprob_rows_from_token_logprobs(
+                    token_logprobs=token_logprobs,
+                    batch=batch,
+                    max_tokens=self.config.train_max_tokens,
+                )
+            elif self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD:
+                trained_positions = tensors["loss_mask"] & (tensors["advantages"] != 0.0)
+                trained_tokens = int(trained_positions.sum().detach().cpu().item())
+                if trained_tokens > 0:
+                    selected_logprobs, _ = self._selective_lm_head_logprobs(
+                        tensors=tensors,
+                        trained_positions=trained_positions,
+                    )
+                else:
+                    selected_logprobs = tensors["old_logprobs"].new_empty((0,), dtype=torch.float32)
+                out = _current_logprob_rows_from_selected_logprobs(
+                    selected_logprobs=selected_logprobs,
+                    trained_positions=trained_positions,
+                    batch=batch,
+                    max_tokens=self.config.train_max_tokens,
+                )
+            else:
+                raise ValueError(f"Unsupported train_logprob_backend={self.config.train_logprob_backend!r}.")
         self.model.train()
         return out
 
-    def train_batch(self, *, adapter_name: AdapterName, batch: list[TrainExample]) -> dict[str, float]:
+    def train_batch(self, *, adapter_name: AdapterName, batch: list[TrainExample]) -> dict[str, object]:
         if len(batch) == 0:
-            return {"loss": 0.0, "num_examples": 0.0, "num_trained_tokens": 0.0}
+            return {
+                "loss": 0.0,
+                "loss_per_trained_token": 0.0,
+                "num_examples": 0.0,
+                "num_input_examples": 0.0,
+                "num_dropped_overlength": 0.0,
+                "num_trained_tokens": 0.0,
+                "train_logprob_backend": self.config.train_logprob_backend,
+                "train_logprob_backend_is_selective_lm_head": float(
+                    self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD
+                ),
+            }
+        if (
+            self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD
+            and is_model_io_tracing_enabled()
+        ):
+            raise ValueError(
+                "train_logprob_backend='selective_lm_head' does not support model I/O tracing; "
+                "disable trace_model_io for this training run."
+            )
+
+        trainable_batch, num_dropped_overlength = _drop_overlength_examples(
+            batch=batch,
+            max_tokens=self.config.train_max_tokens,
+        )
+        if len(trainable_batch) == 0:
+            raise ValueError(
+                "All train samples exceed train_max_tokens; "
+                f"dropped {num_dropped_overlength} of {len(batch)} examples "
+                f"(train_max_tokens={self.config.train_max_tokens})."
+            )
 
         self.wake_up()
         self.set_adapter(adapter_name)
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        minibatch_size = self.config.train_minibatch_size if self.config.train_minibatch_size > 0 else len(batch)
+        minibatch_size = (
+            self.config.train_minibatch_size if self.config.train_minibatch_size > 0 else len(trainable_batch)
+        )
+        ordered_batch = _order_batch_for_minibatching(
+            batch=trainable_batch,
+            max_tokens=self.config.train_max_tokens,
+            length_bucket_batches=self.config.train_length_bucket_batches and minibatch_size < len(trainable_batch),
+        )
+        normalization_sample_count = len(ordered_batch)
         total_loss_value = 0.0
         total_trained_tokens = 0
         approx_kl_numerator = 0.0
-        for start_idx in range(0, len(batch), minibatch_size):
-            minibatch = batch[start_idx : start_idx + minibatch_size]
+        total_forward_input_tokens = 0
+        total_padded_input_tokens = 0
+        total_lm_head_positions = 0
+        total_minibatches = 0
+        on_policy_checked_tokens = 0
+        on_policy_zero_advantage_loss_mask_tokens_skipped = 0
+        on_policy_violations = 0
+        on_policy_sum_abs_diff = 0.0
+        on_policy_max_abs_diff = 0.0
+        ratio_values: list[float] = []
+        clip_count = 0
+        positive_adv_clip_count = 0
+        negative_adv_clip_count = 0
+        positive_adv_count = 0
+        negative_adv_count = 0
+        entropy_sum = 0.0
+        mem_step_idx = -1
+        if self._mem_trace_active():
+            mem_step_idx = self._mem_rec.next_step()
+        for start_idx in range(0, len(ordered_batch), minibatch_size):
+            minibatch = ordered_batch[start_idx : start_idx + minibatch_size]
+            if self._mem_trace_active():
+                reset_peak(self.compute_device)
+                _mem_t_start = now_seconds()
+                _mem_alloc_before_mb = current_alloc_bytes(self.compute_device)
+                self._mem_rec.maybe_capture_weights_baseline(_mem_alloc_before_mb)
+            else:
+                _mem_t_start = 0.0
+                _mem_alloc_before_mb = 0
             tensors = _pad_batch(
                 batch=minibatch,
                 pad_token_id=int(self.tokenizer.pad_token_id),
                 device=self.current_device,
                 max_tokens=self.config.train_max_tokens,
             )
-            outputs = self.model(
-                input_ids=tensors["input_ids"],
-                attention_mask=tensors["attention_mask"],
-            )
-            log_probs = torch.log_softmax(outputs.logits.float(), dim=-1)
-            token_logprobs = log_probs.gather(
-                dim=-1,
-                index=tensors["target_ids"].unsqueeze(-1),
-            ).squeeze(-1)
-            if is_model_io_tracing_enabled():
-                trace_top_k = get_trace_top_logprobs()
-                top_values = None
-                top_indices = None
-                if trace_top_k > 0:
-                    top_values, top_indices = torch.topk(
-                        log_probs,
-                        k=min(trace_top_k, int(log_probs.shape[-1])),
-                        dim=-1,
-                    )
-                get_model_io_tracer().record_trainer_forward(
-                    phase="trainer_forward",
-                    boundary="llm_local_rl.trainer.MultiAdapterTrainer.train_batch",
-                    adapter_name=adapter_name,
-                    batch=minibatch,
-                    tensors=tensors,
-                    minibatch_start=start_idx,
-                    token_logprobs=token_logprobs,
-                    top_token_ids=top_indices,
-                    top_logprobs=top_values,
-                )
-
+            total_minibatches += 1
+            total_forward_input_tokens += int(tensors["attention_mask"].sum().detach().cpu().item())
+            total_padded_input_tokens += int(tensors["input_ids"].numel())
             trained_positions = tensors["loss_mask"] & (tensors["advantages"] != 0.0)
-            if not torch.any(trained_positions):
+            trained_tokens = int(trained_positions.sum().detach().cpu().item())
+
+            _mem_alloc_after_forward_full = ""
+            _mem_peak_after_forward_full = ""
+            _mem_alloc_after_backbone_sel = ""
+            _mem_peak_after_backbone_sel = ""
+            _mem_alloc_after_lm_head_sel = ""
+            _mem_peak_after_lm_head_sel = ""
+            _mem_elapsed_forward = 0.0
+            _mem_elapsed_lm_head = 0.0
+
+            if self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_FULL_LOGITS:
+                if self._mem_trace_active():
+                    reset_peak(self.compute_device)
+                    _mem_t_forward = now_seconds()
+                outputs = self.model(
+                    input_ids=tensors["input_ids"],
+                    attention_mask=tensors["attention_mask"],
+                )
+                total_lm_head_positions += int(tensors["input_ids"].numel())
+                token_logprobs = _target_token_logprobs(logits=outputs.logits, target_ids=tensors["target_ids"])
+                selected_logprobs = token_logprobs[trained_positions]
+                selected_entropy_sum = 0.0
+                if trained_tokens > 0:
+                    with torch.no_grad():
+                        trained_log_probs = torch.log_softmax(outputs.logits[trained_positions].float(), dim=-1)
+                        selected_entropy_sum = float(
+                            (-(trained_log_probs.exp() * trained_log_probs).sum(dim=-1)).sum().detach().cpu().item()
+                        )
+                if self._mem_trace_active():
+                    _mem_alloc_after_forward_full = current_alloc_bytes(self.compute_device)
+                    _mem_peak_after_forward_full = peak_alloc_bytes(self.compute_device)
+                    _mem_elapsed_forward = now_seconds() - _mem_t_forward
+                if self.config.on_policy_logprob_check:
+                    current_logprob_rows = _current_logprob_rows_from_token_logprobs(
+                        token_logprobs=token_logprobs,
+                        batch=minibatch,
+                        max_tokens=self.config.train_max_tokens,
+                    )
+                if is_model_io_tracing_enabled():
+                    trace_top_k = get_trace_top_logprobs()
+                    top_values = None
+                    top_indices = None
+                    if trace_top_k > 0:
+                        log_probs = torch.log_softmax(outputs.logits.float(), dim=-1)
+                        top_values, top_indices = torch.topk(
+                            log_probs,
+                            k=min(trace_top_k, int(log_probs.shape[-1])),
+                            dim=-1,
+                        )
+                    get_model_io_tracer().record_trainer_forward(
+                        phase="trainer_forward",
+                        boundary="llm_local_rl.trainer.MultiAdapterTrainer.train_batch",
+                        adapter_name=adapter_name,
+                        batch=minibatch,
+                        tensors=tensors,
+                        minibatch_start=start_idx,
+                        token_logprobs=token_logprobs,
+                        top_token_ids=top_indices,
+                        top_logprobs=top_values,
+                    )
+            elif self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD:
+                total_lm_head_positions += trained_tokens
+                if trained_tokens > 0:
+                    if self._mem_trace_active():
+                        reset_peak(self.compute_device)
+                        _mem_t_forward = now_seconds()
+                    hidden_states = self._selective_lm_head_hidden_states(tensors=tensors)
+                    if self._mem_trace_active():
+                        _mem_alloc_after_backbone_sel = current_alloc_bytes(self.compute_device)
+                        _mem_peak_after_backbone_sel = peak_alloc_bytes(self.compute_device)
+                        _mem_elapsed_forward = now_seconds() - _mem_t_forward
+                        reset_peak(self.compute_device)
+                        _mem_t_lm_head = now_seconds()
+                    lm_head = self._causal_lm_for_selective_lm_head().get_output_embeddings()
+                    selected_logprobs, selected_entropy_sum = _selected_lm_head_token_logprobs(
+                        hidden_states=hidden_states,
+                        lm_head=lm_head,
+                        target_ids=tensors["target_ids"],
+                        trained_positions=trained_positions,
+                        compile_helper=self.config.compile_train_logprob_helper,
+                    )
+                    if self._mem_trace_active():
+                        _mem_alloc_after_lm_head_sel = current_alloc_bytes(self.compute_device)
+                        _mem_peak_after_lm_head_sel = peak_alloc_bytes(self.compute_device)
+                        _mem_elapsed_lm_head = now_seconds() - _mem_t_lm_head
+                else:
+                    selected_logprobs = tensors["old_logprobs"].new_empty((0,), dtype=torch.float32)
+                    selected_entropy_sum = 0.0
+                if self.config.on_policy_logprob_check:
+                    current_logprob_rows = _current_logprob_rows_from_selected_logprobs(
+                        selected_logprobs=selected_logprobs,
+                        trained_positions=trained_positions,
+                        batch=minibatch,
+                        max_tokens=self.config.train_max_tokens,
+                    )
+            else:
+                raise ValueError(f"Unsupported train_logprob_backend={self.config.train_logprob_backend!r}.")
+
+            if self.config.on_policy_logprob_check:
+                check_result = check_on_policy_logprobs(
+                    adapter_name=adapter_name,
+                    examples=minibatch,
+                    current_logprob_rows=current_logprob_rows,
+                    tokenizer=self.tokenizer,
+                    abs_tol=self.config.on_policy_logprob_abs_tol,
+                    max_tokens=self.config.train_max_tokens,
+                    max_records=self.config.on_policy_logprob_max_records_per_batch,
+                    minibatch_start=start_idx,
+                )
+                on_policy_checked_tokens += check_result.num_checked_tokens
+                on_policy_zero_advantage_loss_mask_tokens_skipped += (
+                    check_result.num_zero_advantage_loss_mask_tokens_skipped
+                )
+                on_policy_violations += check_result.num_violations
+                on_policy_sum_abs_diff += check_result.sum_abs_logprob_diff
+                on_policy_max_abs_diff = max(on_policy_max_abs_diff, check_result.max_abs_logprob_diff)
+                if check_result.records:
+                    self._write_on_policy_logprob_records(records=check_result.records)
+                if check_result.num_violations > 0:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "on_policy_logprob_warning",
+                                "adapter_name": adapter_name,
+                                "minibatch_start": start_idx,
+                                "checked_tokens": check_result.num_checked_tokens,
+                                "trained_tokens_checked": check_result.num_checked_tokens,
+                                "zero_advantage_loss_mask_tokens_skipped": (
+                                    check_result.num_zero_advantage_loss_mask_tokens_skipped
+                                ),
+                                "violations": check_result.num_violations,
+                                "max_abs_diff": check_result.max_abs_logprob_diff,
+                                "trained_token_max_abs_diff": check_result.max_abs_logprob_diff,
+                                "mean_abs_diff": (
+                                    check_result.sum_abs_logprob_diff / check_result.num_checked_tokens
+                                    if check_result.num_checked_tokens > 0
+                                    else 0.0
+                                ),
+                                "trained_token_mean_abs_diff": (
+                                    check_result.sum_abs_logprob_diff / check_result.num_checked_tokens
+                                    if check_result.num_checked_tokens > 0
+                                    else 0.0
+                                ),
+                                "first_offending_trained_token": check_result.first_offending_trained_token,
+                                "warning_path": self.config.on_policy_logprob_warning_path,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+            if trained_tokens == 0:
                 continue
 
-            ratio = torch.exp(token_logprobs[trained_positions] - tensors["old_logprobs"][trained_positions])
+            old_logprobs = tensors["old_logprobs"][trained_positions]
+            ratio = torch.exp(selected_logprobs - old_logprobs)
             clipped_ratio = torch.clamp(
                 ratio,
                 min=1.0 - self.config.ppo_clip_epsilon,
                 max=1.0 + self.config.ppo_clip_epsilon,
             )
             advantages = tensors["advantages"][trained_positions]
+            with torch.no_grad():
+                ratio_detached = ratio.detach().float()
+                ratio_values.extend(ratio_detached.cpu().tolist())
+                clipped_positions = (
+                    (ratio_detached < (1.0 - self.config.ppo_clip_epsilon))
+                    | (ratio_detached > (1.0 + self.config.ppo_clip_epsilon))
+                )
+                positive_adv_positions = advantages.detach() > 0.0
+                negative_adv_positions = advantages.detach() < 0.0
+                clip_count += int(clipped_positions.sum().detach().cpu().item())
+                positive_adv_count += int(positive_adv_positions.sum().detach().cpu().item())
+                negative_adv_count += int(negative_adv_positions.sum().detach().cpu().item())
+                positive_adv_clip_count += int(
+                    (clipped_positions & positive_adv_positions).sum().detach().cpu().item()
+                )
+                negative_adv_clip_count += int(
+                    (clipped_positions & negative_adv_positions).sum().detach().cpu().item()
+                )
+                entropy_sum += selected_entropy_sum
             objective = torch.minimum(ratio * advantages, clipped_ratio * advantages)
-            loss = torch.sum(-objective)
+            loss = torch.sum(-objective) / normalization_sample_count
+            if self._mem_trace_active():
+                reset_peak(self.compute_device)
+                _mem_t_backward = now_seconds()
             loss.backward()
-            trained_tokens = int(trained_positions.sum().item())
+            if self._mem_trace_active():
+                _mem_alloc_after_backward = current_alloc_bytes(self.compute_device)
+                _mem_peak_after_backward = peak_alloc_bytes(self.compute_device)
+                _mem_elapsed_backward = now_seconds() - _mem_t_backward
+                seq_len_max = int(tensors["input_ids"].shape[1])
+                self._mem_rec.append(
+                    {
+                        "step": mem_step_idx,
+                        "adapter_name": adapter_name,
+                        "minibatch_idx": total_minibatches - 1,
+                        "seq_len_max": seq_len_max,
+                        "num_examples": len(minibatch),
+                        "num_trained_tokens": trained_tokens,
+                        "num_padded_positions": int(tensors["input_ids"].numel()),
+                        "train_logprob_backend": self.config.train_logprob_backend,
+                        "alloc_before_mb": _mem_alloc_before_mb,
+                        "alloc_after_forward_full_logits": _mem_alloc_after_forward_full,
+                        "peak_after_forward_full_logits": _mem_peak_after_forward_full,
+                        "alloc_after_backbone_selective": _mem_alloc_after_backbone_sel,
+                        "peak_after_backbone_selective": _mem_peak_after_backbone_sel,
+                        "alloc_after_lm_head_selective": _mem_alloc_after_lm_head_sel,
+                        "peak_after_lm_head_selective": _mem_peak_after_lm_head_sel,
+                        "alloc_after_backward": _mem_alloc_after_backward,
+                        "peak_after_backward": _mem_peak_after_backward,
+                        "wall_clock_s": now_seconds() - _mem_t_start,
+                        "phase_elapsed_forward_s": _mem_elapsed_forward,
+                        "phase_elapsed_lm_head_s": _mem_elapsed_lm_head,
+                        "phase_elapsed_backward_s": _mem_elapsed_backward,
+                    }
+                )
             total_trained_tokens += trained_tokens
             total_loss_value += float(loss.detach().cpu().item())
             approx_kl_numerator += float(
-                torch.sum(tensors["old_logprobs"][trained_positions] - token_logprobs[trained_positions])
+                torch.sum(old_logprobs - selected_logprobs)
                 .detach()
                 .cpu()
                 .item()
@@ -323,15 +966,172 @@ class MultiAdapterTrainer:
 
         if total_trained_tokens == 0:
             self.optimizer.zero_grad(set_to_none=True)
-            return {"loss": 0.0, "num_examples": float(len(batch)), "num_trained_tokens": 0.0}
+            return {
+                "loss": 0.0,
+                "loss_per_trained_token": 0.0,
+                "num_examples": float(len(ordered_batch)),
+                "num_input_examples": float(len(batch)),
+                "num_dropped_overlength": float(num_dropped_overlength),
+                "num_trained_tokens": 0.0,
+                "on_policy_logprob_checked_tokens": float(on_policy_checked_tokens),
+                "trained_tokens_checked": float(on_policy_checked_tokens),
+                "zero_advantage_loss_mask_tokens_skipped": float(
+                    on_policy_zero_advantage_loss_mask_tokens_skipped
+                ),
+                "trained_token_mean_abs_diff": (
+                    on_policy_sum_abs_diff / on_policy_checked_tokens
+                    if on_policy_checked_tokens > 0
+                    else 0.0
+                ),
+                "trained_token_max_abs_diff": float(on_policy_max_abs_diff),
+                "on_policy_logprob_trained_tokens_checked": float(on_policy_checked_tokens),
+                "on_policy_logprob_zero_advantage_loss_mask_tokens_skipped": float(
+                    on_policy_zero_advantage_loss_mask_tokens_skipped
+                ),
+                "on_policy_logprob_trained_token_mean_abs_diff": (
+                    on_policy_sum_abs_diff / on_policy_checked_tokens
+                    if on_policy_checked_tokens > 0
+                    else 0.0
+                ),
+                "on_policy_logprob_trained_token_max_abs_diff": float(on_policy_max_abs_diff),
+                "on_policy_logprob_violations": float(on_policy_violations),
+                "on_policy_logprob_mean_abs_diff": (
+                    on_policy_sum_abs_diff / on_policy_checked_tokens
+                    if on_policy_checked_tokens > 0
+                    else 0.0
+                ),
+                "on_policy_logprob_max_abs_diff": float(on_policy_max_abs_diff),
+                "ratio_mean": 0.0,
+                "ratio_p95": 0.0,
+                "ratio_p99": 0.0,
+                "clipfrac": 0.0,
+                "clipfrac_positive_advantage": 0.0,
+                "clipfrac_negative_advantage": 0.0,
+                "entropy": 0.0,
+                "grad_norm": 0.0,
+                "weight_decay": float(self.config.weight_decay),
+                "max_grad_norm": float(self.config.max_grad_norm),
+                "num_forward_input_tokens": float(total_forward_input_tokens),
+                "num_padded_input_tokens": float(total_padded_input_tokens),
+                "num_train_minibatches": float(total_minibatches),
+                "train_logprob_backend": self.config.train_logprob_backend,
+                "train_logprob_backend_is_selective_lm_head": float(
+                    self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD
+                ),
+                "compile_train_logprob_helper": float(self.config.compile_train_logprob_helper),
+                "lm_head_positions": float(total_lm_head_positions),
+                "lm_head_positions_avoided": float(total_padded_input_tokens - total_lm_head_positions),
+                "lm_head_position_fraction": (
+                    total_lm_head_positions / total_padded_input_tokens if total_padded_input_tokens > 0 else 0.0
+                ),
+            }
 
+        grad_params = [param for param in self.model.parameters() if param.requires_grad and param.grad is not None]
+        if grad_params:
+            clip_limit = self.config.max_grad_norm if self.config.max_grad_norm > 0.0 else math.inf
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(grad_params, max_norm=clip_limit).detach().cpu().item()
+            )
+        else:
+            grad_norm = 0.0
+        if self._mem_trace_active():
+            reset_peak(self.compute_device)
         self.optimizer.step()
+        if self._mem_trace_active():
+            alloc_after_optim = current_alloc_bytes(self.compute_device)
+            peak_after_optim = peak_alloc_bytes(self.compute_device)
+            self._mem_rec.maybe_capture_optim_state_baseline(alloc_after_optim)
+            # Append one "optim-step summary row" tagged minibatch_idx=-1
+            # per train_batch. Mirrors nvidia-smi peak-after-step intent and
+            # lets the plot script draw the optimizer/state baseline band.
+            self._mem_rec.append(
+                {
+                    "step": mem_step_idx,
+                    "adapter_name": adapter_name,
+                    "minibatch_idx": -1,
+                    "seq_len_max": 0,
+                    "num_examples": 0,
+                    "num_trained_tokens": total_trained_tokens,
+                    "num_padded_positions": total_padded_input_tokens,
+                    "train_logprob_backend": self.config.train_logprob_backend,
+                    "alloc_after_optim_step": alloc_after_optim,
+                    "peak_during_optim_step": peak_after_optim,
+                    "reserved_bytes_end": reserved_bytes(self.compute_device),
+                    "wall_clock_s": 0.0,
+                }
+            )
+
+        sorted_ratios = sorted(ratio_values)
+
+        def _percentile(sorted_values: list[float], q: float) -> float:
+            if not sorted_values:
+                return 0.0
+            idx = min(len(sorted_values) - 1, max(0, math.ceil(q * len(sorted_values)) - 1))
+            return float(sorted_values[idx])
 
         return {
             "loss": total_loss_value,
-            "num_examples": float(len(batch)),
+            "loss_per_trained_token": total_loss_value / total_trained_tokens,
+            "num_examples": float(len(ordered_batch)),
+            "num_input_examples": float(len(batch)),
+            "num_dropped_overlength": float(num_dropped_overlength),
             "num_trained_tokens": float(total_trained_tokens),
             "approx_kl": approx_kl_numerator / total_trained_tokens,
+            "ratio_mean": float(sum(ratio_values) / len(ratio_values)) if ratio_values else 0.0,
+            "ratio_p95": _percentile(sorted_ratios, 0.95),
+            "ratio_p99": _percentile(sorted_ratios, 0.99),
+            "clipfrac": clip_count / total_trained_tokens,
+            "clipfrac_positive_advantage": (
+                positive_adv_clip_count / positive_adv_count if positive_adv_count > 0 else 0.0
+            ),
+            "clipfrac_negative_advantage": (
+                negative_adv_clip_count / negative_adv_count if negative_adv_count > 0 else 0.0
+            ),
+            "entropy": entropy_sum / total_trained_tokens,
+            "grad_norm": grad_norm,
+            "weight_decay": float(self.config.weight_decay),
+            "max_grad_norm": float(self.config.max_grad_norm),
+            "num_forward_input_tokens": float(total_forward_input_tokens),
+            "num_padded_input_tokens": float(total_padded_input_tokens),
+            "num_train_minibatches": float(total_minibatches),
+            "train_logprob_backend": self.config.train_logprob_backend,
+            "train_logprob_backend_is_selective_lm_head": float(
+                self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD
+            ),
+            "compile_train_logprob_helper": float(self.config.compile_train_logprob_helper),
+            "lm_head_positions": float(total_lm_head_positions),
+            "lm_head_positions_avoided": float(total_padded_input_tokens - total_lm_head_positions),
+            "lm_head_position_fraction": (
+                total_lm_head_positions / total_padded_input_tokens if total_padded_input_tokens > 0 else 0.0
+            ),
+            "on_policy_logprob_checked_tokens": float(on_policy_checked_tokens),
+            "trained_tokens_checked": float(on_policy_checked_tokens),
+            "zero_advantage_loss_mask_tokens_skipped": float(
+                on_policy_zero_advantage_loss_mask_tokens_skipped
+            ),
+            "trained_token_mean_abs_diff": (
+                on_policy_sum_abs_diff / on_policy_checked_tokens
+                if on_policy_checked_tokens > 0
+                else 0.0
+            ),
+            "trained_token_max_abs_diff": float(on_policy_max_abs_diff),
+            "on_policy_logprob_trained_tokens_checked": float(on_policy_checked_tokens),
+            "on_policy_logprob_zero_advantage_loss_mask_tokens_skipped": float(
+                on_policy_zero_advantage_loss_mask_tokens_skipped
+            ),
+            "on_policy_logprob_trained_token_mean_abs_diff": (
+                on_policy_sum_abs_diff / on_policy_checked_tokens
+                if on_policy_checked_tokens > 0
+                else 0.0
+            ),
+            "on_policy_logprob_trained_token_max_abs_diff": float(on_policy_max_abs_diff),
+            "on_policy_logprob_violations": float(on_policy_violations),
+            "on_policy_logprob_mean_abs_diff": (
+                on_policy_sum_abs_diff / on_policy_checked_tokens
+                if on_policy_checked_tokens > 0
+                else 0.0
+            ),
+            "on_policy_logprob_max_abs_diff": float(on_policy_max_abs_diff),
         }
 
     def save_adapter(self, *, adapter_name: AdapterName, output_dir: str) -> str:
@@ -341,9 +1141,15 @@ class MultiAdapterTrainer:
         self.model.save_pretrained(str(output_path), selected_adapters=[adapter_name])
         if adapter_name == "default":
             return str(output_path)
-        return str(output_path / adapter_name)
+        saved_path = str(output_path / adapter_name)
+        self.saved_adapter_dirs[adapter_name] = saved_path
+        return saved_path
 
     def load_adapter(self, *, adapter_name: AdapterName, adapter_dir: str) -> None:
+        if self.single_target_parameter_adapter_mode:
+            self.saved_adapter_dirs[adapter_name] = adapter_dir
+            self._load_single_target_parameter_adapter(adapter_name=adapter_name)
+            return
         if adapter_name in self.model.peft_config:
             if not hasattr(self.model, "delete_adapter"):
                 raise NotImplementedError("This PEFT runtime cannot replace an already-loaded adapter in place.")
@@ -364,3 +1170,11 @@ class MultiAdapterTrainer:
                 continue
             out[name] = param.detach().cpu().float().clone()
         return out
+
+
+def _uses_target_parameter_adapters(*, adapter_dirs: dict[AdapterName, str]) -> bool:
+    for adapter_dir in adapter_dirs.values():
+        payload = json.loads((Path(adapter_dir) / "adapter_config.json").read_text())
+        if payload["target_parameters"]:
+            return True
+    return False
