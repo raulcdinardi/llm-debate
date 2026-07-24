@@ -63,6 +63,7 @@ def test_train_config_serializes_one_explicit_behavior_policy_contract() -> None
     ("rollout", "fragment"),
     [
         (RolloutConfig(temperature=0.0), "temperature must be > 0"),
+        (RolloutConfig(temperature=1e-7), "temperature must be at least 1e-06"),
         (RolloutConfig(top_p=0.95), "top_p=0.95"),
         (RolloutConfig(min_p=0.02), "min_p=0.02"),
     ],

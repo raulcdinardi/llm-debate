@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 
 BEHAVIOR_POLICY_CONTRACT_VERSION = 1
+MIN_STOCHASTIC_TEMPERATURE = 1e-6
 BEHAVIOR_POLICY_LOGPROBS = "normalized_behavior_policy_logprobs"
 RAW_MODEL_LOGPROBS = "normalized_raw_model_logprobs"
 TEMPERATURE_SCALED_MODEL_LOGPROBS = "normalized_temperature_scaled_model_logprobs"
@@ -96,6 +97,11 @@ class BehaviorPolicySpec:
         unsupported: list[str] = []
         if float(self.temperature) <= 0.0:
             unsupported.append("temperature must be > 0 for stochastic PPO")
+        elif float(self.temperature) < MIN_STOCHASTIC_TEMPERATURE:
+            unsupported.append(
+                "temperature must be at least "
+                f"{MIN_STOCHASTIC_TEMPERATURE:g} for exact sampler/trainer reconstruction"
+            )
         if float(self.top_p) != 1.0:
             unsupported.append(f"top_p={self.top_p} (only 1.0 is supported)")
         if int(self.top_k) != -1:

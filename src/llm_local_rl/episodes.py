@@ -10,6 +10,7 @@ from llm_local_rl.types import EpisodeSample, EpisodeTurn, SamplingRequest
 @dataclass(frozen=True)
 class SingleTurnEpisodeBuilder:
     adapter_name: str = "shared"
+    validate_behavior_policy_contract: bool = True
 
     def build_and_score(
         self,
@@ -39,7 +40,8 @@ class SingleTurnEpisodeBuilder:
             min_p=min_p,
         )
         result = sampler.sample(request)
-        validate_sampling_result_contract(request=request, result=result)
+        if self.validate_behavior_policy_contract:
+            validate_sampling_result_contract(request=request, result=result)
         reward, reward_metrics = env.score_completion(
             instance=instance,
             tokenizer=tokenizer,

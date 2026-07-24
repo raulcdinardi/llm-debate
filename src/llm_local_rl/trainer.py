@@ -907,11 +907,9 @@ class MultiAdapterTrainer:
                         top_logprobs=top_values,
                     )
             elif self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD:
-                selected_positions = (
-                    tensors["behavior_logprob_mask"]
-                    if self.config.on_policy_logprob_check
-                    else trained_positions
-                )
+                # Config validation makes the fail-closed parity gate mandatory, so
+                # selective scoring always covers every sampled behavior-policy token.
+                selected_positions = tensors["behavior_logprob_mask"]
                 selected_position_count = int(selected_positions.sum().detach().cpu().item())
                 total_lm_head_positions += selected_position_count
                 if selected_position_count > 0:

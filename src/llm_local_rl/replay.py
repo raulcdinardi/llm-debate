@@ -38,12 +38,15 @@ def target_logprobs_from_model(
     input_ids: list[int],
     target_ids: list[int],
     device: str,
+    behavior_temperature: float,
 ) -> torch.Tensor:
+    if float(behavior_temperature) <= 0.0:
+        raise ValueError("behavior_temperature must be > 0 for replay scoring.")
     input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
     target_tensor = torch.tensor([target_ids], dtype=torch.long, device=device)
     attention_mask = torch.ones_like(input_tensor, dtype=torch.long, device=device)
     outputs = model(input_ids=input_tensor, attention_mask=attention_mask)
-    logits = outputs.logits.float()
+    logits = outputs.logits.float() / float(behavior_temperature)
     return torch.log_softmax(logits, dim=-1).gather(
         dim=-1,
         index=target_tensor.unsqueeze(-1),
@@ -55,12 +58,14 @@ def replay_loss_loop(
     model,
     example: TrainExample,
     device: str,
+    behavior_temperature: float,
 ) -> torch.Tensor:
     token_logprobs = target_logprobs_from_model(
         model=model,
         input_ids=example.input_ids,
         target_ids=example.target_ids,
         device=device,
+        behavior_temperature=behavior_temperature,
     )
     old_logprobs = torch.tensor(example.old_logprobs, dtype=torch.float32, device=device)
     advantages = torch.tensor(example.advantages, dtype=torch.float32, device=device)
@@ -89,12 +94,14 @@ def replay_loss_vectorized(
     model,
     example: TrainExample,
     device: str,
+    behavior_temperature: float,
 ) -> torch.Tensor:
     token_logprobs = target_logprobs_from_model(
         model=model,
         input_ids=example.input_ids,
         target_ids=example.target_ids,
         device=device,
+        behavior_temperature=behavior_temperature,
     )
     old_logprobs = torch.tensor(example.old_logprobs, dtype=torch.float32, device=device)
     advantages = torch.tensor(example.advantages, dtype=torch.float32, device=device)
