@@ -18,6 +18,7 @@ def _example() -> TrainExample:
         input_ids=[10, 11, 12, 13, 14],
         target_ids=[11, 12, 13, 14, 15],
         loss_mask=[0, 0, 1, 1, 1],
+        behavior_logprob_mask=[0, 0, 1, 1, 1],
         old_logprobs=[0.0, 0.0, -0.3, -0.4, -0.5],
         advantages=[0.0, 0.0, 0.1, 0.1, 0.1],
         metadata={"instance_id": "case_0", "round_num": 2},
@@ -59,6 +60,7 @@ def test_on_policy_logprob_check_covers_zero_advantage_completion_tokens() -> No
         input_ids=[10, 11, 12, 13, 14],
         target_ids=[11, 12, 13, 14, 15],
         loss_mask=[0, 1, 1, 1, 1],
+        behavior_logprob_mask=[0, 1, 1, 1, 1],
         old_logprobs=[0.0, -99.0, -0.3, -99.0, -0.5],
         advantages=[0.0, 0.0, 0.1, 0.0, 0.1],
         metadata={"instance_id": "case_merged", "rounds_merged": 3},
@@ -94,6 +96,60 @@ def test_on_policy_logprob_check_covers_zero_advantage_completion_tokens() -> No
     assert trained_record["advantage"] == pytest.approx(0.1)
     assert trained_record["trained_token"] is True
     assert trained_record["metadata"]["rounds_merged"] == 3
+
+
+def test_on_policy_logprob_check_excludes_injected_renderer_tokens() -> None:
+    example = TrainExample(
+        adapter_name="debate",
+        input_ids=[10, 11, 12, 13, 14],
+        target_ids=[11, 12, 13, 14, 15],
+        loss_mask=[0, 1, 1, 1, 1],
+        behavior_logprob_mask=[0, 1, 0, 0, 1],
+        old_logprobs=[0.0, -0.3, 0.0, 0.0, -0.5],
+        advantages=[0.0, 0.1, 0.0, 0.0, 0.1],
+        metadata={"instance_id": "case_injected", "rounds_merged": 2},
+    )
+
+    result = check_on_policy_logprobs(
+        adapter_name="debate",
+        examples=[example],
+        current_logprob_rows=[[0.0, -0.3, -99.0, 99.0, -0.5]],
+        tokenizer=FakeTokenizer(),
+        abs_tol=1e-6,
+        max_tokens=0,
+        max_records=8,
+        minibatch_start=0,
+    )
+
+    assert result.num_checked_tokens == 2
+    assert result.num_injected_loss_mask_tokens_skipped == 2
+    assert result.num_violations == 0
+    assert result.metrics()["injected_loss_mask_tokens_skipped"] == 2.0
+    assert result.metrics()["on_policy_logprob_injected_loss_mask_tokens_skipped"] == 2.0
+
+
+def test_on_policy_logprob_check_rejects_trained_token_without_behavior_logprob() -> None:
+    example = TrainExample(
+        adapter_name="debate",
+        input_ids=[10, 11],
+        target_ids=[11, 12],
+        loss_mask=[0, 1],
+        behavior_logprob_mask=[0, 0],
+        old_logprobs=[0.0, 0.0],
+        advantages=[0.0, 0.1],
+    )
+
+    with pytest.raises(ValueError, match="nonzero-advantage token"):
+        check_on_policy_logprobs(
+            adapter_name="debate",
+            examples=[example],
+            current_logprob_rows=[[0.0, 0.0]],
+            tokenizer=FakeTokenizer(),
+            abs_tol=1e-6,
+            max_tokens=0,
+            max_records=8,
+            minibatch_start=0,
+        )
 
 
 def test_on_policy_logprob_check_keeps_first_offender_when_records_disabled() -> None:

@@ -136,9 +136,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--on-policy-logprob-check",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",
         default=True,
-        help="Fail before PPO ratio/backward when rollout and trainer behavior-policy logprobs differ.",
+        help=(
+            "Required fail-closed check before PPO ratio/backward when rollout and trainer "
+            "behavior-policy logprobs differ. This safety gate cannot be disabled."
+        ),
     )
     parser.add_argument("--on-policy-logprob-abs-tol", type=float, default=1e-3)
     parser.add_argument("--on-policy-logprob-warning-path", default=None)

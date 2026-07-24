@@ -11,6 +11,7 @@ class OnPolicyLogprobCheckResult:
     num_checked_tokens: int
     num_trained_tokens_checked: int
     num_zero_advantage_loss_mask_tokens_checked: int
+    num_injected_loss_mask_tokens_skipped: int
     num_violations: int
     num_trained_token_violations: int
     sum_abs_logprob_diff: float
@@ -39,6 +40,9 @@ class OnPolicyLogprobCheckResult:
                 self.num_zero_advantage_loss_mask_tokens_checked
             ),
             "zero_advantage_loss_mask_tokens_skipped": 0.0,
+            "injected_loss_mask_tokens_skipped": float(
+                self.num_injected_loss_mask_tokens_skipped
+            ),
             "trained_token_mean_abs_diff": float(trained_mean_abs),
             "trained_token_max_abs_diff": float(self.trained_token_max_abs_logprob_diff),
             "on_policy_logprob_checked_tokens": float(self.num_checked_tokens),
@@ -53,6 +57,9 @@ class OnPolicyLogprobCheckResult:
                 self.num_zero_advantage_loss_mask_tokens_checked
             ),
             "on_policy_logprob_zero_advantage_loss_mask_tokens_skipped": 0.0,
+            "on_policy_logprob_injected_loss_mask_tokens_skipped": float(
+                self.num_injected_loss_mask_tokens_skipped
+            ),
             "on_policy_logprob_trained_token_mean_abs_diff": float(trained_mean_abs),
             "on_policy_logprob_trained_token_max_abs_diff": float(
                 self.trained_token_max_abs_logprob_diff
@@ -87,6 +94,7 @@ def check_on_policy_logprobs(
     num_checked_tokens = 0
     num_trained_tokens_checked = 0
     num_zero_advantage_loss_mask_tokens_checked = 0
+    num_injected_loss_mask_tokens_skipped = 0
     num_violations = 0
     num_trained_token_violations = 0
     sum_abs_logprob_diff = 0.0
@@ -102,6 +110,7 @@ def check_on_policy_logprobs(
         input_ids = example.input_ids[start:]
         target_ids = example.target_ids[start:]
         loss_mask = example.loss_mask[start:]
+        behavior_logprob_mask = example.behavior_logprob_mask[start:]
         old_logprobs = example.old_logprobs[start:]
         advantages = example.advantages[start:]
         current_logprobs = current_logprob_rows[row_idx]
@@ -109,6 +118,7 @@ def check_on_policy_logprobs(
             len(input_ids)
             == len(target_ids)
             == len(loss_mask)
+            == len(behavior_logprob_mask)
             == len(old_logprobs)
             == len(advantages)
             == len(current_logprobs)
@@ -127,6 +137,13 @@ def check_on_policy_logprobs(
             if not should_check:
                 continue
             advantage = float(advantages[sliced_pos])
+            if not behavior_logprob_mask[sliced_pos]:
+                if advantage != 0.0:
+                    raise ValueError(
+                        "A nonzero-advantage token is missing a behavior-policy logprob."
+                    )
+                num_injected_loss_mask_tokens_skipped += 1
+                continue
             trained_token = advantage != 0.0
             old_logprob = float(old_logprobs[sliced_pos])
             current_logprob = float(current_logprobs[sliced_pos])
@@ -185,6 +202,7 @@ def check_on_policy_logprobs(
         num_checked_tokens=num_checked_tokens,
         num_trained_tokens_checked=num_trained_tokens_checked,
         num_zero_advantage_loss_mask_tokens_checked=num_zero_advantage_loss_mask_tokens_checked,
+        num_injected_loss_mask_tokens_skipped=num_injected_loss_mask_tokens_skipped,
         num_violations=num_violations,
         num_trained_token_violations=num_trained_token_violations,
         sum_abs_logprob_diff=sum_abs_logprob_diff,

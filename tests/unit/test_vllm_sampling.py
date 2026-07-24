@@ -9,6 +9,7 @@ from llm_local_rl.behavior_policy import (
     BEHAVIOR_POLICY_LOGPROBS,
     RAW_MODEL_LOGPROBS,
     TEMPERATURE_SCALED_MODEL_LOGPROBS,
+    UNSPECIFIED_LOGPROBS,
     BehaviorPolicySpec,
 )
 from llm_local_rl import vllm_sampling
@@ -137,6 +138,10 @@ def test_vllm_sampling_params_allow_legacy_versions_without_logprobs_mode(monkey
 
     assert "logprobs_mode" not in params.kwargs
     assert params.kwargs["logprobs"] == 1
+    assert vllm_sampling._completion_logprob_semantics(
+        policy=BehaviorPolicySpec(temperature=1.0),
+        backend_mode="legacy_unverified_logprobs",
+    ) == UNSPECIFIED_LOGPROBS
 
 
 def test_vllm_sampling_params_reject_modern_versions_without_logprobs_mode(monkeypatch) -> None:

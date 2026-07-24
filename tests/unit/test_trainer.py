@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import importlib
@@ -27,6 +28,13 @@ from llm_local_rl.trainer import (
     _truncated_row_length,
 )
 from llm_local_rl.behavior_policy import BehaviorPolicySpec
+from llm_local_rl.debate_parity import (
+    DebateResult,
+    DebateTrajectory,
+    Transition,
+    _merge_transition_pair_with_adv_values,
+    training_datum_to_train_example,
+)
 from llm_local_rl.types import TrainExample
 
 
@@ -62,6 +70,40 @@ class _FakeModel(torch.nn.Module):
         return SimpleNamespace(logits=torch.cat([positive, negative], dim=-1))
 
 
+class _TinyBackbone(torch.nn.Module):
+    def __init__(self, *, vocab_size: int = 64, hidden_size: int = 8) -> None:
+        super().__init__()
+        self.embedding = torch.nn.Embedding(vocab_size, hidden_size)
+
+    def forward(
+        self,
+        *,
+        input_ids,
+        attention_mask,
+        use_cache: bool = False,
+        return_dict: bool = True,
+    ):
+        _ = attention_mask, use_cache, return_dict
+        return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
+
+
+class _TinyCausalModel(torch.nn.Module):
+    def __init__(self, *, vocab_size: int = 64, hidden_size: int = 8) -> None:
+        super().__init__()
+        self.model = _TinyBackbone(vocab_size=vocab_size, hidden_size=hidden_size)
+        self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def forward(self, *, input_ids, attention_mask):
+        hidden_states = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        ).last_hidden_state
+        return SimpleNamespace(logits=self.lm_head(hidden_states))
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
 def _fake_trainer(*, train_max_tokens: int = 0) -> MultiAdapterTrainer:
     trainer = object.__new__(MultiAdapterTrainer)
     trainer.config = TrainerConfig(
@@ -82,12 +124,78 @@ def _fake_trainer(*, train_max_tokens: int = 0) -> MultiAdapterTrainer:
     return trainer
 
 
+def _tiny_causal_trainer(*, backend: str, learning_rate: float = 0.0) -> MultiAdapterTrainer:
+    trainer = object.__new__(MultiAdapterTrainer)
+    trainer.config = TrainerConfig(
+        base_model_path="/tmp/nonexistent_model_for_shape_only",
+        device="cpu",
+        torch_dtype="float32",
+        learning_rate=learning_rate,
+        train_logprob_backend=backend,
+        train_minibatch_size=1,
+        behavior_policy=BehaviorPolicySpec(temperature=0.8),
+        on_policy_logprob_abs_tol=1e-6,
+    )
+    trainer.compute_device = "cpu"
+    trainer.current_device = "cpu"
+    trainer.tokenizer = _FakeTokenizer()
+    trainer.model = _TinyCausalModel()
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=learning_rate)
+    trainer._mem_rec = None
+    trainer.wake_up = lambda: None
+    trainer.set_adapter = lambda adapter_name: None
+    return trainer
+
+
+def _real_merged_debate_example() -> TrainExample:
+    first = Transition(
+        prompt_tokens=[1, 2],
+        completion_tokens=[3, 4],
+        completion_logprobs=[-0.1, -0.2],
+        round_num=2,
+    )
+    second = Transition(
+        prompt_tokens=[1, 2, 3, 4, 5],
+        completion_tokens=[6, 7],
+        completion_logprobs=[-0.3, -0.4],
+        round_num=3,
+    )
+    trajectory = DebateTrajectory(
+        agent="A",
+        transitions=[first, second],
+        frozen_solution="fixed",
+    )
+    debate = DebateResult(
+        question="Q",
+        ground_truth=None,
+        trajectory_a=trajectory,
+        trajectory_b=DebateTrajectory(
+            agent="B",
+            transitions=[first, second],
+            frozen_solution="other",
+        ),
+        verdict="A",
+        judge_reasoning="judge",
+    )
+    datum = _merge_transition_pair_with_adv_values(
+        debate=debate,
+        traj=trajectory,
+        first=first,
+        second=second,
+        first_adv_value=0.25,
+        second_adv_value=0.25,
+        metadata={"rounds_merged": 2},
+    )
+    return training_datum_to_train_example(datum=datum, adapter_name="debate")
+
+
 def test_pad_batch_rejects_overlength_instead_of_truncating() -> None:
     example = TrainExample(
         adapter_name="shared",
         input_ids=[10, 11, 12, 13, 14],
         target_ids=[11, 12, 13, 14, 15],
         loss_mask=[0, 0, 0, 1, 1],
+        behavior_logprob_mask=[0, 0, 0, 1, 1],
         old_logprobs=[0.0, 0.0, 0.0, -0.3, -0.2],
         advantages=[0.0, 0.0, 0.0, 0.5, 0.5],
     )
@@ -102,6 +210,7 @@ def test_truncated_row_length_matches_pad_batch_effective_length() -> None:
         input_ids=[10, 11, 12, 13, 14],
         target_ids=[11, 12, 13, 14, 15],
         loss_mask=[0, 0, 0, 1, 1],
+        behavior_logprob_mask=[0, 0, 0, 1, 1],
         old_logprobs=[0.0, 0.0, 0.0, -0.3, -0.2],
         advantages=[0.0, 0.0, 0.0, 0.5, 0.5],
     )
@@ -118,6 +227,7 @@ def test_train_batch_loss_is_normalized_by_kept_sample_count() -> None:
         input_ids=[0],
         target_ids=[1],
         loss_mask=[1],
+        behavior_logprob_mask=[1],
         old_logprobs=[old_logprob],
         advantages=[1.0],
     )
@@ -138,6 +248,7 @@ def test_train_batch_drops_overlength_samples_and_reports_counter() -> None:
         input_ids=[0, 0],
         target_ids=[1, 1],
         loss_mask=[0, 1],
+        behavior_logprob_mask=[0, 1],
         old_logprobs=[0.0, old_logprob],
         advantages=[0.0, 1.0],
     )
@@ -146,6 +257,7 @@ def test_train_batch_drops_overlength_samples_and_reports_counter() -> None:
         input_ids=[0, 0, 0],
         target_ids=[1, 1, 1],
         loss_mask=[0, 1, 1],
+        behavior_logprob_mask=[0, 1, 1],
         old_logprobs=[0.0, old_logprob, old_logprob],
         advantages=[0.0, 1.0, 1.0],
     )
@@ -167,6 +279,7 @@ def test_train_batch_raises_when_all_samples_are_overlength() -> None:
         input_ids=[0, 0, 0],
         target_ids=[1, 1, 1],
         loss_mask=[0, 1, 1],
+        behavior_logprob_mask=[0, 1, 1],
         old_logprobs=[0.0, -math.log(2.0), -math.log(2.0)],
         advantages=[0.0, 1.0, 1.0],
     )
@@ -346,6 +459,7 @@ def test_train_batch_fails_before_backward_or_optimizer_on_contract_violation() 
         input_ids=[0],
         target_ids=[1],
         loss_mask=[1],
+        behavior_logprob_mask=[1],
         old_logprobs=[-0.1],
         advantages=[1.0],
     )
@@ -356,6 +470,134 @@ def test_train_batch_fails_before_backward_or_optimizer_on_contract_violation() 
     assert step_calls == 0
     assert trainer.model.bias.grad is None
     assert torch.equal(trainer.model.bias.detach(), before)
+
+
+@pytest.mark.parametrize("backend", ["full_logits", "selective_lm_head"])
+def test_real_merged_debate_example_checks_only_sampled_tokens(backend: str) -> None:
+    trainer = _tiny_causal_trainer(backend=backend)
+    example = _real_merged_debate_example()
+    assert example.loss_mask[-5:] == [1, 1, 1, 1, 1]
+    assert example.behavior_logprob_mask[-5:] == [1, 1, 0, 1, 1]
+
+    current_rows = trainer.compute_logprobs(adapter_name="debate", batch=[example])
+    example = replace(
+        example,
+        old_logprobs=[
+            current if has_behavior_logprob else old
+            for current, old, has_behavior_logprob in zip(
+                current_rows[0],
+                example.old_logprobs,
+                example.behavior_logprob_mask,
+                strict=True,
+            )
+        ],
+    )
+
+    metrics = trainer.train_batch(adapter_name="debate", batch=[example])
+
+    assert metrics["completion_tokens_checked"] == 4.0
+    assert metrics["injected_loss_mask_tokens_skipped"] == 1.0
+    assert metrics["on_policy_logprob_violations"] == 0.0
+
+
+@pytest.mark.parametrize("backend", ["full_logits", "selective_lm_head"])
+def test_real_merged_debate_mismatch_fails_before_update_for_both_backends(
+    backend: str,
+) -> None:
+    trainer = _tiny_causal_trainer(backend=backend, learning_rate=0.1)
+    example = _real_merged_debate_example()
+    current_rows = trainer.compute_logprobs(adapter_name="debate", batch=[example])
+    old_logprobs = [
+        current if has_behavior_logprob else old
+        for current, old, has_behavior_logprob in zip(
+            current_rows[0],
+            example.old_logprobs,
+            example.behavior_logprob_mask,
+            strict=True,
+        )
+    ]
+    first_sampled_position = example.behavior_logprob_mask.index(1)
+    old_logprobs[first_sampled_position] += 0.1
+    example = replace(example, old_logprobs=old_logprobs)
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in trainer.model.named_parameters()
+    }
+    step_calls = 0
+    original_step = trainer.optimizer.step
+
+    def tracked_step(*args, **kwargs):
+        nonlocal step_calls
+        step_calls += 1
+        return original_step(*args, **kwargs)
+
+    trainer.optimizer.step = tracked_step
+
+    with pytest.raises(BehaviorPolicyLogprobMismatchError, match="before PPO ratio/backward"):
+        trainer.train_batch(adapter_name="debate", batch=[example])
+
+    assert step_calls == 0
+    assert all(parameter.grad is None for parameter in trainer.model.parameters())
+    assert all(
+        torch.equal(parameter.detach(), before[name])
+        for name, parameter in trainer.model.named_parameters()
+    )
+
+
+@pytest.mark.parametrize("backend", ["full_logits", "selective_lm_head"])
+def test_second_minibatch_mismatch_discards_first_minibatch_gradients(
+    backend: str,
+) -> None:
+    trainer = _tiny_causal_trainer(backend=backend, learning_rate=0.1)
+    first = _real_merged_debate_example()
+    second = replace(_real_merged_debate_example(), metadata={"case": "second"})
+    current_rows = trainer.compute_logprobs(
+        adapter_name="debate",
+        batch=[first, second],
+    )
+
+    def with_current_old(example: TrainExample, row: list[float]) -> TrainExample:
+        return replace(
+            example,
+            old_logprobs=[
+                current if has_behavior_logprob else old
+                for current, old, has_behavior_logprob in zip(
+                    row,
+                    example.old_logprobs,
+                    example.behavior_logprob_mask,
+                    strict=True,
+                )
+            ],
+        )
+
+    first = with_current_old(first, current_rows[0])
+    second = with_current_old(second, current_rows[1])
+    second_old_logprobs = list(second.old_logprobs)
+    second_old_logprobs[second.behavior_logprob_mask.index(1)] += 0.1
+    second = replace(second, old_logprobs=second_old_logprobs)
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in trainer.model.named_parameters()
+    }
+    step_calls = 0
+    original_step = trainer.optimizer.step
+
+    def tracked_step(*args, **kwargs):
+        nonlocal step_calls
+        step_calls += 1
+        return original_step(*args, **kwargs)
+
+    trainer.optimizer.step = tracked_step
+
+    with pytest.raises(BehaviorPolicyLogprobMismatchError, match="minibatch_start=1"):
+        trainer.train_batch(adapter_name="debate", batch=[first, second])
+
+    assert step_calls == 0
+    assert all(parameter.grad is None for parameter in trainer.model.parameters())
+    assert all(
+        torch.equal(parameter.detach(), before[name])
+        for name, parameter in trainer.model.named_parameters()
+    )
 
 
 def test_trainer_config_records_moe_target_parameters() -> None:
@@ -380,10 +622,10 @@ def test_configured_adapter_parameter_detection_catches_inactive_split_adapter()
 
 def test_length_bucketed_minibatches_sort_by_effective_length() -> None:
     examples = [
-        TrainExample("shared", [1] * 8, [1] * 8, [1] * 8, [0.0] * 8, [1.0] * 8),
-        TrainExample("shared", [1] * 3, [1] * 3, [1] * 3, [0.0] * 3, [1.0] * 3),
-        TrainExample("shared", [1] * 6, [1] * 6, [1] * 6, [0.0] * 6, [1.0] * 6),
-        TrainExample("shared", [1] * 2, [1] * 2, [1] * 2, [0.0] * 2, [1.0] * 2),
+        TrainExample("shared", [1] * 8, [1] * 8, [1] * 8, [1] * 8, [0.0] * 8, [1.0] * 8),
+        TrainExample("shared", [1] * 3, [1] * 3, [1] * 3, [1] * 3, [0.0] * 3, [1.0] * 3),
+        TrainExample("shared", [1] * 6, [1] * 6, [1] * 6, [1] * 6, [0.0] * 6, [1.0] * 6),
+        TrainExample("shared", [1] * 2, [1] * 2, [1] * 2, [1] * 2, [0.0] * 2, [1.0] * 2),
     ]
 
     ordered = _order_batch_for_minibatching(
@@ -397,9 +639,9 @@ def test_length_bucketed_minibatches_sort_by_effective_length() -> None:
 
 def test_unbucketed_minibatches_preserve_order_without_aliasing() -> None:
     examples = [
-        TrainExample("shared", [1] * 8, [1] * 8, [1] * 8, [0.0] * 8, [1.0] * 8),
-        TrainExample("shared", [1] * 3, [1] * 3, [1] * 3, [0.0] * 3, [1.0] * 3),
-        TrainExample("shared", [1] * 6, [1] * 6, [1] * 6, [0.0] * 6, [1.0] * 6),
+        TrainExample("shared", [1] * 8, [1] * 8, [1] * 8, [1] * 8, [0.0] * 8, [1.0] * 8),
+        TrainExample("shared", [1] * 3, [1] * 3, [1] * 3, [1] * 3, [0.0] * 3, [1.0] * 3),
+        TrainExample("shared", [1] * 6, [1] * 6, [1] * 6, [1] * 6, [0.0] * 6, [1.0] * 6),
     ]
 
     ordered = _order_batch_for_minibatching(
@@ -414,9 +656,9 @@ def test_unbucketed_minibatches_preserve_order_without_aliasing() -> None:
 
 def test_length_bucketed_minibatches_use_truncated_effective_length() -> None:
     examples = [
-        TrainExample("shared", [1] * 100, [1] * 100, [1] * 100, [0.0] * 100, [1.0] * 100),
-        TrainExample("shared", [1] * 8, [1] * 8, [1] * 8, [0.0] * 8, [1.0] * 8),
-        TrainExample("shared", [1] * 60, [1] * 60, [1] * 60, [0.0] * 60, [1.0] * 60),
+        TrainExample("shared", [1] * 100, [1] * 100, [1] * 100, [1] * 100, [0.0] * 100, [1.0] * 100),
+        TrainExample("shared", [1] * 8, [1] * 8, [1] * 8, [1] * 8, [0.0] * 8, [1.0] * 8),
+        TrainExample("shared", [1] * 60, [1] * 60, [1] * 60, [1] * 60, [0.0] * 60, [1.0] * 60),
     ]
 
     ordered = _order_batch_for_minibatching(
@@ -430,10 +672,10 @@ def test_length_bucketed_minibatches_use_truncated_effective_length() -> None:
 
 def test_trainer_smoke_requires_model_env() -> None:
     if torch is None:
-        return
+        pytest.skip("torch is unavailable")
     path = _base_model_path()
     if path is None:
-        return
+        pytest.skip("LLM_LOCAL_RL_BASE_MODEL is not configured")
     trainer = MultiAdapterTrainer(
         config=TrainerConfig(
             base_model_path=path,
@@ -447,10 +689,10 @@ def test_trainer_smoke_requires_model_env() -> None:
 
 def test_adapter_snapshot_keys_disjoint_when_split() -> None:
     if torch is None:
-        return
+        pytest.skip("torch is unavailable")
     path = _base_model_path()
     if path is None:
-        return
+        pytest.skip("LLM_LOCAL_RL_BASE_MODEL is not configured")
     trainer = MultiAdapterTrainer(
         config=TrainerConfig(
             base_model_path=path,
@@ -468,10 +710,10 @@ def test_adapter_snapshot_keys_disjoint_when_split() -> None:
 
 def test_save_and_reload_adapter_snapshot_preserves_weights() -> None:
     if torch is None:
-        return
+        pytest.skip("torch is unavailable")
     path = _base_model_path()
     if path is None:
-        return
+        pytest.skip("LLM_LOCAL_RL_BASE_MODEL is not configured")
     trainer = MultiAdapterTrainer(
         config=TrainerConfig(
             base_model_path=path,
@@ -500,10 +742,10 @@ def test_save_and_reload_adapter_snapshot_preserves_weights() -> None:
 
 def test_train_minibatch_matches_full_batch_update() -> None:
     if torch is None:
-        return
+        pytest.skip("torch is unavailable")
     path = _base_model_path()
     if path is None:
-        return
+        pytest.skip("LLM_LOCAL_RL_BASE_MODEL is not configured")
     common_kwargs = dict(
         base_model_path=path,
         adapter_names=("shared",),
@@ -532,6 +774,7 @@ def test_train_minibatch_matches_full_batch_update() -> None:
             input_ids=[1, 2, 3],
             target_ids=[2, 3, 4],
             loss_mask=[0, 1, 1],
+            behavior_logprob_mask=[0, 1, 1],
             old_logprobs=[0.0, -1.0, -1.0],
             advantages=[0.0, 0.5, 0.5],
         ),
@@ -540,9 +783,25 @@ def test_train_minibatch_matches_full_batch_update() -> None:
             input_ids=[1, 2, 5],
             target_ids=[2, 5, 6],
             loss_mask=[0, 1, 1],
+            behavior_logprob_mask=[0, 1, 1],
             old_logprobs=[0.0, -1.0, -1.0],
             advantages=[0.0, -0.25, -0.25],
         ),
+    ]
+    old_rows = trainer_full.compute_logprobs(adapter_name="shared", batch=batch)
+    batch = [
+        replace(
+            example,
+            old_logprobs=[
+                current if has_behavior_logprob else 0.0
+                for current, has_behavior_logprob in zip(
+                    row,
+                    example.behavior_logprob_mask,
+                    strict=True,
+                )
+            ],
+        )
+        for example, row in zip(batch, old_rows, strict=True)
     ]
     trainer_full.train_batch(adapter_name="shared", batch=batch)
     trainer_mini.train_batch(adapter_name="shared", batch=batch)
@@ -555,10 +814,10 @@ def test_train_minibatch_matches_full_batch_update() -> None:
 
 def test_selective_lm_head_train_batch_matches_full_logits_update() -> None:
     if torch is None:
-        return
+        pytest.skip("torch is unavailable")
     path = _base_model_path()
     if path is None:
-        return
+        pytest.skip("LLM_LOCAL_RL_BASE_MODEL is not configured")
     common_kwargs = dict(
         base_model_path=path,
         adapter_names=("shared",),
@@ -589,6 +848,7 @@ def test_selective_lm_head_train_batch_matches_full_logits_update() -> None:
             input_ids=[1, 2, 3, 4],
             target_ids=[2, 3, 4, 5],
             loss_mask=[0, 1, 1, 1],
+            behavior_logprob_mask=[0, 1, 1, 1],
             old_logprobs=[0.0, -123.0, -1.0, -1.0],
             advantages=[0.0, 0.0, 0.5, -0.5],
         ),
@@ -597,6 +857,7 @@ def test_selective_lm_head_train_batch_matches_full_logits_update() -> None:
             input_ids=[1, 2, 5],
             target_ids=[2, 5, 6],
             loss_mask=[0, 1, 1],
+            behavior_logprob_mask=[0, 1, 1],
             old_logprobs=[0.0, -1.0, -456.0],
             advantages=[0.0, -0.25, 0.0],
         ),
@@ -638,10 +899,10 @@ def test_selective_lm_head_train_batch_matches_full_logits_update() -> None:
 
 def test_selective_lm_head_compute_logprobs_matches_full_logits_on_all_completion_positions() -> None:
     if torch is None:
-        return
+        pytest.skip("torch is unavailable")
     path = _base_model_path()
     if path is None:
-        return
+        pytest.skip("LLM_LOCAL_RL_BASE_MODEL is not configured")
     common_kwargs = dict(
         base_model_path=path,
         adapter_names=("shared",),
@@ -669,6 +930,7 @@ def test_selective_lm_head_compute_logprobs_matches_full_logits_on_all_completio
             input_ids=[1, 2, 3, 4],
             target_ids=[2, 3, 4, 5],
             loss_mask=[0, 1, 1, 1],
+            behavior_logprob_mask=[0, 1, 1, 1],
             old_logprobs=[0.0, -123.0, -1.0, -1.0],
             advantages=[0.0, 0.0, 0.5, -0.5],
         ),
@@ -677,6 +939,7 @@ def test_selective_lm_head_compute_logprobs_matches_full_logits_on_all_completio
             input_ids=[1, 2, 5],
             target_ids=[2, 5, 6],
             loss_mask=[0, 1, 1],
+            behavior_logprob_mask=[0, 1, 1],
             old_logprobs=[0.0, -1.0, -456.0],
             advantages=[0.0, -0.25, 0.0],
         ),

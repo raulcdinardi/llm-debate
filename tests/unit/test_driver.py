@@ -311,10 +311,10 @@ def test_single_turn_grouped_rollouts_use_joint_prefill_and_per_request_seeds() 
                     adapter_name=request.adapter_name,
                     prompt_token_ids=list(request.prompt_token_ids),
                     completion_token_ids=[50 + idx],
-                        completion_logprobs=[-0.1],
-                        text=f"r{idx}",
-                        behavior_policy=BehaviorPolicySpec.from_sampling_request(request),
-                        completion_logprob_semantics=BEHAVIOR_POLICY_LOGPROBS,
+                    completion_logprobs=[-0.1],
+                    text=f"r{idx}",
+                    behavior_policy=BehaviorPolicySpec.from_sampling_request(request),
+                    completion_logprob_semantics=BEHAVIOR_POLICY_LOGPROBS,
                 )
                 for idx, request in enumerate(requests)
             ]
@@ -400,10 +400,10 @@ def test_single_turn_chat_env_prefill_keeps_templated_token_id_prompt() -> None:
                     adapter_name=request.adapter_name,
                     prompt_token_ids=list(request.prompt_token_ids),
                     completion_token_ids=[50],
-                        completion_logprobs=[-0.1],
-                        text="r",
-                        behavior_policy=BehaviorPolicySpec.from_sampling_request(request),
-                        completion_logprob_semantics=BEHAVIOR_POLICY_LOGPROBS,
+                    completion_logprobs=[-0.1],
+                    text="r",
+                    behavior_policy=BehaviorPolicySpec.from_sampling_request(request),
+                    completion_logprob_semantics=BEHAVIOR_POLICY_LOGPROBS,
                 )
                 for request in requests
             ]

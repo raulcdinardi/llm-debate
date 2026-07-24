@@ -121,6 +121,7 @@ def test_trainer_forward_trace_records_tensors_and_target_topk() -> None:
                 input_ids=[65, 66],
                 target_ids=[66, 67],
                 loss_mask=[0, 1],
+                behavior_logprob_mask=[0, 1],
                 old_logprobs=[0.0, -0.5],
                 advantages=[0.0, 1.0],
                 metadata={"instance_id": "abc"},
@@ -130,6 +131,7 @@ def test_trainer_forward_trace_records_tensors_and_target_topk() -> None:
                 "target_ids": [[66, 67]],
                 "attention_mask": [[1, 1]],
                 "loss_mask": [[False, True]],
+                "behavior_logprob_mask": [[False, True]],
                 "old_logprobs": [[0.0, -0.5]],
                 "advantages": [[0.0, 1.0]],
             }
@@ -148,6 +150,7 @@ def test_trainer_forward_trace_records_tensors_and_target_topk() -> None:
             record = _read_jsonl(Path(tmpdir) / "model_io_trace.jsonl")[0]
             row = record["request"]["rows"][0]
             assert row["example_index"] == 4
+            assert row["behavior_logprob_mask"] == [False, True]
             assert row["metadata"]["instance_id"] == "abc"
             assert row["input_tokens"][0]["text"] == "A"
             assert row["target_top_logprobs"][1][0]["token_id"] == 67

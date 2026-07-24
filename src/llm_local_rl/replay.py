@@ -65,6 +65,11 @@ def replay_loss_loop(
     old_logprobs = torch.tensor(example.old_logprobs, dtype=torch.float32, device=device)
     advantages = torch.tensor(example.advantages, dtype=torch.float32, device=device)
     loss_mask = torch.tensor(example.loss_mask, dtype=torch.bool, device=device)
+    behavior_logprob_mask = torch.tensor(
+        example.behavior_logprob_mask,
+        dtype=torch.bool,
+        device=device,
+    )
 
     loss = torch.tensor(0.0, dtype=torch.float32, device=device)
     for idx in range(token_logprobs.shape[0]):
@@ -72,6 +77,8 @@ def replay_loss_loop(
             continue
         if float(advantages[idx].item()) == 0.0:
             continue
+        if not bool(behavior_logprob_mask[idx]):
+            raise ValueError("A trained token is missing a behavior-policy logprob.")
         ratio = torch.exp(token_logprobs[idx] - old_logprobs[idx])
         loss = loss + (-ratio * advantages[idx])
     return loss
@@ -92,7 +99,14 @@ def replay_loss_vectorized(
     old_logprobs = torch.tensor(example.old_logprobs, dtype=torch.float32, device=device)
     advantages = torch.tensor(example.advantages, dtype=torch.float32, device=device)
     loss_mask = torch.tensor(example.loss_mask, dtype=torch.bool, device=device)
+    behavior_logprob_mask = torch.tensor(
+        example.behavior_logprob_mask,
+        dtype=torch.bool,
+        device=device,
+    )
     trained_positions = loss_mask & (advantages != 0.0)
+    if bool((trained_positions & ~behavior_logprob_mask).any().detach().cpu().item()):
+        raise ValueError("A trained token is missing a behavior-policy logprob.")
     if not torch.any(trained_positions):
         return torch.tensor(0.0, dtype=torch.float32, device=device)
     ratio = torch.exp(token_logprobs[trained_positions] - old_logprobs[trained_positions])

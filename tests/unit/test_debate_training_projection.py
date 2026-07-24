@@ -81,6 +81,7 @@ def test_split_projection_preserves_source_round_advantages() -> None:
     assert first_debate.target_ids[-5:] == [6, 7, 8, 9, 10]
     assert first_debate.advantages[-5:] == [0.25, 0.25, 0.0, 0.25, 0.25]
     assert first_debate.old_logprobs[-5:] == [-0.3, -0.4, 0.0, -0.5, -0.6]
+    assert first_debate.behavior_logprob_mask[-5:] == [1, 1, 0, 1, 1]
     assert first_debate.metadata["round_nums"] == [2, 3]
     assert first_debate.metadata["rounds_merged"] == 2
     assert first_debate.metadata["r23_advantage_scope"] == "per_round"
@@ -146,6 +147,7 @@ def test_shared_training_data_supports_judge_compare_for_three_rounds() -> None:
     assert winner.completion_advantages[:2] == [0.25, 0.25]
     assert winner.completion_advantages[3:5] == [0.25, 0.25]
     assert winner.completion_advantages[6:8] == [0.25, 0.25]
+    assert winner.completion_logprob_mask == [1, 1, 0, 1, 1, 0, 1, 1]
     assert loser.completion_advantages[:2] == [-0.25, -0.25]
     assert loser.completion_advantages[3:5] == [-0.25, -0.25]
     assert loser.completion_advantages[6:8] == [-0.25, -0.25]

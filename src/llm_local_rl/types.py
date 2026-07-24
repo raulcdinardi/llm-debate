@@ -59,6 +59,7 @@ class TrainExample:
     input_ids: list[int]
     target_ids: list[int]
     loss_mask: list[int]
+    behavior_logprob_mask: list[int]
     old_logprobs: list[float]
     advantages: list[float]
     metadata: dict[str, Any] = field(default_factory=dict)

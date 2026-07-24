@@ -8,6 +8,7 @@ from llm_local_rl.behavior_policy import (
     BEHAVIOR_POLICY_LOGPROBS,
     RAW_MODEL_LOGPROBS,
     TEMPERATURE_SCALED_MODEL_LOGPROBS,
+    UNSPECIFIED_LOGPROBS,
     BehaviorPolicySpec,
     behavior_policy_contract_record,
 )
@@ -154,16 +155,16 @@ def _behavior_logprobs_mode(
 
     version = _vllm_version()
     parsed_version = _parse_version_tuple(version)
-    # Older vLLM releases did not expose logprobs_mode; this path assumes
-    # their completion logprobs are raw model logprobs. A transformed policy
-    # result will be rejected if a PPO caller tries to consume it, while
-    # non-trainable judge/evaluation generation remains available.
+    # Older vLLM releases did not expose logprobs_mode. Their returned
+    # completion-logprob semantics are not asserted here: non-trainable
+    # judge/evaluation generation remains available, while the PPO rollout
+    # contract rejects the explicit "unspecified" semantics below.
     if parsed_version is None or parsed_version > _RAW_LOGPROBS_LEGACY_MAX_VERSION:
         raise RuntimeError(
             "vLLM SamplingParams does not expose logprobs_mode, so behavior-logprob semantics "
             f"cannot be pinned for vllm.__version__={version!r}. Upgrade vLLM or verify the API contract."
         )
-    return {}, "legacy_raw_model_logprobs"
+    return {}, "legacy_unverified_logprobs"
 
 
 def _completion_logprob_semantics(
@@ -171,11 +172,13 @@ def _completion_logprob_semantics(
     policy: BehaviorPolicySpec,
     backend_mode: str,
 ) -> str:
+    if backend_mode == "legacy_unverified_logprobs":
+        return UNSPECIFIED_LOGPROBS
     if policy.exact_trainer_reconstruction_supported() and (
         backend_mode == "processed_logprobs" or policy.is_raw_model_distribution()
     ):
         return BEHAVIOR_POLICY_LOGPROBS
-    if policy.temperature == 0.0 or backend_mode == "legacy_raw_model_logprobs":
+    if policy.temperature == 0.0:
         return RAW_MODEL_LOGPROBS
     # Modern processed logprobs are temperature-adjusted, but we deliberately
     # do not claim post-truncation normalization for unsupported processors.

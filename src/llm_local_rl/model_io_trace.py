@@ -317,6 +317,11 @@ class ModelIOTracer:
                     "target_tokens": self._token_rows(target_ids),
                     "attention_mask": _row_values(tensors.get("attention_mask"), row_idx, n),
                     "loss_mask": _row_values(tensors.get("loss_mask"), row_idx, n),
+                    "behavior_logprob_mask": _row_values(
+                        tensors.get("behavior_logprob_mask"),
+                        row_idx,
+                        n,
+                    ),
                     "old_logprobs": _row_values(tensors.get("old_logprobs"), row_idx, n),
                     "advantages": _row_values(tensors.get("advantages"), row_idx, n),
                     "target_logprobs": _row_values(token_logprobs, row_idx, n) if token_logprobs is not None else None,
@@ -605,8 +610,8 @@ function tokenTable(tokens) {
 function trainerTables(r) {
   const rows = (r.request && r.request.rows) || [];
   return rows.map(row => `<h3>Example ${row.example_index}</h3>
-    <table><thead><tr><th>#</th><th>input</th><th>target</th><th>attention</th><th>loss</th><th>old lp</th><th>adv</th><th>target lp</th><th>top-k</th></tr></thead><tbody>`
-    + row.input_ids.map((id, i) => `<tr><td>${i}</td><td>${id} <code>${escapeHtml(tokenText(row.input_tokens, i))}</code></td><td>${row.target_ids[i]} <code>${escapeHtml(tokenText(row.target_tokens, i))}</code></td><td>${row.attention_mask[i]}</td><td>${row.loss_mask[i]}</td><td>${fmt(row.old_logprobs[i])}</td><td>${fmt(row.advantages[i])}</td><td>${fmt((row.target_logprobs || [])[i])}</td><td>${alts((row.target_top_logprobs || [])[i])}</td></tr>`).join("")
+    <table><thead><tr><th>#</th><th>input</th><th>target</th><th>attention</th><th>loss</th><th>behavior lp</th><th>old lp</th><th>adv</th><th>target lp</th><th>top-k</th></tr></thead><tbody>`
+    + row.input_ids.map((id, i) => `<tr><td>${i}</td><td>${id} <code>${escapeHtml(tokenText(row.input_tokens, i))}</code></td><td>${row.target_ids[i]} <code>${escapeHtml(tokenText(row.target_tokens, i))}</code></td><td>${row.attention_mask[i]}</td><td>${row.loss_mask[i]}</td><td>${(row.behavior_logprob_mask || [])[i]}</td><td>${fmt(row.old_logprobs[i])}</td><td>${fmt(row.advantages[i])}</td><td>${fmt((row.target_logprobs || [])[i])}</td><td>${alts((row.target_top_logprobs || [])[i])}</td></tr>`).join("")
     + `</tbody></table>`).join("");
 }
 

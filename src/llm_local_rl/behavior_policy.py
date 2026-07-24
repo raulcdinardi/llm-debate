@@ -12,6 +12,7 @@ BEHAVIOR_POLICY_CONTRACT_VERSION = 1
 BEHAVIOR_POLICY_LOGPROBS = "normalized_behavior_policy_logprobs"
 RAW_MODEL_LOGPROBS = "normalized_raw_model_logprobs"
 TEMPERATURE_SCALED_MODEL_LOGPROBS = "normalized_temperature_scaled_model_logprobs"
+UNSPECIFIED_LOGPROBS = "unspecified"
 LogprobSemantics = Literal[
     "normalized_behavior_policy_logprobs",
     "normalized_raw_model_logprobs",

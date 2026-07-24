@@ -90,10 +90,33 @@ def _validate_example_lengths(example: TrainExample) -> None:
         len(example.input_ids)
         == len(example.target_ids)
         == len(example.loss_mask)
+        == len(example.behavior_logprob_mask)
         == len(example.old_logprobs)
         == len(example.advantages)
     ):
         raise ValueError("TrainExample fields must all have equal length.")
+    if any(value not in (0, 1) for value in example.loss_mask):
+        raise ValueError("TrainExample loss_mask must contain only 0 or 1.")
+    if any(value not in (0, 1) for value in example.behavior_logprob_mask):
+        raise ValueError("TrainExample behavior_logprob_mask must contain only 0 or 1.")
+    if any(
+        has_behavior_logprob and not has_loss
+        for has_behavior_logprob, has_loss in zip(
+            example.behavior_logprob_mask,
+            example.loss_mask,
+            strict=True,
+        )
+    ):
+        raise ValueError("behavior_logprob_mask must be a subset of loss_mask.")
+    if any(
+        advantage != 0.0 and not has_behavior_logprob
+        for advantage, has_behavior_logprob in zip(
+            example.advantages,
+            example.behavior_logprob_mask,
+            strict=True,
+        )
+    ):
+        raise ValueError("Every nonzero-advantage token must have a behavior-policy logprob.")
 
 
 def _is_overlength(*, example: TrainExample, max_tokens: int = 0) -> bool:
@@ -133,6 +156,7 @@ def _pad_batch(
     target_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long, device=device)
     attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
     loss_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
+    behavior_logprob_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
     old_logprobs = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
     advantages = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
 
@@ -142,6 +166,11 @@ def _pad_batch(
         target_ids[row_idx, :n] = torch.tensor(example.target_ids, dtype=torch.long, device=device)
         attention_mask[row_idx, :n] = 1
         loss_mask[row_idx, :n] = torch.tensor(example.loss_mask, dtype=torch.bool, device=device)
+        behavior_logprob_mask[row_idx, :n] = torch.tensor(
+            example.behavior_logprob_mask,
+            dtype=torch.bool,
+            device=device,
+        )
         old_logprobs[row_idx, :n] = torch.tensor(example.old_logprobs, dtype=torch.float32, device=device)
         advantages[row_idx, :n] = torch.tensor(example.advantages, dtype=torch.float32, device=device)
 
@@ -150,6 +179,7 @@ def _pad_batch(
         "target_ids": target_ids,
         "attention_mask": attention_mask,
         "loss_mask": loss_mask,
+        "behavior_logprob_mask": behavior_logprob_mask,
         "old_logprobs": old_logprobs,
         "advantages": advantages,
     }
@@ -683,7 +713,7 @@ class MultiAdapterTrainer:
                     max_tokens=self.config.train_max_tokens,
                 )
             elif self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD:
-                completion_positions = tensors["loss_mask"]
+                completion_positions = tensors["behavior_logprob_mask"]
                 completion_tokens = int(completion_positions.sum().detach().cpu().item())
                 if completion_tokens > 0:
                     selected_logprobs, _ = self._selective_lm_head_logprobs(
@@ -760,6 +790,7 @@ class MultiAdapterTrainer:
         on_policy_checked_tokens = 0
         on_policy_trained_tokens_checked = 0
         on_policy_zero_advantage_loss_mask_tokens_checked = 0
+        on_policy_injected_loss_mask_tokens_skipped = 0
         on_policy_violations = 0
         on_policy_trained_token_violations = 0
         on_policy_sum_abs_diff = 0.0
@@ -796,6 +827,13 @@ class MultiAdapterTrainer:
             total_forward_input_tokens += int(tensors["attention_mask"].sum().detach().cpu().item())
             total_padded_input_tokens += int(tensors["input_ids"].numel())
             trained_positions = tensors["loss_mask"] & (tensors["advantages"] != 0.0)
+            invalid_trained_positions = trained_positions & ~tensors["behavior_logprob_mask"]
+            if bool(invalid_trained_positions.any().detach().cpu().item()):
+                self.optimizer.zero_grad(set_to_none=True)
+                raise ValueError(
+                    "A nonzero-advantage token is missing a behavior-policy logprob; "
+                    "refusing to compute a PPO ratio."
+                )
             trained_tokens = int(trained_positions.sum().detach().cpu().item())
 
             _mem_alloc_after_forward_full = ""
@@ -869,7 +907,11 @@ class MultiAdapterTrainer:
                         top_logprobs=top_values,
                     )
             elif self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD:
-                selected_positions = tensors["loss_mask"] if self.config.on_policy_logprob_check else trained_positions
+                selected_positions = (
+                    tensors["behavior_logprob_mask"]
+                    if self.config.on_policy_logprob_check
+                    else trained_positions
+                )
                 selected_position_count = int(selected_positions.sum().detach().cpu().item())
                 total_lm_head_positions += selected_position_count
                 if selected_position_count > 0:
@@ -929,6 +971,9 @@ class MultiAdapterTrainer:
                 on_policy_zero_advantage_loss_mask_tokens_checked += (
                     check_result.num_zero_advantage_loss_mask_tokens_checked
                 )
+                on_policy_injected_loss_mask_tokens_skipped += (
+                    check_result.num_injected_loss_mask_tokens_skipped
+                )
                 on_policy_violations += check_result.num_violations
                 on_policy_trained_token_violations += check_result.num_trained_token_violations
                 on_policy_sum_abs_diff += check_result.sum_abs_logprob_diff
@@ -949,6 +994,9 @@ class MultiAdapterTrainer:
                         "trained_tokens_checked": check_result.num_trained_tokens_checked,
                         "zero_advantage_loss_mask_tokens_checked": (
                             check_result.num_zero_advantage_loss_mask_tokens_checked
+                        ),
+                        "injected_loss_mask_tokens_skipped": (
+                            check_result.num_injected_loss_mask_tokens_skipped
                         ),
                         "violations": check_result.num_violations,
                         "trained_token_violations": check_result.num_trained_token_violations,
@@ -1071,6 +1119,9 @@ class MultiAdapterTrainer:
                     on_policy_zero_advantage_loss_mask_tokens_checked
                 ),
                 "zero_advantage_loss_mask_tokens_skipped": 0.0,
+                "injected_loss_mask_tokens_skipped": float(
+                    on_policy_injected_loss_mask_tokens_skipped
+                ),
                 "trained_token_mean_abs_diff": (
                     on_policy_trained_sum_abs_diff / on_policy_trained_tokens_checked
                     if on_policy_trained_tokens_checked > 0
@@ -1087,6 +1138,9 @@ class MultiAdapterTrainer:
                     on_policy_zero_advantage_loss_mask_tokens_checked
                 ),
                 "on_policy_logprob_zero_advantage_loss_mask_tokens_skipped": 0.0,
+                "on_policy_logprob_injected_loss_mask_tokens_skipped": float(
+                    on_policy_injected_loss_mask_tokens_skipped
+                ),
                 "on_policy_logprob_trained_token_mean_abs_diff": (
                     on_policy_trained_sum_abs_diff / on_policy_trained_tokens_checked
                     if on_policy_trained_tokens_checked > 0
@@ -1212,6 +1266,9 @@ class MultiAdapterTrainer:
                 on_policy_zero_advantage_loss_mask_tokens_checked
             ),
             "zero_advantage_loss_mask_tokens_skipped": 0.0,
+            "injected_loss_mask_tokens_skipped": float(
+                on_policy_injected_loss_mask_tokens_skipped
+            ),
             "trained_token_mean_abs_diff": (
                 on_policy_trained_sum_abs_diff / on_policy_trained_tokens_checked
                 if on_policy_trained_tokens_checked > 0
@@ -1228,6 +1285,9 @@ class MultiAdapterTrainer:
                 on_policy_zero_advantage_loss_mask_tokens_checked
             ),
             "on_policy_logprob_zero_advantage_loss_mask_tokens_skipped": 0.0,
+            "on_policy_logprob_injected_loss_mask_tokens_skipped": float(
+                on_policy_injected_loss_mask_tokens_skipped
+            ),
             "on_policy_logprob_trained_token_mean_abs_diff": (
                 on_policy_trained_sum_abs_diff / on_policy_trained_tokens_checked
                 if on_policy_trained_tokens_checked > 0

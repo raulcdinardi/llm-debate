@@ -88,6 +88,7 @@ class TrainingDatum:
     prompt_tokens: list[int]
     completion_tokens: list[int]
     completion_logprobs: list[float]
+    completion_logprob_mask: list[int]
     completion_advantages: list[float]
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -169,6 +170,13 @@ def _merge_rounds_with_centered_reward(
         + [0.0] * len(r3_continuation_tokens)
         + list(t3.completion_logprobs)
     )
+    merged_logprob_mask = (
+        [1] * len(t1.completion_tokens)
+        + [0] * len(r2_continuation_tokens)
+        + [1] * len(t2.completion_tokens)
+        + [0] * len(r3_continuation_tokens)
+        + [1] * len(t3.completion_tokens)
+    )
 
     total_generated_tokens = len(t1.completion_tokens) + len(t2.completion_tokens) + len(t3.completion_tokens)
     if total_generated_tokens <= 0:
@@ -194,6 +202,7 @@ def _merge_rounds_with_centered_reward(
         prompt_tokens=t1.prompt_tokens,
         completion_tokens=merged_completion,
         completion_logprobs=merged_logprobs,
+        completion_logprob_mask=merged_logprob_mask,
         completion_advantages=merged_advantages,
         metadata={
             "question": debate.question[:100],
@@ -257,6 +266,13 @@ def _merge_rounds_with_adv_values(
         + [0.0] * len(r3_continuation_tokens)
         + list(t3.completion_logprobs)
     )
+    merged_logprob_mask = (
+        [1] * len(t1.completion_tokens)
+        + [0] * len(r2_continuation_tokens)
+        + [1] * len(t2.completion_tokens)
+        + [0] * len(r3_continuation_tokens)
+        + [1] * len(t3.completion_tokens)
+    )
     merged_advantages = (
         [r1_adv_value] * len(t1.completion_tokens)
         + [0.0] * len(r2_continuation_tokens)
@@ -269,6 +285,7 @@ def _merge_rounds_with_adv_values(
         prompt_tokens=t1.prompt_tokens,
         completion_tokens=merged_completion,
         completion_logprobs=merged_logprobs,
+        completion_logprob_mask=merged_logprob_mask,
         completion_advantages=merged_advantages,
         metadata={
             "question": debate.question[:100],
@@ -307,12 +324,18 @@ def _merge_two_rounds_with_adv_values(
     r2_continuation_tokens = t2.prompt_tokens[r1_full_len:]
     merged_completion = t1.completion_tokens + r2_continuation_tokens + t2.completion_tokens
     merged_logprobs = list(t1.completion_logprobs) + [0.0] * len(r2_continuation_tokens) + list(t2.completion_logprobs)
+    merged_logprob_mask = (
+        [1] * len(t1.completion_tokens)
+        + [0] * len(r2_continuation_tokens)
+        + [1] * len(t2.completion_tokens)
+    )
     merged_advantages = [r1_adv_value] * len(t1.completion_tokens) + [0.0] * len(r2_continuation_tokens) + [r2_adv_value] * len(t2.completion_tokens)
 
     return TrainingDatum(
         prompt_tokens=t1.prompt_tokens,
         completion_tokens=merged_completion,
         completion_logprobs=merged_logprobs,
+        completion_logprob_mask=merged_logprob_mask,
         completion_advantages=merged_advantages,
         metadata={
             "question": debate.question[:100],
@@ -357,6 +380,11 @@ def _merge_transition_pair_with_adv_values(
         + [0.0] * len(continuation_tokens)
         + list(second.completion_logprobs)
     )
+    merged_logprob_mask = (
+        [1] * len(first.completion_tokens)
+        + [0] * len(continuation_tokens)
+        + [1] * len(second.completion_tokens)
+    )
     merged_advantages = (
         [first_adv_value] * len(first.completion_tokens)
         + [0.0] * len(continuation_tokens)
@@ -367,6 +395,7 @@ def _merge_transition_pair_with_adv_values(
         prompt_tokens=first.prompt_tokens,
         completion_tokens=merged_completion,
         completion_logprobs=merged_logprobs,
+        completion_logprob_mask=merged_logprob_mask,
         completion_advantages=merged_advantages,
         metadata={
             "question": debate.question[:100],
@@ -520,6 +549,7 @@ def assemble_training_data_r1_only_centered(
                     prompt_tokens=t1.prompt_tokens,
                     completion_tokens=t1.completion_tokens,
                     completion_logprobs=t1.completion_logprobs,
+                    completion_logprob_mask=[1] * len(t1.completion_tokens),
                     completion_advantages=[adv] * len(t1.completion_tokens),
                     metadata={
                         "question": debate.question[:100],
@@ -565,6 +595,7 @@ def assemble_training_data_r1_only_compare(
                     prompt_tokens=t1.prompt_tokens,
                     completion_tokens=t1.completion_tokens,
                     completion_logprobs=t1.completion_logprobs,
+                    completion_logprob_mask=[1] * len(t1.completion_tokens),
                     completion_advantages=[adv] * len(t1.completion_tokens),
                     metadata={
                         "question": debate.question[:100],
@@ -757,8 +788,21 @@ def training_datum_to_train_example(*, datum: TrainingDatum, adapter_name: str) 
         raise ValueError("Cannot train on an empty completion.")
     if len(datum.completion_tokens) != len(datum.completion_logprobs):
         raise ValueError("Completion tokens and logprobs must have equal length.")
+    if len(datum.completion_tokens) != len(datum.completion_logprob_mask):
+        raise ValueError("Completion tokens and logprob mask must have equal length.")
     if len(datum.completion_tokens) != len(datum.completion_advantages):
         raise ValueError("Completion tokens and advantages must have equal length.")
+    if any(value not in (0, 1) for value in datum.completion_logprob_mask):
+        raise ValueError("Completion logprob mask must contain only 0 or 1.")
+    if any(
+        advantage != 0.0 and not has_behavior_logprob
+        for advantage, has_behavior_logprob in zip(
+            datum.completion_advantages,
+            datum.completion_logprob_mask,
+            strict=True,
+        )
+    ):
+        raise ValueError("Every nonzero-advantage token must have a behavior-policy logprob.")
 
     full_token_ids = datum.prompt_tokens + datum.completion_tokens
     input_ids = full_token_ids[:-1]
@@ -772,6 +816,7 @@ def training_datum_to_train_example(*, datum: TrainingDatum, adapter_name: str) 
         input_ids=input_ids,
         target_ids=target_ids,
         loss_mask=([0] * prompt_prefix_len) + ([1] * len(datum.completion_tokens)),
+        behavior_logprob_mask=([0] * prompt_prefix_len) + list(datum.completion_logprob_mask),
         old_logprobs=([0.0] * prompt_prefix_len) + list(datum.completion_logprobs),
         advantages=([0.0] * prompt_prefix_len) + list(datum.completion_advantages),
         metadata=dict(datum.metadata),
@@ -889,6 +934,7 @@ def assemble_split_train_examples(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             completion_logprobs=completion_logprobs,
+            completion_logprob_mask=[1] * len(completion_tokens),
             completion_advantages=advantages,
             metadata=metadata,
         )

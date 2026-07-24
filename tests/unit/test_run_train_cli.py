@@ -167,3 +167,16 @@ def test_parse_sglang_sampler_backend_args(monkeypatch) -> None:
     assert args.compile_train_logprob_helper is True
     assert args.stop_parsed_reward_hacking_min == 0.45
     assert args.stop_parsed_reward_hacking_max == 0.55
+
+
+def test_cli_does_not_expose_a_parity_gate_disable_flag() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--model-path",
+                "/tmp/model",
+                "--output-dir",
+                "/tmp/out",
+                "--no-on-policy-logprob-check",
+            ]
+        )
