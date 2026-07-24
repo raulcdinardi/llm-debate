@@ -6,6 +6,7 @@ import os
 import importlib.util
 import pytest
 
+from llm_local_rl.behavior_policy import BEHAVIOR_POLICY_LOGPROBS, BehaviorPolicySpec
 if importlib.util.find_spec("transformers") is not None:
     from transformers import AutoTokenizer
 else:
@@ -54,6 +55,8 @@ class RecordingSampler:
                     completion_token_ids=token_ids,
                     completion_logprobs=[-0.1] * len(token_ids),
                     text=text,
+                    behavior_policy=BehaviorPolicySpec.from_sampling_request(request),
+                    completion_logprob_semantics=BEHAVIOR_POLICY_LOGPROBS,
                 )
             )
         return outputs

@@ -187,6 +187,9 @@ class ModelIOTracer:
         provider = str(raw["sampler_backend"]) if "sampler_backend" in raw else "vllm"
         top_logprobs_by_pos = raw.pop("completion_top_logprobs", None)
         completion_logprobs = list(getattr(result, "completion_logprobs", []))
+        completion_logprob_semantics = str(
+            getattr(result, "completion_logprob_semantics", "unspecified")
+        )
 
         completion_rows = []
         for idx, token_id in enumerate(completion_ids):
@@ -223,6 +226,7 @@ class ModelIOTracer:
             "response": {
                 "completion_token_ids": completion_ids,
                 "completion_logprobs": completion_logprobs,
+                "completion_logprob_semantics": completion_logprob_semantics,
                 "completion_tokens": completion_rows,
                 "completion_text": getattr(result, "text", ""),
                 "raw": _json_safe(raw),
@@ -230,8 +234,8 @@ class ModelIOTracer:
             "exactness": {
                 "prompt_token_ids": "actual_model_input",
                 "completion_token_ids": "actual_model_output",
-                "completion_logprobs": "vllm_generated_token_logprobs",
-                "top_logprobs": "vllm_generated_token_alternatives"
+                "completion_logprobs": completion_logprob_semantics,
+                "top_logprobs": f"{provider}_generated_token_alternatives"
                 if top_logprobs_by_pos is not None
                 else "not_available",
                 "decoded_text": "local_tokenizer_decode",

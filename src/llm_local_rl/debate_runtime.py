@@ -5,6 +5,7 @@ import random
 import re
 from typing import Callable
 
+from llm_local_rl.behavior_policy import validate_sampling_result_contract
 from llm_local_rl.chat_templates import get_chat_adapter
 from llm_local_rl.debate_parity import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
 from llm_local_rl.model_io_trace import trace_context
@@ -600,6 +601,8 @@ class DebateRuntime:
                 rollout_batch_size=len(chunk),
             ):
                 results = self.sampler.sample_many(chunk)
+            for request, result in zip(chunk, results, strict=True):
+                validate_sampling_result_contract(request=request, result=result)
             out.extend(
                 (result.completion_token_ids, result.completion_logprobs, result.text, result.raw)
                 for result in results

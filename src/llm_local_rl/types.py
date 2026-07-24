@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from llm_local_rl.behavior_policy import BehaviorPolicySpec, LogprobSemantics
+
 AdapterName = Literal["shared", "solution", "debate", "judge"]
 
 
@@ -27,6 +29,8 @@ class SamplingResult:
     completion_token_ids: list[int]
     completion_logprobs: list[float]
     text: str
+    behavior_policy: BehaviorPolicySpec | None = None
+    completion_logprob_semantics: LogprobSemantics = "unspecified"
     raw: dict[str, Any] = field(default_factory=dict)
 
 

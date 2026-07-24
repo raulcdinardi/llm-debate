@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from llm_local_rl.behavior_policy import validate_sampling_result_contract
 from llm_local_rl.interfaces import Environment, Sampler, Tokenizer
 from llm_local_rl.types import EpisodeSample, EpisodeTurn, SamplingRequest
 
@@ -28,17 +29,17 @@ class SingleTurnEpisodeBuilder:
         else:
             prompt_text = env.build_initial_prompt(instance=instance)
             prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-        result = sampler.sample(
-            SamplingRequest(
-                adapter_name=self.adapter_name,
-                prompt_token_ids=prompt_token_ids,
-                stop_token_ids=env.stop_token_ids(tokenizer=tokenizer),
-                max_tokens=max_tokens,
-                temperature=temperature,
-                seed=seed,
-                min_p=min_p,
-            )
+        request = SamplingRequest(
+            adapter_name=self.adapter_name,
+            prompt_token_ids=prompt_token_ids,
+            stop_token_ids=env.stop_token_ids(tokenizer=tokenizer),
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            min_p=min_p,
         )
+        result = sampler.sample(request)
+        validate_sampling_result_contract(request=request, result=result)
         reward, reward_metrics = env.score_completion(
             instance=instance,
             tokenizer=tokenizer,
@@ -88,29 +89,35 @@ class DebateEpisodeBuilder:
             prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
         stop_token_ids = env.stop_token_ids(tokenizer=tokenizer)
 
-        solution_result = sampler.sample(
-            SamplingRequest(
-                adapter_name=self.solution_adapter,
-                prompt_token_ids=prompt_token_ids,
-                stop_token_ids=stop_token_ids,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                seed=seed,
-                min_p=min_p,
-            )
+        solution_request = SamplingRequest(
+            adapter_name=self.solution_adapter,
+            prompt_token_ids=prompt_token_ids,
+            stop_token_ids=stop_token_ids,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            min_p=min_p,
+        )
+        solution_result = sampler.sample(solution_request)
+        validate_sampling_result_contract(
+            request=solution_request,
+            result=solution_result,
         )
         critique_prefix = tokenizer.encode(" Critique the previous answer.", add_special_tokens=False)
         critique_prompt = prompt_token_ids + solution_result.completion_token_ids + critique_prefix
-        debate_result = sampler.sample(
-            SamplingRequest(
-                adapter_name=self.debate_adapter,
-                prompt_token_ids=critique_prompt,
-                stop_token_ids=stop_token_ids,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                seed=None if seed is None else seed + 1,
-                min_p=min_p,
-            )
+        debate_request = SamplingRequest(
+            adapter_name=self.debate_adapter,
+            prompt_token_ids=critique_prompt,
+            stop_token_ids=stop_token_ids,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=None if seed is None else seed + 1,
+            min_p=min_p,
+        )
+        debate_result = sampler.sample(debate_request)
+        validate_sampling_result_contract(
+            request=debate_request,
+            result=debate_result,
         )
         reward, reward_metrics = env.score_completion(
             instance=instance,

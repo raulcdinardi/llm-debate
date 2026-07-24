@@ -10,6 +10,13 @@ from typing import Any
 
 import pytest
 
+from llm_local_rl.behavior_policy import (
+    BEHAVIOR_POLICY_LOGPROBS,
+    RAW_MODEL_LOGPROBS,
+    TEMPERATURE_SCALED_MODEL_LOGPROBS,
+    BehaviorPolicySpec,
+    validate_sampling_result_contract,
+)
 from llm_local_rl.model_io_trace import configure_model_io_tracing, reset_model_io_tracing
 from llm_local_rl.sglang_sampling import (
     SglangRuntimeConfig,
@@ -217,6 +224,7 @@ def test_sglang_sampler_loads_loras_batches_token_id_requests_and_preserves_orde
     assert all(payload["sampling_params"]["top_p"] == 0.95 for payload in generate_payloads)
     assert all(payload["sampling_params"]["top_k"] == -1 for payload in generate_payloads)
     assert all(payload["sampling_params"]["min_p"] == 0.02 for payload in generate_payloads)
+    assert all(payload["sampling_params"]["repetition_penalty"] == 1.0 for payload in generate_payloads)
     assert all(payload["sampling_params"]["stop_token_ids"] == [99] for payload in generate_payloads)
     assert all(payload["sampling_params"]["stop"] == ["CONCLUDED"] for payload in generate_payloads)
     assert all(payload["sampling_params"]["no_stop_trim"] is True for payload in generate_payloads)
@@ -235,7 +243,9 @@ def test_sglang_sampler_loads_loras_batches_token_id_requests_and_preserves_orde
         for got, expected in zip(result.completion_logprobs, expected_logprobs, strict=True):
             assert math.isclose(got, expected, rel_tol=0.0, abs_tol=1e-12)
         assert result.raw["sampler_backend"] == "sglang"
-        assert result.raw["completion_logprobs"] == "raw_model_logprobs"
+        assert result.behavior_policy == BehaviorPolicySpec.from_sampling_request(request)
+        assert result.completion_logprob_semantics == TEMPERATURE_SCALED_MODEL_LOGPROBS
+        assert result.raw["completion_logprobs"] == TEMPERATURE_SCALED_MODEL_LOGPROBS
 
     sampler.close()
     unload_payloads = _payloads(fake_sglang_server, "/unload_lora_adapter")
@@ -243,6 +253,39 @@ def test_sglang_sampler_loads_loras_batches_token_id_requests_and_preserves_orde
         "debate__sgloraid_1",
         "solution__sgloraid_2",
     ]
+
+
+def test_sglang_sampler_distinguishes_trainable_behavior_from_greedy_judge_logprobs(
+    tmp_path: Path,
+    fake_sglang_server: _FakeSglangServer,
+) -> None:
+    adapter_path = _make_adapter(tmp_path / "solution", weight_bytes=b"policy")
+    sampler = SglangSampler(
+        runtime=SglangRuntimeConfig(base_url=fake_sglang_server.base_url, timeout_s=5.0),
+        adapter_paths={"solution": adapter_path},
+    )
+    policy_request = SamplingRequest(
+        adapter_name="solution",
+        prompt_token_ids=[1, 2],
+        stop_token_ids=[],
+        max_tokens=4,
+        temperature=0.8,
+    )
+    judge_request = SamplingRequest(
+        adapter_name="solution",
+        prompt_token_ids=[3, 4],
+        stop_token_ids=[],
+        max_tokens=4,
+        temperature=0.0,
+    )
+
+    policy_result, judge_result = sampler.sample_many([policy_request, judge_request])
+
+    assert policy_result.completion_logprob_semantics == BEHAVIOR_POLICY_LOGPROBS
+    validate_sampling_result_contract(request=policy_request, result=policy_result)
+    assert judge_result.completion_logprob_semantics == RAW_MODEL_LOGPROBS
+    with pytest.raises(ValueError, match="normalized behavior policy"):
+        validate_sampling_result_contract(request=judge_request, result=judge_result)
 
 
 def test_sglang_sampler_hot_swap_reloads_overwritten_adapter_dir(

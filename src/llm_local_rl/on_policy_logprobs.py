@@ -9,36 +9,54 @@ from llm_local_rl.types import AdapterName, TrainExample
 @dataclass(frozen=True)
 class OnPolicyLogprobCheckResult:
     num_checked_tokens: int
-    num_zero_advantage_loss_mask_tokens_skipped: int
+    num_trained_tokens_checked: int
+    num_zero_advantage_loss_mask_tokens_checked: int
     num_violations: int
+    num_trained_token_violations: int
     sum_abs_logprob_diff: float
     max_abs_logprob_diff: float
+    trained_token_sum_abs_logprob_diff: float
+    trained_token_max_abs_logprob_diff: float
+    first_offending_token: dict[str, Any] | None
     first_offending_trained_token: dict[str, Any] | None
     records: list[dict[str, Any]]
 
     def metrics(self) -> dict[str, float]:
-        mean_abs = (
+        completion_mean_abs = (
             self.sum_abs_logprob_diff / self.num_checked_tokens
             if self.num_checked_tokens > 0
             else 0.0
         )
+        trained_mean_abs = (
+            self.trained_token_sum_abs_logprob_diff / self.num_trained_tokens_checked
+            if self.num_trained_tokens_checked > 0
+            else 0.0
+        )
         return {
-            "trained_tokens_checked": float(self.num_checked_tokens),
-            "zero_advantage_loss_mask_tokens_skipped": float(
-                self.num_zero_advantage_loss_mask_tokens_skipped
+            "completion_tokens_checked": float(self.num_checked_tokens),
+            "trained_tokens_checked": float(self.num_trained_tokens_checked),
+            "zero_advantage_loss_mask_tokens_checked": float(
+                self.num_zero_advantage_loss_mask_tokens_checked
             ),
-            "trained_token_mean_abs_diff": float(mean_abs),
-            "trained_token_max_abs_diff": float(self.max_abs_logprob_diff),
+            "zero_advantage_loss_mask_tokens_skipped": 0.0,
+            "trained_token_mean_abs_diff": float(trained_mean_abs),
+            "trained_token_max_abs_diff": float(self.trained_token_max_abs_logprob_diff),
             "on_policy_logprob_checked_tokens": float(self.num_checked_tokens),
             "on_policy_logprob_violations": float(self.num_violations),
-            "on_policy_logprob_mean_abs_diff": float(mean_abs),
+            "on_policy_logprob_mean_abs_diff": float(completion_mean_abs),
             "on_policy_logprob_max_abs_diff": float(self.max_abs_logprob_diff),
-            "on_policy_logprob_trained_tokens_checked": float(self.num_checked_tokens),
-            "on_policy_logprob_zero_advantage_loss_mask_tokens_skipped": float(
-                self.num_zero_advantage_loss_mask_tokens_skipped
+            "on_policy_logprob_trained_tokens_checked": float(self.num_trained_tokens_checked),
+            "on_policy_logprob_trained_token_violations": float(
+                self.num_trained_token_violations
             ),
-            "on_policy_logprob_trained_token_mean_abs_diff": float(mean_abs),
-            "on_policy_logprob_trained_token_max_abs_diff": float(self.max_abs_logprob_diff),
+            "on_policy_logprob_zero_advantage_loss_mask_tokens_checked": float(
+                self.num_zero_advantage_loss_mask_tokens_checked
+            ),
+            "on_policy_logprob_zero_advantage_loss_mask_tokens_skipped": 0.0,
+            "on_policy_logprob_trained_token_mean_abs_diff": float(trained_mean_abs),
+            "on_policy_logprob_trained_token_max_abs_diff": float(
+                self.trained_token_max_abs_logprob_diff
+            ),
         }
 
 
@@ -67,10 +85,15 @@ def check_on_policy_logprobs(
         raise ValueError("examples and current_logprob_rows must have equal length.")
 
     num_checked_tokens = 0
-    num_zero_advantage_loss_mask_tokens_skipped = 0
+    num_trained_tokens_checked = 0
+    num_zero_advantage_loss_mask_tokens_checked = 0
     num_violations = 0
+    num_trained_token_violations = 0
     sum_abs_logprob_diff = 0.0
     max_abs_logprob_diff = 0.0
+    trained_token_sum_abs_logprob_diff = 0.0
+    trained_token_max_abs_logprob_diff = 0.0
+    first_offending_token: dict[str, Any] | None = None
     first_offending_trained_token: dict[str, Any] | None = None
     records: list[dict[str, Any]] = []
 
@@ -104,9 +127,7 @@ def check_on_policy_logprobs(
             if not should_check:
                 continue
             advantage = float(advantages[sliced_pos])
-            if advantage == 0.0:
-                num_zero_advantage_loss_mask_tokens_skipped += 1
-                continue
+            trained_token = advantage != 0.0
             old_logprob = float(old_logprobs[sliced_pos])
             current_logprob = float(current_logprobs[sliced_pos])
             diff = current_logprob - old_logprob
@@ -114,11 +135,22 @@ def check_on_policy_logprobs(
             num_checked_tokens += 1
             sum_abs_logprob_diff += abs_diff
             max_abs_logprob_diff = max(max_abs_logprob_diff, abs_diff)
+            if trained_token:
+                num_trained_tokens_checked += 1
+                trained_token_sum_abs_logprob_diff += abs_diff
+                trained_token_max_abs_logprob_diff = max(
+                    trained_token_max_abs_logprob_diff,
+                    abs_diff,
+                )
+            else:
+                num_zero_advantage_loss_mask_tokens_checked += 1
             if abs_diff <= abs_tol:
                 continue
             num_violations += 1
+            if trained_token:
+                num_trained_token_violations += 1
             record = {
-                "event": "on_policy_logprob_drift",
+                "event": "behavior_policy_logprob_contract_violation",
                 "adapter_name": adapter_name,
                 "minibatch_start": minibatch_start,
                 "minibatch_row": row_idx,
@@ -139,20 +171,27 @@ def check_on_policy_logprobs(
                 "abs_diff": abs_diff,
                 "abs_tol": float(abs_tol),
                 "advantage": advantage,
-                "trained_token": True,
+                "trained_token": trained_token,
                 "metadata": dict(example.metadata),
             }
-            if first_offending_trained_token is None:
+            if first_offending_token is None:
+                first_offending_token = dict(record)
+            if trained_token and first_offending_trained_token is None:
                 first_offending_trained_token = dict(record)
             if len(records) < max_records:
                 records.append(record)
 
     return OnPolicyLogprobCheckResult(
         num_checked_tokens=num_checked_tokens,
-        num_zero_advantage_loss_mask_tokens_skipped=num_zero_advantage_loss_mask_tokens_skipped,
+        num_trained_tokens_checked=num_trained_tokens_checked,
+        num_zero_advantage_loss_mask_tokens_checked=num_zero_advantage_loss_mask_tokens_checked,
         num_violations=num_violations,
+        num_trained_token_violations=num_trained_token_violations,
         sum_abs_logprob_diff=sum_abs_logprob_diff,
         max_abs_logprob_diff=max_abs_logprob_diff,
+        trained_token_sum_abs_logprob_diff=trained_token_sum_abs_logprob_diff,
+        trained_token_max_abs_logprob_diff=trained_token_max_abs_logprob_diff,
+        first_offending_token=first_offending_token,
         first_offending_trained_token=first_offending_trained_token,
         records=records,
     )

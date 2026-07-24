@@ -1,3 +1,7 @@
+from llm_local_rl.behavior_policy import (
+    BEHAVIOR_POLICY_LOGPROBS,
+    BehaviorPolicySpec,
+)
 from llm_local_rl.debate_parity import DebateConfig, DebateResult, DebateTrajectory, TrainingDatum, Transition
 from llm_local_rl.envs import HTSequenceEnv
 from llm_local_rl.episodes import SingleTurnEpisodeBuilder
@@ -32,6 +36,8 @@ __all__ = [
     "HTSequenceInstance",
     "SamplingRequest",
     "SamplingResult",
+    "BEHAVIOR_POLICY_LOGPROBS",
+    "BehaviorPolicySpec",
     "SingleTurnEpisodeBuilder",
     "TraceConfig",
     "TrainingDatum",

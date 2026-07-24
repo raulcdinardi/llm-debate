@@ -134,7 +134,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stop-parsed-reward-hacking-min", type=float, default=None)
     parser.add_argument("--stop-parsed-reward-hacking-max", type=float, default=None)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--on-policy-logprob-check", action="store_true")
+    parser.add_argument(
+        "--on-policy-logprob-check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail before PPO ratio/backward when rollout and trainer behavior-policy logprobs differ.",
+    )
     parser.add_argument("--on-policy-logprob-abs-tol", type=float, default=1e-3)
     parser.add_argument("--on-policy-logprob-warning-path", default=None)
     parser.add_argument("--on-policy-logprob-max-records-per-batch", type=int, default=8)

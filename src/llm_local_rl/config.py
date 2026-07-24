@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 
+from llm_local_rl.behavior_policy import BehaviorPolicySpec
+
 
 @dataclass(frozen=True)
 class RolloutConfig:
@@ -90,7 +92,7 @@ class TrainRunConfig:
     stop_parsed_reward_hacking_min: float | None = None
     stop_parsed_reward_hacking_max: float | None = None
     gradient_checkpointing: bool = True
-    on_policy_logprob_check: bool = False
+    on_policy_logprob_check: bool = True
     on_policy_logprob_abs_tol: float = 1e-3
     on_policy_logprob_warning_path: str | None = None
     on_policy_logprob_max_records_per_batch: int = 8
@@ -118,7 +120,12 @@ class TrainRunConfig:
     resource_log_interval_s: float = 5.0
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        data["behavior_policy_contract"] = self.behavior_policy().to_dict()
+        return data
+
+    def behavior_policy(self) -> BehaviorPolicySpec:
+        return BehaviorPolicySpec.from_rollout_config(self.rollout)
 
     def __post_init__(self) -> None:
         judge_modes = sum(
@@ -136,6 +143,12 @@ class TrainRunConfig:
             )
         if not 0.0 < float(self.rollout.top_p) <= 1.0:
             raise ValueError(f"rollout.top_p must be in (0, 1], got {self.rollout.top_p}")
+        self.behavior_policy().assert_exact_trainer_reconstruction_supported()
+        if not self.on_policy_logprob_check:
+            raise ValueError(
+                "PPO training requires the fail-closed on-policy logprob check; "
+                "on_policy_logprob_check=False is not allowed."
+            )
 
         if self.debate_stop_on_concluded:
             if self.rollout.mode != "debate":
@@ -240,7 +253,7 @@ class TrainRunConfig:
             stop_parsed_reward_hacking_min=data.get("stop_parsed_reward_hacking_min"),
             stop_parsed_reward_hacking_max=data.get("stop_parsed_reward_hacking_max"),
             gradient_checkpointing=data.get("gradient_checkpointing", True),
-            on_policy_logprob_check=data.get("on_policy_logprob_check", False),
+            on_policy_logprob_check=data.get("on_policy_logprob_check", True),
             on_policy_logprob_abs_tol=data.get("on_policy_logprob_abs_tol", 1e-3),
             on_policy_logprob_warning_path=data.get("on_policy_logprob_warning_path"),
             on_policy_logprob_max_records_per_batch=data.get("on_policy_logprob_max_records_per_batch", 8),

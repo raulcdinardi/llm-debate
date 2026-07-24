@@ -3,14 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 import inspect
 import os
-import warnings
 
+from llm_local_rl.behavior_policy import (
+    BEHAVIOR_POLICY_LOGPROBS,
+    RAW_MODEL_LOGPROBS,
+    TEMPERATURE_SCALED_MODEL_LOGPROBS,
+    BehaviorPolicySpec,
+    behavior_policy_contract_record,
+)
 from llm_local_rl.lora_identity import AdapterIdentity, adapter_identity
 from llm_local_rl.model_io_trace import get_model_io_tracer, get_trace_top_logprobs
 from llm_local_rl.types import SamplingRequest, SamplingResult
 
 _RAW_LOGPROBS_LEGACY_MAX_VERSION = (0, 9, 99)
-_WARNED_RAW_LOGPROB_SAMPLING_POLICY = False
 
 
 def _logprob_value(entry: object) -> float:
@@ -135,45 +140,46 @@ def _parse_version_tuple(version: str) -> tuple[int, int, int] | None:
     return tuple(parts)
 
 
-def _raw_logprobs_mode_kwargs(SamplingParams) -> dict[str, str]:
+def _behavior_logprobs_mode(
+    SamplingParams,
+    *,
+    policy: BehaviorPolicySpec,
+) -> tuple[dict[str, str], str]:
     try:
         sampling_params_parameters = inspect.signature(SamplingParams).parameters
     except (TypeError, ValueError):
         sampling_params_parameters = {}
     if "logprobs_mode" in sampling_params_parameters:
-        return {"logprobs_mode": "raw_logprobs"}
+        return {"logprobs_mode": "processed_logprobs"}, "processed_logprobs"
 
     version = _vllm_version()
     parsed_version = _parse_version_tuple(version)
     # Older vLLM releases did not expose logprobs_mode; this path assumes
-    # their completion logprobs are raw model logprobs. Modern versions should
-    # expose logprobs_mode, so fail loudly if that contract is not visible.
+    # their completion logprobs are raw model logprobs. A transformed policy
+    # result will be rejected if a PPO caller tries to consume it, while
+    # non-trainable judge/evaluation generation remains available.
     if parsed_version is None or parsed_version > _RAW_LOGPROBS_LEGACY_MAX_VERSION:
         raise RuntimeError(
-            "vLLM SamplingParams does not expose logprobs_mode, so raw completion logprob semantics "
+            "vLLM SamplingParams does not expose logprobs_mode, so behavior-logprob semantics "
             f"cannot be pinned for vllm.__version__={version!r}. Upgrade vLLM or verify the API contract."
         )
-    return {}
+    return {}, "legacy_raw_model_logprobs"
 
 
-def _warn_if_raw_logprobs_sampling_policy_differs(
+def _completion_logprob_semantics(
     *,
-    temperature: float,
-    min_p: float,
-    logprobs: int,
-) -> None:
-    global _WARNED_RAW_LOGPROB_SAMPLING_POLICY
-    if _WARNED_RAW_LOGPROB_SAMPLING_POLICY or logprobs <= 0:
-        return
-    if float(temperature) == 1.0 and float(min_p) <= 0.0:
-        return
-    _WARNED_RAW_LOGPROB_SAMPLING_POLICY = True
-    warnings.warn(
-        "vLLM sampling is requesting raw model logprobs while temperature != 1.0 or min_p > 0. "
-        "The sampled tokens come from the transformed behavior policy, but stored logprobs are raw model logprobs.",
-        RuntimeWarning,
-        stacklevel=3,
-    )
+    policy: BehaviorPolicySpec,
+    backend_mode: str,
+) -> str:
+    if policy.exact_trainer_reconstruction_supported() and (
+        backend_mode == "processed_logprobs" or policy.is_raw_model_distribution()
+    ):
+        return BEHAVIOR_POLICY_LOGPROBS
+    if policy.temperature == 0.0 or backend_mode == "legacy_raw_model_logprobs":
+        return RAW_MODEL_LOGPROBS
+    # Modern processed logprobs are temperature-adjusted, but we deliberately
+    # do not claim post-truncation normalization for unsupported processors.
+    return TEMPERATURE_SCALED_MODEL_LOGPROBS
 
 
 def _build_sampling_params(
@@ -188,21 +194,27 @@ def _build_sampling_params(
     trace_top_logprobs: int,
 ):
     logprobs = max(1, trace_top_logprobs)
-    _warn_if_raw_logprobs_sampling_policy_differs(
-        temperature=temperature,
-        min_p=min_p,
-        logprobs=logprobs,
+    policy = BehaviorPolicySpec(
+        temperature=float(temperature),
+        top_p=float(top_p),
+        min_p=float(min_p),
+    )
+    logprobs_mode_kwargs, _backend_mode = _behavior_logprobs_mode(
+        SamplingParams,
+        policy=policy,
     )
     kwargs = {
         "temperature": float(temperature),
         "top_p": float(top_p),
+        "top_k": -1,
         "min_p": float(min_p),
+        "repetition_penalty": 1.0,
         "max_tokens": int(max_tokens),
         "stop_token_ids": list(stop_token_ids) if stop_token_ids else None,
         "logprobs": logprobs,
         "seed": seed,
     }
-    kwargs.update(_raw_logprobs_mode_kwargs(SamplingParams))
+    kwargs.update(logprobs_mode_kwargs)
     return SamplingParams(**kwargs)
 
 
@@ -314,6 +326,19 @@ class VllmSampler:
 
         results: list[SamplingResult | None] = [None] * len(requests)
         for (adapter_name, temperature, min_p, top_p, max_tokens, stop_token_ids, seed), grouped_requests in grouped.items():
+            behavior_policy = BehaviorPolicySpec(
+                temperature=temperature,
+                top_p=top_p,
+                min_p=min_p,
+            )
+            _mode_kwargs, backend_mode = _behavior_logprobs_mode(
+                SamplingParams,
+                policy=behavior_policy,
+            )
+            logprob_semantics = _completion_logprob_semantics(
+                policy=behavior_policy,
+                backend_mode=backend_mode,
+            )
             sampling_params = _build_sampling_params(
                 SamplingParams,
                 temperature=temperature,
@@ -349,7 +374,14 @@ class VllmSampler:
                 text = getattr(seq, "text", None) or ""
                 raw = {
                     "finish_reason": getattr(seq, "finish_reason", None),
-                    "completion_logprobs": "raw_model_logprobs",
+                    "completion_logprobs": logprob_semantics,
+                    "behavior_policy_contract": behavior_policy_contract_record(
+                        policy=behavior_policy,
+                        backend="vllm",
+                        backend_mode=backend_mode,
+                        return_original_logprobs=False,
+                        semantics=logprob_semantics,
+                    ),
                 }
                 if trace_top_logprobs > 0:
                     raw["completion_top_logprobs"] = completion_top_logprobs
@@ -359,6 +391,8 @@ class VllmSampler:
                     completion_token_ids=completion_token_ids,
                     completion_logprobs=completion_logprobs,
                     text=text,
+                    behavior_policy=behavior_policy,
+                    completion_logprob_semantics=logprob_semantics,
                     raw=raw,
                 )
                 get_model_io_tracer().record_generation(
@@ -384,6 +418,15 @@ def direct_vllm_sample(
     _LLM, SamplingParams, LoRARequest = _import_vllm_symbols()
     _ = _LLM
     trace_top_logprobs = get_trace_top_logprobs()
+    behavior_policy = BehaviorPolicySpec.from_sampling_request(request)
+    _mode_kwargs, backend_mode = _behavior_logprobs_mode(
+        SamplingParams,
+        policy=behavior_policy,
+    )
+    logprob_semantics = _completion_logprob_semantics(
+        policy=behavior_policy,
+        backend_mode=backend_mode,
+    )
 
     sampling_params = _build_sampling_params(
         SamplingParams,
@@ -422,7 +465,14 @@ def direct_vllm_sample(
         text = ""
     raw = {
         "finish_reason": getattr(seq, "finish_reason", None),
-        "completion_logprobs": "raw_model_logprobs",
+        "completion_logprobs": logprob_semantics,
+        "behavior_policy_contract": behavior_policy_contract_record(
+            policy=behavior_policy,
+            backend="vllm",
+            backend_mode=backend_mode,
+            return_original_logprobs=False,
+            semantics=logprob_semantics,
+        ),
     }
     if trace_top_logprobs > 0:
         raw["completion_top_logprobs"] = completion_top_logprobs
@@ -432,6 +482,8 @@ def direct_vllm_sample(
         completion_token_ids=completion_token_ids,
         completion_logprobs=completion_logprobs,
         text=text,
+        behavior_policy=behavior_policy,
+        completion_logprob_semantics=logprob_semantics,
         raw=raw,
     )
     get_model_io_tracer().record_generation(

@@ -5,6 +5,13 @@ import json
 from urllib.error import HTTPError
 from urllib import request as urlrequest
 
+from llm_local_rl.behavior_policy import (
+    BEHAVIOR_POLICY_LOGPROBS,
+    RAW_MODEL_LOGPROBS,
+    TEMPERATURE_SCALED_MODEL_LOGPROBS,
+    BehaviorPolicySpec,
+    behavior_policy_contract_record,
+)
 from llm_local_rl.lora_identity import AdapterIdentity, adapter_identity
 from llm_local_rl.model_io_trace import get_model_io_tracer, get_trace_top_logprobs
 from llm_local_rl.types import SamplingRequest, SamplingResult
@@ -129,6 +136,7 @@ class SglangRuntimeConfig:
     unload_stale_adapters: bool = True
     memory_saver: bool = False
     memory_saver_tags: tuple[str, ...] = ("kv_cache",)
+    return_original_logprobs: bool = False
 
 
 class SglangSampler:
@@ -297,6 +305,7 @@ class SglangSampler:
                 "top_p": top_p,
                 "top_k": -1,
                 "min_p": min_p,
+                "repetition_penalty": 1.0,
                 "stop_token_ids": list(stop_token_ids),
             }
             if stop_strings:
@@ -326,9 +335,31 @@ class SglangSampler:
                 text = response_item["text"] if "text" in response_item else ""
                 if not isinstance(text, str):
                     raise TypeError("SGLang response text must be a string.")
+                behavior_policy = BehaviorPolicySpec.from_sampling_request(request)
+                if self.runtime.return_original_logprobs or behavior_policy.temperature == 0.0:
+                    logprob_semantics = RAW_MODEL_LOGPROBS
+                elif (
+                    behavior_policy.top_p != 1.0
+                    or behavior_policy.top_k != -1
+                    or behavior_policy.min_p != 0.0
+                    or behavior_policy.repetition_penalty != 1.0
+                ):
+                    # SGLang 0.5.15 returns temperature-scaled logprobs before
+                    # top-k/top-p/min-p filtering in its standard sampler path.
+                    logprob_semantics = TEMPERATURE_SCALED_MODEL_LOGPROBS
+                else:
+                    logprob_semantics = BEHAVIOR_POLICY_LOGPROBS
+                contract = behavior_policy_contract_record(
+                    policy=behavior_policy,
+                    backend="sglang",
+                    backend_mode="standard_sampler",
+                    return_original_logprobs=self.runtime.return_original_logprobs,
+                    semantics=logprob_semantics,
+                )
                 raw = {
                     "sampler_backend": "sglang",
-                    "completion_logprobs": "raw_model_logprobs",
+                    "completion_logprobs": logprob_semantics,
+                    "behavior_policy_contract": contract,
                 }
                 if "finish_reason" in meta_info:
                     raw["finish_reason"] = meta_info["finish_reason"]
@@ -343,6 +374,8 @@ class SglangSampler:
                     completion_token_ids=completion_token_ids,
                     completion_logprobs=completion_logprobs,
                     text=text,
+                    behavior_policy=behavior_policy,
+                    completion_logprob_semantics=logprob_semantics,
                     raw=raw,
                 )
                 get_model_io_tracer().record_generation(

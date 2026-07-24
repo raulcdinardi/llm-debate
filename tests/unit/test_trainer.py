@@ -16,6 +16,7 @@ if torch is None or peft_spec is None or transformers_spec is None:
     pytest.skip("trainer unit tests require torch, peft, and transformers", allow_module_level=True)
 
 from llm_local_rl.trainer import (
+    BehaviorPolicyLogprobMismatchError,
     MultiAdapterTrainer,
     TrainerConfig,
     _is_configured_adapter_parameter,
@@ -25,6 +26,7 @@ from llm_local_rl.trainer import (
     _target_token_logprobs,
     _truncated_row_length,
 )
+from llm_local_rl.behavior_policy import BehaviorPolicySpec
 from llm_local_rl.types import TrainExample
 
 
@@ -201,6 +203,38 @@ def test_target_token_logprobs_match_full_log_softmax_gather_with_small_chunks()
     assert torch.allclose(actual, expected, atol=1e-6)
 
 
+def test_target_token_logprobs_reconstruct_temperature_scaled_behavior_distribution() -> None:
+    generator = torch.Generator(device="cpu").manual_seed(20260723)
+    logits = torch.randn((2, 4, 13), generator=generator, dtype=torch.float32)
+    target_ids = torch.randint(0, 13, (2, 4), generator=generator)
+
+    expected = torch.log_softmax(logits / 0.8, dim=-1).gather(
+        dim=-1,
+        index=target_ids.unsqueeze(-1),
+    ).squeeze(-1)
+    actual = _target_token_logprobs(
+        logits=logits,
+        target_ids=target_ids,
+        behavior_temperature=0.8,
+        max_positions_per_chunk=3,
+    )
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_temperature_mismatch_negative_control_reproduces_inverse_temperature_slope() -> None:
+    logits = torch.tensor([6.0, 2.0, -3.0, -8.0], dtype=torch.float32)
+    raw = torch.log_softmax(logits, dim=-1)
+    behavior = torch.log_softmax(logits / 0.8, dim=-1)
+
+    rare_token_pair_slope = float(
+        ((behavior[3] - behavior[2]) / (raw[3] - raw[2])).item()
+    )
+
+    assert rare_token_pair_slope == pytest.approx(1.25, abs=1e-6)
+    assert not torch.allclose(raw, behavior, atol=1e-3)
+
+
 def test_selected_lm_head_token_logprobs_match_full_lm_head_logits() -> None:
     generator = torch.Generator(device="cpu").manual_seed(20260629)
     hidden_states = torch.randn((2, 4, 5), generator=generator, dtype=torch.float32, requires_grad=True)
@@ -229,7 +263,7 @@ def test_selected_lm_head_token_logprobs_match_full_lm_head_logits() -> None:
         hidden_states=hidden_states,
         lm_head=lm_head,
         target_ids=target_ids,
-        trained_positions=trained_positions,
+        selected_positions=trained_positions,
         max_positions_per_chunk=2,
     )
 
@@ -248,12 +282,80 @@ def test_selected_lm_head_token_logprobs_handles_empty_trained_positions() -> No
         hidden_states=hidden_states,
         lm_head=lm_head,
         target_ids=target_ids,
-        trained_positions=trained_positions,
+        selected_positions=trained_positions,
     )
 
     assert actual_logprobs.shape == (0,)
     assert actual_logprobs.dtype == torch.float32
     assert actual_entropy == 0.0
+
+
+def test_selective_lm_head_matches_full_logits_at_behavior_temperature() -> None:
+    generator = torch.Generator(device="cpu").manual_seed(20260724)
+    hidden_states = torch.randn((2, 3, 5), generator=generator, dtype=torch.float32)
+    lm_head = torch.nn.Linear(5, 11, bias=False)
+    with torch.no_grad():
+        lm_head.weight.copy_(torch.randn((11, 5), generator=generator))
+    target_ids = torch.randint(0, 11, (2, 3), generator=generator)
+    selected_positions = torch.tensor(
+        [[True, False, True], [False, True, True]],
+        dtype=torch.bool,
+    )
+
+    full_logits = lm_head(hidden_states)
+    expected = _target_token_logprobs(
+        logits=full_logits,
+        target_ids=target_ids,
+        behavior_temperature=0.8,
+    )[selected_positions]
+    actual, _entropy = _selected_lm_head_token_logprobs(
+        hidden_states=hidden_states,
+        lm_head=lm_head,
+        target_ids=target_ids,
+        selected_positions=selected_positions,
+        behavior_temperature=0.8,
+        max_positions_per_chunk=2,
+    )
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_train_batch_fails_before_backward_or_optimizer_on_contract_violation() -> None:
+    trainer = _fake_trainer()
+    trainer.config = TrainerConfig(
+        base_model_path="/tmp/nonexistent_model_for_shape_only",
+        device="cpu",
+        torch_dtype="float32",
+        learning_rate=0.1,
+        behavior_policy=BehaviorPolicySpec(temperature=0.8),
+        on_policy_logprob_abs_tol=1e-6,
+    )
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    step_calls = 0
+    original_step = trainer.optimizer.step
+
+    def tracked_step(*args, **kwargs):
+        nonlocal step_calls
+        step_calls += 1
+        return original_step(*args, **kwargs)
+
+    trainer.optimizer.step = tracked_step
+    before = trainer.model.bias.detach().clone()
+    example = TrainExample(
+        adapter_name="shared",
+        input_ids=[0],
+        target_ids=[1],
+        loss_mask=[1],
+        old_logprobs=[-0.1],
+        advantages=[1.0],
+    )
+
+    with pytest.raises(BehaviorPolicyLogprobMismatchError, match="before PPO ratio/backward"):
+        trainer.train_batch(adapter_name="shared", batch=[example])
+
+    assert step_calls == 0
+    assert trainer.model.bias.grad is None
+    assert torch.equal(trainer.model.bias.detach(), before)
 
 
 def test_trainer_config_records_moe_target_parameters() -> None:
@@ -513,16 +615,18 @@ def test_selective_lm_head_train_batch_matches_full_logits_update() -> None:
         "clipfrac",
         "entropy",
         "num_trained_tokens",
+        "completion_tokens_checked",
         "trained_tokens_checked",
-        "zero_advantage_loss_mask_tokens_skipped",
+        "zero_advantage_loss_mask_tokens_checked",
     ):
         assert selective_metrics[key] == pytest.approx(full_metrics[key], abs=1e-5)
     assert selective_metrics["trained_tokens_checked"] == 3.0
-    assert selective_metrics["zero_advantage_loss_mask_tokens_skipped"] == 2.0
+    assert selective_metrics["zero_advantage_loss_mask_tokens_checked"] == 2.0
+    assert selective_metrics["zero_advantage_loss_mask_tokens_skipped"] == 0.0
     assert full_metrics["lm_head_positions"] == full_metrics["num_padded_input_tokens"]
-    assert selective_metrics["lm_head_positions"] == selective_metrics["num_trained_tokens"]
+    assert selective_metrics["lm_head_positions"] == selective_metrics["completion_tokens_checked"]
     assert selective_metrics["lm_head_positions_avoided"] == (
-        selective_metrics["num_padded_input_tokens"] - selective_metrics["num_trained_tokens"]
+        selective_metrics["num_padded_input_tokens"] - selective_metrics["completion_tokens_checked"]
     )
 
     full_after = trainer_full.adapter_parameter_snapshot(adapter_name="shared")
@@ -532,7 +636,7 @@ def test_selective_lm_head_train_batch_matches_full_logits_update() -> None:
         assert torch.allclose(full_after[key], selective_after[key], atol=1e-5)
 
 
-def test_selective_lm_head_compute_logprobs_matches_full_logits_on_trained_positions() -> None:
+def test_selective_lm_head_compute_logprobs_matches_full_logits_on_all_completion_positions() -> None:
     if torch is None:
         return
     path = _base_model_path()
@@ -585,7 +689,7 @@ def test_selective_lm_head_compute_logprobs_matches_full_logits_on_trained_posit
     for example, full_row, selective_row in zip(batch, full_rows, selective_rows, strict=True):
         assert len(selective_row) == len(full_row)
         for idx, (full_logprob, selective_logprob) in enumerate(zip(full_row, selective_row, strict=True)):
-            if example.loss_mask[idx] and example.advantages[idx] != 0.0:
+            if example.loss_mask[idx]:
                 assert selective_logprob == pytest.approx(full_logprob, abs=1e-5)
             else:
                 assert selective_logprob == 0.0
