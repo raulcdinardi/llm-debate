@@ -23,6 +23,7 @@ class SamplingParamsWithLogprobsMode:
         top_p,
         top_k,
         min_p,
+        presence_penalty,
         repetition_penalty,
         max_tokens,
         stop_token_ids,
@@ -35,6 +36,7 @@ class SamplingParamsWithLogprobsMode:
             "top_p": top_p,
             "top_k": top_k,
             "min_p": min_p,
+            "presence_penalty": presence_penalty,
             "repetition_penalty": repetition_penalty,
             "max_tokens": max_tokens,
             "stop_token_ids": stop_token_ids,
@@ -52,6 +54,7 @@ class SamplingParamsWithoutLogprobsMode:
         top_p,
         top_k,
         min_p,
+        presence_penalty,
         repetition_penalty,
         max_tokens,
         stop_token_ids,
@@ -63,6 +66,7 @@ class SamplingParamsWithoutLogprobsMode:
             "top_p": top_p,
             "top_k": top_k,
             "min_p": min_p,
+            "presence_penalty": presence_penalty,
             "repetition_penalty": repetition_penalty,
             "max_tokens": max_tokens,
             "stop_token_ids": stop_token_ids,
@@ -97,6 +101,9 @@ def test_vllm_sampling_params_preserve_nontrainable_judge_processors_without_cla
         temperature=0.7,
         top_p=0.95,
         min_p=0.1,
+        top_k=20,
+        presence_penalty=1.5,
+        repetition_penalty=1.1,
         max_tokens=8,
         stop_token_ids=(99,),
         seed=123,
@@ -105,8 +112,18 @@ def test_vllm_sampling_params_preserve_nontrainable_judge_processors_without_cla
 
     assert params.kwargs["top_p"] == 0.95
     assert params.kwargs["min_p"] == 0.1
+    assert params.kwargs["top_k"] == 20
+    assert params.kwargs["presence_penalty"] == 1.5
+    assert params.kwargs["repetition_penalty"] == 1.1
     assert vllm_sampling._completion_logprob_semantics(
-        policy=BehaviorPolicySpec(temperature=0.7, top_p=0.95, min_p=0.1),
+        policy=BehaviorPolicySpec(
+            temperature=0.7,
+            top_p=0.95,
+            top_k=20,
+            min_p=0.1,
+            presence_penalty=1.5,
+            repetition_penalty=1.1,
+        ),
         backend_mode="processed_logprobs",
     ) == TEMPERATURE_SCALED_MODEL_LOGPROBS
 

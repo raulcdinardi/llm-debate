@@ -6,6 +6,7 @@ import re
 from typing import Callable
 
 from llm_local_rl.behavior_policy import validate_sampling_result_contract
+from llm_local_rl.base_model_judge import build_base_judge_prompt, extract_strict_verdict
 from llm_local_rl.chat_templates import get_chat_adapter
 from llm_local_rl.debate_parity import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
 from llm_local_rl.model_io_trace import trace_context
@@ -143,6 +144,15 @@ class DebateRuntimeConfig:
     stop_on_concluded: bool = False
     base_r2_prefill: str = "The reasons that my solution is better than my opponent's are:\n1)"
     base_r3_prefill: str = "Responding to my opponent's criticism:\n1)"
+    judge_prompt_format: str = "chat"
+    judge_max_tokens: int = 0
+    judge_temperature: float = 0.3
+    judge_top_p: float = 1.0
+    judge_top_k: int = -1
+    judge_min_p: float = 0.0
+    judge_presence_penalty: float = 0.0
+    judge_repetition_penalty: float = 1.0
+    judge_seed: int | None = None
     debate_judge_server_url: str | None = None
     debate_judge_server_adapter_path: str | None = None
 
@@ -212,46 +222,19 @@ class DebateRuntime:
         completion_logprobs: list[list[float]] = []
         raw_responses: list[dict] = []
         retry_flags: list[bool] = []
-        debate_payloads: list[tuple[str, str, str, str, str, str, str, str]] = []
         for debate_idx, (inst_a, _inst_b) in enumerate(inst_pairs):
             a_idx = 2 * debate_idx
             b_idx = 2 * debate_idx + 1
-            debate_payloads.append(
-                (
-                    self.task.judge_context_text(inst=inst_a),
-                    self.task.judge_constitution_text(inst=inst_a),
-                    r1_visible_text[a_idx],
-                    r1_visible_text[b_idx],
-                    r2_visible_text[a_idx],
-                    r2_visible_text[b_idx],
-                    r3_visible_text[a_idx],
-                    r3_visible_text[b_idx],
-                )
+            verdict, reasoning = self._run_external_judge(
+                question=self.task.judge_context_text(inst=inst_a),
+                constitution=self.task.judge_constitution_text(inst=inst_a),
+                r1_a=r1_visible_text[a_idx],
+                r1_b=r1_visible_text[b_idx],
+                r2_a=r2_visible_text[a_idx],
+                r2_b=r2_visible_text[b_idx],
+                r3_a=r3_visible_text[a_idx],
+                r3_b=r3_visible_text[b_idx],
             )
-
-        judge_many = getattr(self.judge_fn, "judge_many", None)
-        if callable(judge_many):
-            judged = judge_many(debate_payloads)
-            if len(judged) != len(debate_payloads):
-                raise ValueError(
-                    f"External judge returned {len(judged)} results for {len(debate_payloads)} debates"
-                )
-        else:
-            judged = [
-                self._run_external_judge(
-                    question=payload[0],
-                    constitution=payload[1],
-                    r1_a=payload[2],
-                    r1_b=payload[3],
-                    r2_a=payload[4],
-                    r2_b=payload[5],
-                    r3_a=payload[6],
-                    r3_b=payload[7],
-                )
-                for payload in debate_payloads
-            ]
-
-        for verdict, reasoning in judged:
             verdicts.append(verdict)
             reasonings.append(reasoning)
             prompt_tokens.append([])
@@ -639,7 +622,7 @@ class DebateRuntime:
     def _sample_judge_many(self, *, prompt_tokens_list: list[list[int]], round_num: int, step_seed: int | None, stop_token_ids: list[int], max_tokens: int, temperature: float) -> list[tuple[list[int], list[float], str, dict]]:
         requests = []
         adapter_name = self._judge_adapter_name()
-        for idx, prompt_tokens in enumerate(prompt_tokens_list):
+        for prompt_tokens in prompt_tokens_list:
             requests.append(
                 SamplingRequest(
                     adapter_name=adapter_name,
@@ -647,9 +630,12 @@ class DebateRuntime:
                     stop_token_ids=stop_token_ids,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    seed=self._round_seed(step_seed=step_seed, request_idx=idx, round_num=round_num),
-                    min_p=float(self.runtime_config.min_p),
-                    top_p=float(self.runtime_config.top_p),
+                    seed=self.runtime_config.judge_seed,
+                    min_p=float(self.runtime_config.judge_min_p),
+                    top_p=float(self.runtime_config.judge_top_p),
+                    top_k=int(self.runtime_config.judge_top_k),
+                    presence_penalty=float(self.runtime_config.judge_presence_penalty),
+                    repetition_penalty=float(self.runtime_config.judge_repetition_penalty),
                 )
             )
         batch_size = self.runtime_config.rollout_batch_size if self.runtime_config.rollout_batch_size > 0 else len(requests)
@@ -671,6 +657,25 @@ class DebateRuntime:
         return out
 
     def _judge_prompts(self, *, inst_pairs: list[tuple[TaskInstance, TaskInstance]], r1_visible_text: list[str], r2_visible_text: list[str], r3_visible_text: list[str]) -> list[list[int]]:
+        if self.runtime_config.judge_prompt_format == "base_model_sft":
+            return [
+                list(
+                    self.tokenizer.encode(
+                        build_base_judge_prompt(
+                            question=self.task.judge_context_text(inst=inst_a),
+                            constitution=self.task.judge_constitution_text(inst=inst_a),
+                            r1_a=r1_visible_text[2 * debate_idx],
+                            r1_b=r1_visible_text[2 * debate_idx + 1],
+                            r2_a=r2_visible_text[2 * debate_idx],
+                            r2_b=r2_visible_text[2 * debate_idx + 1],
+                            r3_a=r3_visible_text[2 * debate_idx],
+                            r3_b=r3_visible_text[2 * debate_idx + 1],
+                        ),
+                        add_special_tokens=False,
+                    )
+                )
+                for debate_idx, (inst_a, _inst_b) in enumerate(inst_pairs)
+            ]
         adapter = get_chat_adapter(self.tokenizer)
         prompts: list[list[int]] = []
         for debate_idx, (inst_a, _inst_b) in enumerate(inst_pairs):
@@ -1066,11 +1071,30 @@ class DebateRuntime:
                 judge_completion_logprobs.append([])
                 judge_raw_responses.append({"external_judge": True, "raw_text": reasoning})
         else:
-            adapter = get_chat_adapter(self.tokenizer)
             judge_prompt_tokens = []
             for idx, (inst_a, _inst_b) in enumerate(inst_pairs):
                 a_idx = 2 * idx
                 b_idx = 2 * idx + 1
+                if self.runtime_config.judge_prompt_format == "base_model_sft":
+                    judge_prompt_tokens.append(
+                        list(
+                            self.tokenizer.encode(
+                                build_base_judge_prompt(
+                                    question=self.task.judge_context_text(inst=inst_a),
+                                    constitution=self.task.judge_constitution_text(inst=inst_a),
+                                    r1_a=r1_visible_text[a_idx],
+                                    r1_b=r1_visible_text[b_idx],
+                                    r2_a="",
+                                    r2_b="",
+                                    r3_a="",
+                                    r3_b="",
+                                ),
+                                add_special_tokens=False,
+                            )
+                        )
+                    )
+                    continue
+                adapter = get_chat_adapter(self.tokenizer)
                 system = (
                     self.debate_config.system_judge
                     + "\n\nIMPORTANT: Output exactly one tag: <VERDICT>...</VERDICT>. Judge task compliance first. VERDICT must be A or B only."
@@ -1090,8 +1114,11 @@ class DebateRuntime:
                 round_num=99,
                 step_seed=step_seed,
                 stop_token_ids=stop_token_ids,
-                max_tokens=self._max_tokens_for_round(round_num=1),
-                temperature=0.0,
+                max_tokens=(
+                    self.runtime_config.judge_max_tokens
+                    or self._max_tokens_for_round(round_num=1)
+                ),
+                temperature=float(self.runtime_config.judge_temperature),
             )
             verdicts = []
             judge_reasonings = []
@@ -1099,7 +1126,11 @@ class DebateRuntime:
             judge_completion_logprobs = []
             judge_raw_responses = []
             for idx, (comp, lps, text, raw) in enumerate(judge_results):
-                verdict = extract_verdict(_strip_think_blocks(text))
+                verdict = (
+                    extract_strict_verdict(text)
+                    if self.runtime_config.judge_prompt_format == "base_model_sft"
+                    else extract_verdict(_strip_think_blocks(text))
+                )
                 if verdict == "INVALID" and self.runtime_config.debate_r1_reward != "judge_rejection_task":
                     verdict = _fallback_verdict_from_invalid_judge(step_seed=step_seed, debate_idx=idx)
                 verdicts.append(verdict)
@@ -1149,8 +1180,11 @@ class DebateRuntime:
             round_num=99,
             step_seed=step_seed,
             stop_token_ids=stop_token_ids,
-            max_tokens=self._max_tokens_for_round(round_num=1),
-            temperature=0.3,
+            max_tokens=(
+                self.runtime_config.judge_max_tokens
+                or self._max_tokens_for_round(round_num=1)
+            ),
+            temperature=float(self.runtime_config.judge_temperature),
         )
         verdicts: list[Verdict] = []
         reasonings: list[str] = []
@@ -1160,7 +1194,11 @@ class DebateRuntime:
         retry_flags: list[bool] = []
         invalid_indices: list[int] = []
         for idx, (comp, lps, text, raw) in enumerate(results):
-            verdict = extract_verdict(_strip_think_blocks(text))
+            verdict = (
+                extract_strict_verdict(text)
+                if self.runtime_config.judge_prompt_format == "base_model_sft"
+                else extract_verdict(_strip_think_blocks(text))
+            )
             verdicts.append(verdict)
             reasonings.append(extract_reasoning(text))
             completion_tokens.append(comp)
@@ -1175,11 +1213,18 @@ class DebateRuntime:
                 round_num=100,
                 step_seed=step_seed,
                 stop_token_ids=stop_token_ids,
-                max_tokens=self._max_tokens_for_round(round_num=1),
+                max_tokens=(
+                    self.runtime_config.judge_max_tokens
+                    or self._max_tokens_for_round(round_num=1)
+                ),
                 temperature=0.0,
             )
             for debate_idx, (comp, lps, text, raw) in zip(invalid_indices, retry_results, strict=True):
-                retry_verdict = extract_verdict(_strip_think_blocks(text))
+                retry_verdict = (
+                    extract_strict_verdict(text)
+                    if self.runtime_config.judge_prompt_format == "base_model_sft"
+                    else extract_verdict(_strip_think_blocks(text))
+                )
                 if retry_verdict == "INVALID":
                     continue
                 verdicts[debate_idx] = retry_verdict

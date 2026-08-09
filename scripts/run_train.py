@@ -81,6 +81,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--debate-judge-server-adapter-path", default=None)
     parser.add_argument("--debate-mock-judge-seed", type=int, default=None)
     parser.add_argument("--debate-external-judge-timeout-s", type=float, default=600.0)
+    parser.add_argument(
+        "--debate-judge-prompt-format",
+        default="chat",
+        choices=["chat", "base_model_sft"],
+    )
+    parser.add_argument("--debate-judge-max-tokens", type=int, default=0)
+    parser.add_argument("--debate-judge-temperature", type=float, default=0.3)
+    parser.add_argument("--debate-judge-top-p", type=float, default=1.0)
+    parser.add_argument("--debate-judge-top-k", type=int, default=-1)
+    parser.add_argument("--debate-judge-min-p", type=float, default=0.0)
+    parser.add_argument("--debate-judge-presence-penalty", type=float, default=0.0)
+    parser.add_argument("--debate-judge-repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--debate-judge-seed", type=int, default=None)
     parser.add_argument("--debate-round-adapter-names", nargs="*", default=["solution", "debate", "debate"])
     parser.add_argument(
         "--debate-prompt-format",
@@ -257,6 +270,15 @@ def main() -> int:
                 debate_judge_server_adapter_path=args.debate_judge_server_adapter_path,
                 debate_mock_judge_seed=args.debate_mock_judge_seed,
                 debate_external_judge_timeout_s=args.debate_external_judge_timeout_s,
+                debate_judge_prompt_format=args.debate_judge_prompt_format,
+                debate_judge_max_tokens=args.debate_judge_max_tokens,
+                debate_judge_temperature=args.debate_judge_temperature,
+                debate_judge_top_p=args.debate_judge_top_p,
+                debate_judge_top_k=args.debate_judge_top_k,
+                debate_judge_min_p=args.debate_judge_min_p,
+                debate_judge_presence_penalty=args.debate_judge_presence_penalty,
+                debate_judge_repetition_penalty=args.debate_judge_repetition_penalty,
+                debate_judge_seed=args.debate_judge_seed,
                 debate_round_adapter_names=tuple(args.debate_round_adapter_names),
                 debate_prompt_format=args.debate_prompt_format,
                 debate_stop_on_concluded=args.debate_stop_on_concluded,

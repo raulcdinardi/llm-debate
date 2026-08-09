@@ -74,6 +74,15 @@ class TrainRunConfig:
     debate_judge_server_adapter_path: str | None = None
     debate_mock_judge_seed: int | None = None
     debate_external_judge_timeout_s: float = 600.0
+    debate_judge_prompt_format: str = "chat"
+    debate_judge_max_tokens: int = 0
+    debate_judge_temperature: float = 0.3
+    debate_judge_top_p: float = 1.0
+    debate_judge_top_k: int = -1
+    debate_judge_min_p: float = 0.0
+    debate_judge_presence_penalty: float = 0.0
+    debate_judge_repetition_penalty: float = 1.0
+    debate_judge_seed: int | None = None
     debate_round_adapter_names: tuple[str, ...] = ("solution", "debate", "debate")
     debate_prompt_format: str = "chat"
     debate_stop_on_concluded: bool = False
@@ -143,6 +152,28 @@ class TrainRunConfig:
             )
         if not 0.0 < float(self.rollout.top_p) <= 1.0:
             raise ValueError(f"rollout.top_p must be in (0, 1], got {self.rollout.top_p}")
+        if self.debate_judge_prompt_format not in ("chat", "base_model_sft"):
+            raise ValueError(
+                "debate_judge_prompt_format must be 'chat' or 'base_model_sft', got "
+                f"{self.debate_judge_prompt_format!r}"
+            )
+        if self.debate_judge_max_tokens < 0:
+            raise ValueError("debate_judge_max_tokens must be non-negative")
+        BehaviorPolicySpec(
+            temperature=self.debate_judge_temperature,
+            top_p=self.debate_judge_top_p,
+            top_k=self.debate_judge_top_k,
+            min_p=self.debate_judge_min_p,
+            presence_penalty=self.debate_judge_presence_penalty,
+            repetition_penalty=self.debate_judge_repetition_penalty,
+        )
+        if (
+            judge_modes == 0
+            and self.debate_judge_adapter == "judge"
+            and self.debate_judge_prompt_format == "base_model_sft"
+            and self.sampler_backend != "vllm"
+        ):
+            raise ValueError("base_model_sft judge sampling currently requires sampler_backend='vllm'")
         self.behavior_policy().assert_exact_trainer_reconstruction_supported()
         if not self.on_policy_logprob_check:
             raise ValueError(
@@ -233,6 +264,15 @@ class TrainRunConfig:
             debate_judge_server_adapter_path=data.get("debate_judge_server_adapter_path"),
             debate_mock_judge_seed=data.get("debate_mock_judge_seed"),
             debate_external_judge_timeout_s=data.get("debate_external_judge_timeout_s", 600.0),
+            debate_judge_prompt_format=data.get("debate_judge_prompt_format", "chat"),
+            debate_judge_max_tokens=data.get("debate_judge_max_tokens", 0),
+            debate_judge_temperature=data.get("debate_judge_temperature", 0.3),
+            debate_judge_top_p=data.get("debate_judge_top_p", 1.0),
+            debate_judge_top_k=data.get("debate_judge_top_k", -1),
+            debate_judge_min_p=data.get("debate_judge_min_p", 0.0),
+            debate_judge_presence_penalty=data.get("debate_judge_presence_penalty", 0.0),
+            debate_judge_repetition_penalty=data.get("debate_judge_repetition_penalty", 1.0),
+            debate_judge_seed=data.get("debate_judge_seed"),
             debate_round_adapter_names=tuple(data.get("debate_round_adapter_names", ("solution", "debate", "debate"))),
             debate_prompt_format=data.get("debate_prompt_format", "chat"),
             debate_stop_on_concluded=data.get("debate_stop_on_concluded", False),

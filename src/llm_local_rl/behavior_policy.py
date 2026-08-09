@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     from llm_local_rl.types import SamplingRequest, SamplingResult
 
 
-BEHAVIOR_POLICY_CONTRACT_VERSION = 1
+BEHAVIOR_POLICY_CONTRACT_VERSION = 2
 MIN_STOCHASTIC_TEMPERATURE = 1e-6
 BEHAVIOR_POLICY_LOGPROBS = "normalized_behavior_policy_logprobs"
 RAW_MODEL_LOGPROBS = "normalized_raw_model_logprobs"
@@ -36,6 +36,7 @@ class BehaviorPolicySpec:
     top_p: float = 1.0
     top_k: int = -1
     min_p: float = 0.0
+    presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
 
     def __post_init__(self) -> None:
@@ -43,6 +44,7 @@ class BehaviorPolicySpec:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "min_p": self.min_p,
+            "presence_penalty": self.presence_penalty,
             "repetition_penalty": self.repetition_penalty,
         }
         for name, value in numeric_values.items():
@@ -56,6 +58,10 @@ class BehaviorPolicySpec:
             raise ValueError(f"top_k must be -1 (disabled) or positive, got {self.top_k}.")
         if not 0.0 <= float(self.min_p) <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
+        if not -2.0 <= float(self.presence_penalty) <= 2.0:
+            raise ValueError(
+                f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
+            )
         if float(self.repetition_penalty) <= 0.0:
             raise ValueError(
                 f"repetition_penalty must be positive, got {self.repetition_penalty}."
@@ -66,9 +72,10 @@ class BehaviorPolicySpec:
         return cls(
             temperature=float(request.temperature),
             top_p=float(request.top_p),
-            top_k=-1,
+            top_k=int(request.top_k),
             min_p=float(request.min_p),
-            repetition_penalty=1.0,
+            presence_penalty=float(request.presence_penalty),
+            repetition_penalty=float(request.repetition_penalty),
         )
 
     @classmethod
@@ -90,6 +97,7 @@ class BehaviorPolicySpec:
             and float(self.top_p) == 1.0
             and int(self.top_k) == -1
             and float(self.min_p) == 0.0
+            and float(self.presence_penalty) == 0.0
             and float(self.repetition_penalty) == 1.0
         )
 
@@ -108,6 +116,10 @@ class BehaviorPolicySpec:
             unsupported.append(f"top_k={self.top_k} (only -1/disabled is supported)")
         if float(self.min_p) != 0.0:
             unsupported.append(f"min_p={self.min_p} (only 0.0 is supported)")
+        if float(self.presence_penalty) != 0.0:
+            unsupported.append(
+                f"presence_penalty={self.presence_penalty} (only 0.0 is supported)"
+            )
         if float(self.repetition_penalty) != 1.0:
             unsupported.append(
                 f"repetition_penalty={self.repetition_penalty} (only 1.0 is supported)"

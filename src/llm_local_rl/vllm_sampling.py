@@ -195,12 +195,18 @@ def _build_sampling_params(
     stop_token_ids: tuple[int, ...] | list[int],
     seed: int | None,
     trace_top_logprobs: int,
+    top_k: int = -1,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
 ):
     logprobs = max(1, trace_top_logprobs)
     policy = BehaviorPolicySpec(
         temperature=float(temperature),
         top_p=float(top_p),
+        top_k=int(top_k),
         min_p=float(min_p),
+        presence_penalty=float(presence_penalty),
+        repetition_penalty=float(repetition_penalty),
     )
     logprobs_mode_kwargs, _backend_mode = _behavior_logprobs_mode(
         SamplingParams,
@@ -209,9 +215,10 @@ def _build_sampling_params(
     kwargs = {
         "temperature": float(temperature),
         "top_p": float(top_p),
-        "top_k": -1,
+        "top_k": int(top_k),
         "min_p": float(min_p),
-        "repetition_penalty": 1.0,
+        "presence_penalty": float(presence_penalty),
+        "repetition_penalty": float(repetition_penalty),
         "max_tokens": int(max_tokens),
         "stop_token_ids": list(stop_token_ids) if stop_token_ids else None,
         "logprobs": logprobs,
@@ -312,7 +319,7 @@ class VllmSampler:
         _LLM, SamplingParams, _LoRARequest = _import_vllm_symbols()
         _ = (_LLM, _LoRARequest)
         trace_top_logprobs = get_trace_top_logprobs()
-        grouped: dict[tuple[str, float, float, float, int, tuple[int, ...], int | None], list[tuple[int, SamplingRequest]]] = {}
+        grouped: dict[tuple, list[tuple[int, SamplingRequest]]] = {}
         for idx, request in enumerate(requests):
             if request.stop_strings:
                 raise NotImplementedError("String stops are pinned to the SGLang sampler backend.")
@@ -321,6 +328,9 @@ class VllmSampler:
                 float(request.temperature),
                 float(request.min_p),
                 float(request.top_p),
+                int(request.top_k),
+                float(request.presence_penalty),
+                float(request.repetition_penalty),
                 int(request.max_tokens),
                 tuple(int(tok) for tok in request.stop_token_ids),
                 request.seed,
@@ -328,11 +338,25 @@ class VllmSampler:
             grouped.setdefault(key, []).append((idx, request))
 
         results: list[SamplingResult | None] = [None] * len(requests)
-        for (adapter_name, temperature, min_p, top_p, max_tokens, stop_token_ids, seed), grouped_requests in grouped.items():
+        for (
+            adapter_name,
+            temperature,
+            min_p,
+            top_p,
+            top_k,
+            presence_penalty,
+            repetition_penalty,
+            max_tokens,
+            stop_token_ids,
+            seed,
+        ), grouped_requests in grouped.items():
             behavior_policy = BehaviorPolicySpec(
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
                 min_p=min_p,
+                presence_penalty=presence_penalty,
+                repetition_penalty=repetition_penalty,
             )
             _mode_kwargs, backend_mode = _behavior_logprobs_mode(
                 SamplingParams,
@@ -347,6 +371,9 @@ class VllmSampler:
                 temperature=temperature,
                 top_p=top_p,
                 min_p=min_p,
+                top_k=top_k,
+                presence_penalty=presence_penalty,
+                repetition_penalty=repetition_penalty,
                 max_tokens=max_tokens,
                 stop_token_ids=stop_token_ids,
                 seed=seed,
@@ -436,6 +463,9 @@ def direct_vllm_sample(
         temperature=float(request.temperature),
         top_p=float(request.top_p),
         min_p=float(request.min_p),
+        top_k=int(request.top_k),
+        presence_penalty=float(request.presence_penalty),
+        repetition_penalty=float(request.repetition_penalty),
         max_tokens=int(request.max_tokens),
         stop_token_ids=request.stop_token_ids,
         seed=request.seed,

@@ -274,6 +274,15 @@ class SglangSampler:
             list[tuple[int, SamplingRequest]],
         ] = {}
         for idx, request in enumerate(requests):
+            if (
+                request.top_k != -1
+                or request.presence_penalty != 0.0
+                or request.repetition_penalty != 1.0
+            ):
+                raise NotImplementedError(
+                    "top_k, presence_penalty, and repetition_penalty request overrides "
+                    "are currently implemented only by the vLLM sampler."
+                )
             key = (
                 request.adapter_name,
                 float(request.temperature),

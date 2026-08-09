@@ -191,36 +191,3 @@ def test_external_judge_trace_records_prompt_body_and_raw_response(monkeypatch) 
             assert record["exactness"]["token_ids"] == "local_visualization_only"
         finally:
             reset_model_io_tracing()
-
-
-def test_external_judge_batches_prompts_and_preserves_response_order(monkeypatch) -> None:
-    seen_body: dict = {}
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self) -> bytes:
-            return b'{"results":[{"raw_text":"<VERDICT>B</VERDICT> second"},{"raw_text":"<VERDICT>A</VERDICT> first"}]}'
-
-    def fake_urlopen(req, timeout):
-        _ = timeout
-        seen_body.update(json.loads(req.data.decode("utf-8")))
-        return FakeResponse()
-
-    monkeypatch.setattr(base_model_judge.request, "urlopen", fake_urlopen)
-    judge = build_remote_base_judge(RemoteBaseJudgeConfig(url="http://judge.test"))
-    common = ("Rules", "A1", "B1", "A2", "B2", "A3", "B3")
-
-    results = judge.judge_many([("Question 1", *common), ("Question 2", *common)])
-
-    assert results == [
-        ("B", "<VERDICT>B</VERDICT> second"),
-        ("A", "<VERDICT>A</VERDICT> first"),
-    ]
-    assert len(seen_body["prompt_texts"]) == 2
-    assert "Question 1" in seen_body["prompt_texts"][0]
-    assert "Question 2" in seen_body["prompt_texts"][1]

@@ -55,6 +55,7 @@ def test_train_config_serializes_one_explicit_behavior_policy_contract() -> None
         "top_p": 1.0,
         "top_k": -1,
         "min_p": 0.0,
+        "presence_penalty": 0.0,
         "repetition_penalty": 1.0,
     }
 
@@ -118,7 +119,7 @@ def test_contract_record_names_normalization_and_backend_semantics() -> None:
         scoring_dtype="float32",
     )
 
-    assert record["version"] == 1
+    assert record["version"] == 2
     assert record["semantics"] == BEHAVIOR_POLICY_LOGPROBS
     assert record["normalization"] == "log_softmax"
     assert record["policy"] == policy.to_dict()
