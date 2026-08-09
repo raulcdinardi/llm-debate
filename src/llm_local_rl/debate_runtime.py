@@ -247,6 +247,14 @@ class DebateRuntime:
     def rollout(self, *, step_seed: int | None) -> DebateRolloutOutput:
         if self.runtime_config.group_size % 2 != 0:
             raise ValueError("Debate requires even group_size.")
+        if (
+            self.runtime_config.judge_prompt_format == "base_model_sft"
+            and self.runtime_config.num_rounds != 3
+        ):
+            raise ValueError(
+                "judge_prompt_format='base_model_sft' requires a complete three-round debate; "
+                f"got num_rounds={self.runtime_config.num_rounds}"
+            )
         instances = self.task.sample_instances(n=self.runtime_config.num_groups, seed=step_seed)
         instances_repeated: list[TaskInstance] = []
         expander = getattr(self.task, "expand_group_instances", None)
@@ -1071,30 +1079,11 @@ class DebateRuntime:
                 judge_completion_logprobs.append([])
                 judge_raw_responses.append({"external_judge": True, "raw_text": reasoning})
         else:
+            adapter = get_chat_adapter(self.tokenizer)
             judge_prompt_tokens = []
             for idx, (inst_a, _inst_b) in enumerate(inst_pairs):
                 a_idx = 2 * idx
                 b_idx = 2 * idx + 1
-                if self.runtime_config.judge_prompt_format == "base_model_sft":
-                    judge_prompt_tokens.append(
-                        list(
-                            self.tokenizer.encode(
-                                build_base_judge_prompt(
-                                    question=self.task.judge_context_text(inst=inst_a),
-                                    constitution=self.task.judge_constitution_text(inst=inst_a),
-                                    r1_a=r1_visible_text[a_idx],
-                                    r1_b=r1_visible_text[b_idx],
-                                    r2_a="",
-                                    r2_b="",
-                                    r3_a="",
-                                    r3_b="",
-                                ),
-                                add_special_tokens=False,
-                            )
-                        )
-                    )
-                    continue
-                adapter = get_chat_adapter(self.tokenizer)
                 system = (
                     self.debate_config.system_judge
                     + "\n\nIMPORTANT: Output exactly one tag: <VERDICT>...</VERDICT>. Judge task compliance first. VERDICT must be A or B only."

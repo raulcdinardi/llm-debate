@@ -171,9 +171,11 @@ class TrainRunConfig:
             judge_modes == 0
             and self.debate_judge_adapter == "judge"
             and self.debate_judge_prompt_format == "base_model_sft"
-            and self.sampler_backend != "vllm"
         ):
-            raise ValueError("base_model_sft judge sampling currently requires sampler_backend='vllm'")
+            if self.debate_rounds != 3:
+                raise ValueError("base_model_sft judge prompting requires debate_rounds=3")
+            if self.sampler_backend != "vllm":
+                raise ValueError("base_model_sft judge sampling currently requires sampler_backend='vllm'")
         self.behavior_policy().assert_exact_trainer_reconstruction_supported()
         if not self.on_policy_logprob_check:
             raise ValueError(

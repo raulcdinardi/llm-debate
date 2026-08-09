@@ -470,6 +470,19 @@ def test_split_adapter_names_include_judge_only_when_requested() -> None:
     assert driver._adapter_names() == ("solution", "debate")
 
 
+def test_base_sft_internal_judge_requires_complete_three_round_debate() -> None:
+    with pytest.raises(ValueError, match="requires debate_rounds=3"):
+        TrainRunConfig(
+            model_path="/tmp/nonexistent_model_for_shape_only",
+            output_dir="/tmp/out",
+            adapter_layout="split",
+            debate_judge_adapter="judge",
+            debate_judge_prompt_format="base_model_sft",
+            debate_rounds=1,
+            sampler_backend="vllm",
+        )
+
+
 def test_split_vllm_sampler_can_sleep_instead_of_teardown() -> None:
     from llm_local_rl.driver import TrainingDriver
 
