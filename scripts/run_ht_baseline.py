@@ -28,7 +28,7 @@ def main() -> int:
     args = parse_args()
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
     env = HTSequenceEnv(sequence_len=args.sequence_len, reward_mode=args.reward_mode)
-    builder = SingleTurnEpisodeBuilder()
+    builder = SingleTurnEpisodeBuilder(validate_behavior_policy_contract=False)
     sampler = VllmSampler(runtime=VllmRuntimeConfig(model_path=args.model_path))
 
     instances = env.sample_instances(n=args.num_samples, seed=args.seed)

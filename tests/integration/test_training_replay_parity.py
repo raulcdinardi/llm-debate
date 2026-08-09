@@ -59,6 +59,7 @@ def test_training_replay_gradient_matches_reference_loop() -> None:
         add_special_tokens=False,
     )
     completion_token_ids = tokenizer.encode(" HHTT", add_special_tokens=False)
+    behavior_temperature = 0.8
 
     seed = 0
     torch.manual_seed(seed)
@@ -73,6 +74,7 @@ def test_training_replay_gradient_matches_reference_loop() -> None:
             input_ids=(prompt_token_ids + completion_token_ids)[:-1],
             target_ids=(prompt_token_ids + completion_token_ids)[1:],
             device=device,
+            behavior_temperature=behavior_temperature,
         ).detach().cpu().tolist()
     prompt_prefix_len = len(prompt_token_ids) - 1
     completion_logprobs = baseline_logprobs[prompt_prefix_len:]
@@ -93,7 +95,12 @@ def test_training_replay_gradient_matches_reference_loop() -> None:
         adapter_path=assets.adapter_a_path,
         device=device,
     )
-    loss_loop = replay_loss_loop(model=model_loop, example=example, device=device)
+    loss_loop = replay_loss_loop(
+        model=model_loop,
+        example=example,
+        device=device,
+        behavior_temperature=behavior_temperature,
+    )
     loss_loop.backward()
     grads_loop = collect_trainable_grads(model_loop)
     loss_loop_value = float(loss_loop.detach().cpu().item())
@@ -108,7 +115,12 @@ def test_training_replay_gradient_matches_reference_loop() -> None:
         adapter_path=assets.adapter_a_path,
         device=device,
     )
-    loss_vectorized = replay_loss_vectorized(model=model_vectorized, example=example, device=device)
+    loss_vectorized = replay_loss_vectorized(
+        model=model_vectorized,
+        example=example,
+        device=device,
+        behavior_temperature=behavior_temperature,
+    )
     loss_vectorized.backward()
     grads_vectorized = collect_trainable_grads(model_vectorized)
     loss_vectorized_value = float(loss_vectorized.detach().cpu().item())

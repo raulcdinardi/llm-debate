@@ -29,6 +29,28 @@ This avoids the previous shape where debate mechanics and task/environment logic
 
 Heavy integration tests are opt-in and require a local model path.
 
+## PPO behavior-policy contract
+
+PPO rollouts and trainer recomputation share one serialized
+`BehaviorPolicySpec`. The stored old logprob and the trainer's current
+logprob must both describe the same normalized distribution that generated
+the action. Temperature is therefore applied in both paths. The parity gate
+checks every sampled completion token and raises before ratio calculation,
+backward, or an optimizer step if the values differ.
+
+The current trainer reconstructs temperature scaling exactly. Trainable PPO
+runs fail configuration validation when `top_p != 1`, `min_p != 0`, top-k is
+enabled, or a repetition penalty is active, because those processors are not
+yet identically normalized in both the sampler and trainer. These options
+remain usable for non-trainable judge/evaluation sampling, but their returned
+logprobs must not be consumed as PPO behavior logprobs.
+
+Renderer-inserted R2/R3 continuation tokens carry an explicit
+`behavior_logprob_mask=0`; sampled tokens carry `1`. The gate never infers
+provenance from a numeric logprob such as zero. For SGLang, launchers pin
+`SGLANG_RETURN_ORIGINAL_LOGPROB=false`; that declaration is not trusted as
+proof by itself—the zero-update parity gate remains the runtime authority.
+
 ## Winner-modulated R1 reward
 
 For split-adapter debate runs, `--debate-r1-reward judge_rejection_task`

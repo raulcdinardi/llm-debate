@@ -285,6 +285,7 @@ class _CwTinyTokenizer:
 
 
 def test_debate_runtime_integration_fake_sampler():
+    from llm_local_rl.behavior_policy import BEHAVIOR_POLICY_LOGPROBS, BehaviorPolicySpec
     from llm_local_rl.debate_parity import DebateConfig
     from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
     from llm_local_rl.types import SamplingRequest, SamplingResult
@@ -305,6 +306,8 @@ def test_debate_runtime_integration_fake_sampler():
                     completion_token_ids=tokenizer.encode(text),
                     completion_logprobs=[-0.1] * len(tokenizer.encode(text)),
                     text=text,
+                    behavior_policy=BehaviorPolicySpec.from_sampling_request(req),
+                    completion_logprob_semantics=BEHAVIOR_POLICY_LOGPROBS,
                     raw={"scripted": True},
                 ))
             return outs

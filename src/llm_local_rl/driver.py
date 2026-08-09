@@ -7,6 +7,7 @@ from statistics import mean, pstdev
 from contextlib import nullcontext
 
 from llm_local_rl.base_model_judge import RemoteBaseJudgeConfig, build_remote_base_judge
+from llm_local_rl.behavior_policy import validate_sampling_result_contract
 from llm_local_rl.config import CheckpointManifest, TrainRunConfig
 from llm_local_rl.debate_parity import (
     DebateConfig,
@@ -282,6 +283,7 @@ class TrainingDriver:
             on_policy_logprob_abs_tol=self.config.on_policy_logprob_abs_tol,
             on_policy_logprob_warning_path=on_policy_warning_path,
             on_policy_logprob_max_records_per_batch=self.config.on_policy_logprob_max_records_per_batch,
+            behavior_policy=self.config.behavior_policy(),
         )
 
     def _configure_tracing(self) -> None:
@@ -298,6 +300,7 @@ class TrainingDriver:
             metadata={
                 "model_path": self.config.model_path,
                 "tokenizer_path": self.config.tokenizer_path or self.config.model_path,
+                "behavior_policy_contract": self.config.behavior_policy().to_dict(),
             },
         )
 
@@ -530,6 +533,15 @@ class TrainingDriver:
                 stop_on_concluded=self.config.debate_stop_on_concluded,
                 base_r2_prefill=self.config.base_r2_prefill,
                 base_r3_prefill=self.config.base_r3_prefill,
+                judge_prompt_format=self.config.debate_judge_prompt_format,
+                judge_max_tokens=self.config.debate_judge_max_tokens,
+                judge_temperature=self.config.debate_judge_temperature,
+                judge_top_p=self.config.debate_judge_top_p,
+                judge_top_k=self.config.debate_judge_top_k,
+                judge_min_p=self.config.debate_judge_min_p,
+                judge_presence_penalty=self.config.debate_judge_presence_penalty,
+                judge_repetition_penalty=self.config.debate_judge_repetition_penalty,
+                judge_seed=self.config.debate_judge_seed,
                 debate_judge_server_url=self.config.debate_judge_server_url,
                 debate_judge_server_adapter_path=self.config.debate_judge_server_adapter_path,
             ),
@@ -588,7 +600,13 @@ class TrainingDriver:
                     )
                 )
             results = self.sampler.sample_many(requests)
-            for (_request_idx, instance), result in zip(chunk, results, strict=True):
+            for (_request_idx, instance), request, result in zip(
+                chunk,
+                requests,
+                results,
+                strict=True,
+            ):
+                validate_sampling_result_contract(request=request, result=result)
                 scored_completion_token_ids = prefill_token_ids + result.completion_token_ids
                 reward, reward_metrics = self.env.score_completion(
                     instance=instance,

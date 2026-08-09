@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+import pytest
+
+from llm_local_rl.behavior_policy import BEHAVIOR_POLICY_LOGPROBS, BehaviorPolicySpec
 from llm_local_rl.debate_parity import DebateConfig
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
 from llm_local_rl.debate_tasks import HTSequenceDebateTask
@@ -68,13 +71,17 @@ class TinyChatTokenizer:
 class RecordingSampler:
     tokenizer: object
     requests: list[SamplingRequest]
+    batches: list[list[SamplingRequest]] = field(default_factory=list)
 
     def sample_many(self, requests: list[SamplingRequest]) -> list[SamplingResult]:
+        self.batches.append(list(requests))
         self.requests.extend(requests)
         outputs = []
         for request in requests:
             if request.adapter_name in {"shared", "solution"}:
                 text = "<SOLUTION>H, T, H, T</SOLUTION>"
+            elif request.adapter_name == "judge":
+                text = "<VERDICT>A</VERDICT>"
             else:
                 text = "Their answer violates the format."
             token_ids = self.tokenizer.encode(text, add_special_tokens=False)
@@ -85,6 +92,8 @@ class RecordingSampler:
                     completion_token_ids=token_ids,
                     completion_logprobs=[-0.1] * len(token_ids),
                     text=text,
+                    behavior_policy=BehaviorPolicySpec.from_sampling_request(request),
+                    completion_logprob_semantics=BEHAVIOR_POLICY_LOGPROBS,
                     raw={},
                 )
             )
@@ -150,3 +159,66 @@ def test_external_judge_fn_short_circuits_three_round_policy_judge_sampling() ->
         "debate",
         "debate",
     ]
+
+
+def test_frozen_base_sft_judge_uses_same_sampler_in_one_ordered_batch() -> None:
+    tokenizer = TinyChatTokenizer()
+    sampler = RecordingSampler(tokenizer=tokenizer, requests=[])
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=3,
+            num_groups=2,
+            group_size=2,
+            judge_adapter="judge",
+            judge_prompt_format="base_model_sft",
+            judge_max_tokens=512,
+            judge_temperature=1.0,
+            judge_top_p=0.95,
+            judge_top_k=20,
+            judge_presence_penalty=1.5,
+            judge_seed=0,
+        ),
+        adapter_layout="split",
+    )
+
+    runtime.rollout(step_seed=7)
+
+    assert len(sampler.batches) == 4
+    judge_batch = sampler.batches[-1]
+    assert len(judge_batch) == 2
+    assert all(request.adapter_name == "judge" for request in judge_batch)
+    assert all(request.max_tokens == 512 for request in judge_batch)
+    assert all(request.temperature == 1.0 for request in judge_batch)
+    assert all(request.top_p == 0.95 for request in judge_batch)
+    assert all(request.top_k == 20 for request in judge_batch)
+    assert all(request.presence_penalty == 1.5 for request in judge_batch)
+    assert all(request.seed == 0 for request in judge_batch)
+    prompts = [tokenizer.decode(request.prompt_token_ids) for request in judge_batch]
+    assert all(prompt.startswith("System:\n") for prompt in prompts)
+    assert all(prompt.endswith("1)") for prompt in prompts)
+    assert all("Round 2 (Argument):\nTheir answer violates the format." in prompt for prompt in prompts)
+    assert all("Round 3 (Response):\nTheir answer violates the format." in prompt for prompt in prompts)
+
+
+def test_base_sft_judge_rejects_incomplete_debate_instead_of_blank_rounds() -> None:
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=TinyChatTokenizer(),
+        sampler=RecordingSampler(tokenizer=TinyChatTokenizer(), requests=[]),
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=1,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="judge",
+            judge_prompt_format="base_model_sft",
+        ),
+        adapter_layout="split",
+    )
+
+    with pytest.raises(ValueError, match="complete three-round debate"):
+        runtime.rollout(step_seed=0)

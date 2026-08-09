@@ -8,6 +8,8 @@ import sys
 
 
 UNIT_TARGETS = [
+    "tests/unit/test_behavior_policy.py",
+    "tests/unit/test_behavior_policy_microprobe.py",
     "tests/unit/test_ht_sequence_env.py",
     "tests/unit/test_masking.py",
     "tests/unit/test_episode_routing.py",

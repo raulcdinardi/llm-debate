@@ -167,3 +167,56 @@ def test_parse_sglang_sampler_backend_args(monkeypatch) -> None:
     assert args.compile_train_logprob_helper is True
     assert args.stop_parsed_reward_hacking_min == 0.45
     assert args.stop_parsed_reward_hacking_max == 0.55
+
+
+def test_cli_does_not_expose_a_parity_gate_disable_flag() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--model-path",
+                "/tmp/model",
+                "--output-dir",
+                "/tmp/out",
+                "--no-on-policy-logprob-check",
+            ]
+        )
+
+
+def test_cli_parses_same_engine_base_sft_judge_contract() -> None:
+    args = parse_args(
+        [
+            "--model-path",
+            "/model",
+            "--output-dir",
+            "/out",
+            "--mode",
+            "debate",
+            "--adapter-layout",
+            "split",
+            "--debate-judge-adapter",
+            "judge",
+            "--debate-judge-prompt-format",
+            "base_model_sft",
+            "--debate-judge-max-tokens",
+            "512",
+            "--debate-judge-temperature",
+            "1",
+            "--debate-judge-top-p",
+            ".95",
+            "--debate-judge-top-k",
+            "20",
+            "--debate-judge-presence-penalty",
+            "1.5",
+            "--debate-judge-seed",
+            "0",
+        ]
+    )
+
+    assert args.debate_judge_adapter == "judge"
+    assert args.debate_judge_prompt_format == "base_model_sft"
+    assert args.debate_judge_max_tokens == 512
+    assert args.debate_judge_temperature == 1.0
+    assert args.debate_judge_top_p == 0.95
+    assert args.debate_judge_top_k == 20
+    assert args.debate_judge_presence_penalty == 1.5
+    assert args.debate_judge_seed == 0

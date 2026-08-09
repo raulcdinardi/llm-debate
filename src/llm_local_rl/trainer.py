@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 from pathlib import Path
@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from llm_local_rl.behavior_policy import BehaviorPolicySpec
 from llm_local_rl.memory_trace import (
     MemoryTraceRecorder,
     current_alloc_bytes,
@@ -33,6 +34,10 @@ TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD = "selective_lm_head"
 TRAIN_LOGPROB_BACKENDS = (TRAIN_LOGPROB_BACKEND_FULL_LOGITS, TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD)
 
 
+class BehaviorPolicyLogprobMismatchError(RuntimeError):
+    """Raised before PPO ratio/backward when zero-update parity fails."""
+
+
 @dataclass(frozen=True)
 class TrainerConfig:
     base_model_path: str
@@ -52,16 +57,23 @@ class TrainerConfig:
     train_logprob_backend: str = TRAIN_LOGPROB_BACKEND_FULL_LOGITS
     compile_train_logprob_helper: bool = False
     gradient_checkpointing: bool = True
-    on_policy_logprob_check: bool = False
+    on_policy_logprob_check: bool = True
     on_policy_logprob_abs_tol: float = 1e-3
     on_policy_logprob_warning_path: str | None = None
     on_policy_logprob_max_records_per_batch: int = 8
+    behavior_policy: BehaviorPolicySpec = field(default_factory=BehaviorPolicySpec)
 
     def __post_init__(self) -> None:
         if self.train_logprob_backend not in TRAIN_LOGPROB_BACKENDS:
             raise ValueError(
                 f"Unsupported train_logprob_backend={self.train_logprob_backend!r}; "
                 f"expected one of {TRAIN_LOGPROB_BACKENDS!r}."
+            )
+        self.behavior_policy.assert_exact_trainer_reconstruction_supported()
+        if not self.on_policy_logprob_check:
+            raise ValueError(
+                "PPO training requires the fail-closed on-policy logprob check; "
+                "on_policy_logprob_check=False is not allowed."
             )
 
 
@@ -78,10 +90,33 @@ def _validate_example_lengths(example: TrainExample) -> None:
         len(example.input_ids)
         == len(example.target_ids)
         == len(example.loss_mask)
+        == len(example.behavior_logprob_mask)
         == len(example.old_logprobs)
         == len(example.advantages)
     ):
         raise ValueError("TrainExample fields must all have equal length.")
+    if any(value not in (0, 1) for value in example.loss_mask):
+        raise ValueError("TrainExample loss_mask must contain only 0 or 1.")
+    if any(value not in (0, 1) for value in example.behavior_logprob_mask):
+        raise ValueError("TrainExample behavior_logprob_mask must contain only 0 or 1.")
+    if any(
+        has_behavior_logprob and not has_loss
+        for has_behavior_logprob, has_loss in zip(
+            example.behavior_logprob_mask,
+            example.loss_mask,
+            strict=True,
+        )
+    ):
+        raise ValueError("behavior_logprob_mask must be a subset of loss_mask.")
+    if any(
+        advantage != 0.0 and not has_behavior_logprob
+        for advantage, has_behavior_logprob in zip(
+            example.advantages,
+            example.behavior_logprob_mask,
+            strict=True,
+        )
+    ):
+        raise ValueError("Every nonzero-advantage token must have a behavior-policy logprob.")
 
 
 def _is_overlength(*, example: TrainExample, max_tokens: int = 0) -> bool:
@@ -121,6 +156,7 @@ def _pad_batch(
     target_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long, device=device)
     attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
     loss_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
+    behavior_logprob_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
     old_logprobs = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
     advantages = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
 
@@ -130,6 +166,11 @@ def _pad_batch(
         target_ids[row_idx, :n] = torch.tensor(example.target_ids, dtype=torch.long, device=device)
         attention_mask[row_idx, :n] = 1
         loss_mask[row_idx, :n] = torch.tensor(example.loss_mask, dtype=torch.bool, device=device)
+        behavior_logprob_mask[row_idx, :n] = torch.tensor(
+            example.behavior_logprob_mask,
+            dtype=torch.bool,
+            device=device,
+        )
         old_logprobs[row_idx, :n] = torch.tensor(example.old_logprobs, dtype=torch.float32, device=device)
         advantages[row_idx, :n] = torch.tensor(example.advantages, dtype=torch.float32, device=device)
 
@@ -138,6 +179,7 @@ def _pad_batch(
         "target_ids": target_ids,
         "attention_mask": attention_mask,
         "loss_mask": loss_mask,
+        "behavior_logprob_mask": behavior_logprob_mask,
         "old_logprobs": old_logprobs,
         "advantages": advantages,
     }
@@ -151,6 +193,7 @@ def _target_token_logprobs(
     *,
     logits: torch.Tensor,
     target_ids: torch.Tensor,
+    behavior_temperature: float = 1.0,
     max_positions_per_chunk: int = _TARGET_LOGPROB_POSITIONS_PER_CHUNK,
 ) -> torch.Tensor:
     if logits.ndim != 3:
@@ -159,6 +202,10 @@ def _target_token_logprobs(
         raise ValueError(f"target_ids shape {tuple(target_ids.shape)} does not match logits prefix {tuple(logits.shape[:2])}")
     if max_positions_per_chunk <= 0:
         raise ValueError("max_positions_per_chunk must be positive")
+    if not math.isfinite(float(behavior_temperature)) or float(behavior_temperature) <= 0.0:
+        raise ValueError(
+            f"behavior_temperature must be finite and positive, got {behavior_temperature!r}."
+        )
     vocab_size = int(logits.shape[-1])
     flat_logits = logits.reshape(-1, vocab_size)
     flat_target_ids = target_ids.reshape(-1)
@@ -167,7 +214,7 @@ def _target_token_logprobs(
         end = min(start + max_positions_per_chunk, int(flat_target_ids.numel()))
         chunks.append(
             -F.cross_entropy(
-                flat_logits[start:end].float(),
+                flat_logits[start:end].float() / float(behavior_temperature),
                 flat_target_ids[start:end],
                 reduction="none",
             )
@@ -210,7 +257,9 @@ def _selected_lm_head_token_logprobs(
     hidden_states: torch.Tensor,
     lm_head,
     target_ids: torch.Tensor,
-    trained_positions: torch.Tensor,
+    selected_positions: torch.Tensor,
+    entropy_positions: torch.Tensor | None = None,
+    behavior_temperature: float = 1.0,
     max_positions_per_chunk: int = _TARGET_LOGPROB_POSITIONS_PER_CHUNK,
     compile_helper: bool = False,
 ) -> tuple[torch.Tensor, float]:
@@ -220,22 +269,41 @@ def _selected_lm_head_token_logprobs(
         raise ValueError(
             f"target_ids shape {tuple(target_ids.shape)} does not match hidden prefix {tuple(hidden_states.shape[:2])}"
         )
-    if trained_positions.shape != target_ids.shape:
+    if selected_positions.shape != target_ids.shape:
         raise ValueError(
-            f"trained_positions shape {tuple(trained_positions.shape)} does not match target_ids {tuple(target_ids.shape)}"
+            f"selected_positions shape {tuple(selected_positions.shape)} does not match target_ids {tuple(target_ids.shape)}"
         )
-    if trained_positions.dtype != torch.bool:
-        raise ValueError(f"trained_positions must be bool, got {trained_positions.dtype}")
+    if selected_positions.dtype != torch.bool:
+        raise ValueError(f"selected_positions must be bool, got {selected_positions.dtype}")
+    if entropy_positions is not None:
+        if entropy_positions.shape != selected_positions.shape:
+            raise ValueError(
+                f"entropy_positions shape {tuple(entropy_positions.shape)} does not match "
+                f"selected_positions {tuple(selected_positions.shape)}"
+            )
+        if entropy_positions.dtype != torch.bool:
+            raise ValueError(f"entropy_positions must be bool, got {entropy_positions.dtype}")
+        if bool((entropy_positions & ~selected_positions).any().detach().cpu().item()):
+            raise ValueError("entropy_positions must be a subset of selected_positions.")
     if max_positions_per_chunk <= 0:
         raise ValueError("max_positions_per_chunk must be positive")
+    if not math.isfinite(float(behavior_temperature)) or float(behavior_temperature) <= 0.0:
+        raise ValueError(
+            f"behavior_temperature must be finite and positive, got {behavior_temperature!r}."
+        )
     if not hasattr(lm_head, "weight"):
         raise ValueError("lm_head must expose a weight tensor.")
 
-    selected_target_ids = target_ids[trained_positions]
+    selected_target_ids = target_ids[selected_positions]
     if int(selected_target_ids.numel()) == 0:
         return hidden_states.new_empty((0,), dtype=torch.float32), 0.0
 
-    selected_hidden_states = hidden_states[trained_positions]
+    selected_hidden_states = hidden_states[selected_positions]
+    selected_entropy_positions = (
+        torch.ones_like(selected_target_ids, dtype=torch.bool)
+        if entropy_positions is None
+        else entropy_positions[selected_positions]
+    )
     weight = lm_head.weight
     bias = getattr(lm_head, "bias", None)
     if int(weight.shape[1]) != int(selected_hidden_states.shape[-1]):
@@ -254,7 +322,7 @@ def _selected_lm_head_token_logprobs(
             bias=bias,
             compile_helper=compile_helper,
         )
-        logits_float = logits.float()
+        logits_float = logits.float() / float(behavior_temperature)
         logprob_chunks.append(
             -F.cross_entropy(
                 logits_float,
@@ -264,7 +332,10 @@ def _selected_lm_head_token_logprobs(
         )
         with torch.no_grad():
             log_probs = torch.log_softmax(logits_float.detach(), dim=-1)
-            entropy_sum += float((-(log_probs.exp() * log_probs).sum(dim=-1)).sum().detach().cpu().item())
+            entropy_values = -(log_probs.exp() * log_probs).sum(dim=-1)
+            entropy_sum += float(
+                entropy_values[selected_entropy_positions[start:end]].sum().detach().cpu().item()
+            )
 
     return torch.cat(logprob_chunks, dim=0), entropy_sum
 
@@ -298,18 +369,21 @@ def _current_logprob_rows_from_token_logprobs(
 def _current_logprob_rows_from_selected_logprobs(
     *,
     selected_logprobs: torch.Tensor,
-    trained_positions: torch.Tensor,
+    selected_positions: torch.Tensor,
     batch: list[TrainExample],
     max_tokens: int = 0,
 ) -> list[list[float]]:
     selected_logprobs_cpu = selected_logprobs.detach().float().cpu().tolist()
-    trained_positions_cpu = trained_positions.detach().cpu()
+    selected_positions_cpu = selected_positions.detach().cpu()
     current_logprob_rows: list[list[float]] = []
     selected_idx = 0
     for row_idx, example in enumerate(batch):
         row_len = _truncated_row_length(example=example, max_tokens=max_tokens)
         row = [0.0] * row_len
-        active_positions = torch.nonzero(trained_positions_cpu[row_idx, :row_len], as_tuple=False).flatten().tolist()
+        active_positions = torch.nonzero(
+            selected_positions_cpu[row_idx, :row_len],
+            as_tuple=False,
+        ).flatten().tolist()
         for position in active_positions:
             row[int(position)] = float(selected_logprobs_cpu[selected_idx])
             selected_idx += 1
@@ -435,7 +509,8 @@ class MultiAdapterTrainer:
         self,
         *,
         tensors: dict[str, torch.Tensor],
-        trained_positions: torch.Tensor,
+        selected_positions: torch.Tensor,
+        entropy_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, float]:
         hidden_states = self._selective_lm_head_hidden_states(tensors=tensors)
         lm_head = self._causal_lm_for_selective_lm_head().get_output_embeddings()
@@ -443,7 +518,9 @@ class MultiAdapterTrainer:
             hidden_states=hidden_states,
             lm_head=lm_head,
             target_ids=tensors["target_ids"],
-            trained_positions=trained_positions,
+            selected_positions=selected_positions,
+            entropy_positions=entropy_positions,
+            behavior_temperature=self.config.behavior_policy.temperature,
             compile_helper=self.config.compile_train_logprob_helper,
         )
 
@@ -600,13 +677,20 @@ class MultiAdapterTrainer:
                     input_ids=tensors["input_ids"],
                     attention_mask=tensors["attention_mask"],
                 )
-                token_logprobs = _target_token_logprobs(logits=outputs.logits, target_ids=tensors["target_ids"])
+                token_logprobs = _target_token_logprobs(
+                    logits=outputs.logits,
+                    target_ids=tensors["target_ids"],
+                    behavior_temperature=self.config.behavior_policy.temperature,
+                )
                 if is_model_io_tracing_enabled():
                     trace_top_k = get_trace_top_logprobs()
                     top_values = None
                     top_indices = None
                     if trace_top_k > 0:
-                        log_probs = torch.log_softmax(outputs.logits.float(), dim=-1)
+                        log_probs = torch.log_softmax(
+                            outputs.logits.float() / float(self.config.behavior_policy.temperature),
+                            dim=-1,
+                        )
                         top_values, top_indices = torch.topk(
                             log_probs,
                             k=min(trace_top_k, int(log_probs.shape[-1])),
@@ -629,18 +713,18 @@ class MultiAdapterTrainer:
                     max_tokens=self.config.train_max_tokens,
                 )
             elif self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD:
-                trained_positions = tensors["loss_mask"] & (tensors["advantages"] != 0.0)
-                trained_tokens = int(trained_positions.sum().detach().cpu().item())
-                if trained_tokens > 0:
+                completion_positions = tensors["behavior_logprob_mask"]
+                completion_tokens = int(completion_positions.sum().detach().cpu().item())
+                if completion_tokens > 0:
                     selected_logprobs, _ = self._selective_lm_head_logprobs(
                         tensors=tensors,
-                        trained_positions=trained_positions,
+                        selected_positions=completion_positions,
                     )
                 else:
                     selected_logprobs = tensors["old_logprobs"].new_empty((0,), dtype=torch.float32)
                 out = _current_logprob_rows_from_selected_logprobs(
                     selected_logprobs=selected_logprobs,
-                    trained_positions=trained_positions,
+                    selected_positions=completion_positions,
                     batch=batch,
                     max_tokens=self.config.train_max_tokens,
                 )
@@ -704,10 +788,15 @@ class MultiAdapterTrainer:
         total_lm_head_positions = 0
         total_minibatches = 0
         on_policy_checked_tokens = 0
-        on_policy_zero_advantage_loss_mask_tokens_skipped = 0
+        on_policy_trained_tokens_checked = 0
+        on_policy_zero_advantage_loss_mask_tokens_checked = 0
+        on_policy_injected_loss_mask_tokens_skipped = 0
         on_policy_violations = 0
+        on_policy_trained_token_violations = 0
         on_policy_sum_abs_diff = 0.0
         on_policy_max_abs_diff = 0.0
+        on_policy_trained_sum_abs_diff = 0.0
+        on_policy_trained_max_abs_diff = 0.0
         ratio_values: list[float] = []
         clip_count = 0
         positive_adv_clip_count = 0
@@ -738,6 +827,13 @@ class MultiAdapterTrainer:
             total_forward_input_tokens += int(tensors["attention_mask"].sum().detach().cpu().item())
             total_padded_input_tokens += int(tensors["input_ids"].numel())
             trained_positions = tensors["loss_mask"] & (tensors["advantages"] != 0.0)
+            invalid_trained_positions = trained_positions & ~tensors["behavior_logprob_mask"]
+            if bool(invalid_trained_positions.any().detach().cpu().item()):
+                self.optimizer.zero_grad(set_to_none=True)
+                raise ValueError(
+                    "A nonzero-advantage token is missing a behavior-policy logprob; "
+                    "refusing to compute a PPO ratio."
+                )
             trained_tokens = int(trained_positions.sum().detach().cpu().item())
 
             _mem_alloc_after_forward_full = ""
@@ -758,12 +854,20 @@ class MultiAdapterTrainer:
                     attention_mask=tensors["attention_mask"],
                 )
                 total_lm_head_positions += int(tensors["input_ids"].numel())
-                token_logprobs = _target_token_logprobs(logits=outputs.logits, target_ids=tensors["target_ids"])
+                token_logprobs = _target_token_logprobs(
+                    logits=outputs.logits,
+                    target_ids=tensors["target_ids"],
+                    behavior_temperature=self.config.behavior_policy.temperature,
+                )
                 selected_logprobs = token_logprobs[trained_positions]
                 selected_entropy_sum = 0.0
                 if trained_tokens > 0:
                     with torch.no_grad():
-                        trained_log_probs = torch.log_softmax(outputs.logits[trained_positions].float(), dim=-1)
+                        trained_log_probs = torch.log_softmax(
+                            outputs.logits[trained_positions].float()
+                            / float(self.config.behavior_policy.temperature),
+                            dim=-1,
+                        )
                         selected_entropy_sum = float(
                             (-(trained_log_probs.exp() * trained_log_probs).sum(dim=-1)).sum().detach().cpu().item()
                         )
@@ -782,7 +886,10 @@ class MultiAdapterTrainer:
                     top_values = None
                     top_indices = None
                     if trace_top_k > 0:
-                        log_probs = torch.log_softmax(outputs.logits.float(), dim=-1)
+                        log_probs = torch.log_softmax(
+                            outputs.logits.float() / float(self.config.behavior_policy.temperature),
+                            dim=-1,
+                        )
                         top_values, top_indices = torch.topk(
                             log_probs,
                             k=min(trace_top_k, int(log_probs.shape[-1])),
@@ -800,8 +907,12 @@ class MultiAdapterTrainer:
                         top_logprobs=top_values,
                     )
             elif self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD:
-                total_lm_head_positions += trained_tokens
-                if trained_tokens > 0:
+                # Config validation makes the fail-closed parity gate mandatory, so
+                # selective scoring always covers every sampled behavior-policy token.
+                selected_positions = tensors["behavior_logprob_mask"]
+                selected_position_count = int(selected_positions.sum().detach().cpu().item())
+                total_lm_head_positions += selected_position_count
+                if selected_position_count > 0:
                     if self._mem_trace_active():
                         reset_peak(self.compute_device)
                         _mem_t_forward = now_seconds()
@@ -813,24 +924,29 @@ class MultiAdapterTrainer:
                         reset_peak(self.compute_device)
                         _mem_t_lm_head = now_seconds()
                     lm_head = self._causal_lm_for_selective_lm_head().get_output_embeddings()
-                    selected_logprobs, selected_entropy_sum = _selected_lm_head_token_logprobs(
+                    scored_logprobs, selected_entropy_sum = _selected_lm_head_token_logprobs(
                         hidden_states=hidden_states,
                         lm_head=lm_head,
                         target_ids=tensors["target_ids"],
-                        trained_positions=trained_positions,
+                        selected_positions=selected_positions,
+                        entropy_positions=trained_positions,
+                        behavior_temperature=self.config.behavior_policy.temperature,
                         compile_helper=self.config.compile_train_logprob_helper,
                     )
+                    trained_within_selected = trained_positions[selected_positions]
+                    selected_logprobs = scored_logprobs[trained_within_selected]
                     if self._mem_trace_active():
                         _mem_alloc_after_lm_head_sel = current_alloc_bytes(self.compute_device)
                         _mem_peak_after_lm_head_sel = peak_alloc_bytes(self.compute_device)
                         _mem_elapsed_lm_head = now_seconds() - _mem_t_lm_head
                 else:
-                    selected_logprobs = tensors["old_logprobs"].new_empty((0,), dtype=torch.float32)
+                    scored_logprobs = tensors["old_logprobs"].new_empty((0,), dtype=torch.float32)
+                    selected_logprobs = scored_logprobs
                     selected_entropy_sum = 0.0
                 if self.config.on_policy_logprob_check:
                     current_logprob_rows = _current_logprob_rows_from_selected_logprobs(
-                        selected_logprobs=selected_logprobs,
-                        trained_positions=trained_positions,
+                        selected_logprobs=scored_logprobs,
+                        selected_positions=selected_positions,
                         batch=minibatch,
                         max_tokens=self.config.train_max_tokens,
                     )
@@ -849,45 +965,66 @@ class MultiAdapterTrainer:
                     minibatch_start=start_idx,
                 )
                 on_policy_checked_tokens += check_result.num_checked_tokens
-                on_policy_zero_advantage_loss_mask_tokens_skipped += (
-                    check_result.num_zero_advantage_loss_mask_tokens_skipped
+                on_policy_trained_tokens_checked += check_result.num_trained_tokens_checked
+                on_policy_zero_advantage_loss_mask_tokens_checked += (
+                    check_result.num_zero_advantage_loss_mask_tokens_checked
+                )
+                on_policy_injected_loss_mask_tokens_skipped += (
+                    check_result.num_injected_loss_mask_tokens_skipped
                 )
                 on_policy_violations += check_result.num_violations
+                on_policy_trained_token_violations += check_result.num_trained_token_violations
                 on_policy_sum_abs_diff += check_result.sum_abs_logprob_diff
                 on_policy_max_abs_diff = max(on_policy_max_abs_diff, check_result.max_abs_logprob_diff)
+                on_policy_trained_sum_abs_diff += check_result.trained_token_sum_abs_logprob_diff
+                on_policy_trained_max_abs_diff = max(
+                    on_policy_trained_max_abs_diff,
+                    check_result.trained_token_max_abs_logprob_diff,
+                )
                 if check_result.records:
                     self._write_on_policy_logprob_records(records=check_result.records)
                 if check_result.num_violations > 0:
-                    print(
-                        json.dumps(
-                            {
-                                "event": "on_policy_logprob_warning",
-                                "adapter_name": adapter_name,
-                                "minibatch_start": start_idx,
-                                "checked_tokens": check_result.num_checked_tokens,
-                                "trained_tokens_checked": check_result.num_checked_tokens,
-                                "zero_advantage_loss_mask_tokens_skipped": (
-                                    check_result.num_zero_advantage_loss_mask_tokens_skipped
-                                ),
-                                "violations": check_result.num_violations,
-                                "max_abs_diff": check_result.max_abs_logprob_diff,
-                                "trained_token_max_abs_diff": check_result.max_abs_logprob_diff,
-                                "mean_abs_diff": (
-                                    check_result.sum_abs_logprob_diff / check_result.num_checked_tokens
-                                    if check_result.num_checked_tokens > 0
-                                    else 0.0
-                                ),
-                                "trained_token_mean_abs_diff": (
-                                    check_result.sum_abs_logprob_diff / check_result.num_checked_tokens
-                                    if check_result.num_checked_tokens > 0
-                                    else 0.0
-                                ),
-                                "first_offending_trained_token": check_result.first_offending_trained_token,
-                                "warning_path": self.config.on_policy_logprob_warning_path,
-                            },
-                            sort_keys=True,
+                    event = {
+                        "event": "behavior_policy_logprob_contract_violation",
+                        "adapter_name": adapter_name,
+                        "minibatch_start": start_idx,
+                        "completion_tokens_checked": check_result.num_checked_tokens,
+                        "trained_tokens_checked": check_result.num_trained_tokens_checked,
+                        "zero_advantage_loss_mask_tokens_checked": (
+                            check_result.num_zero_advantage_loss_mask_tokens_checked
                         ),
-                        flush=True,
+                        "injected_loss_mask_tokens_skipped": (
+                            check_result.num_injected_loss_mask_tokens_skipped
+                        ),
+                        "violations": check_result.num_violations,
+                        "trained_token_violations": check_result.num_trained_token_violations,
+                        "max_abs_diff": check_result.max_abs_logprob_diff,
+                        "trained_token_max_abs_diff": check_result.trained_token_max_abs_logprob_diff,
+                        "mean_abs_diff": (
+                            check_result.sum_abs_logprob_diff / check_result.num_checked_tokens
+                            if check_result.num_checked_tokens > 0
+                            else 0.0
+                        ),
+                        "trained_token_mean_abs_diff": (
+                            check_result.trained_token_sum_abs_logprob_diff
+                            / check_result.num_trained_tokens_checked
+                            if check_result.num_trained_tokens_checked > 0
+                            else 0.0
+                        ),
+                        "first_offending_token": check_result.first_offending_token,
+                        "first_offending_trained_token": check_result.first_offending_trained_token,
+                        "report_path": self.config.on_policy_logprob_warning_path,
+                        "behavior_policy": self.config.behavior_policy.to_dict(),
+                    }
+                    print(json.dumps(event, sort_keys=True), flush=True)
+                    self.optimizer.zero_grad(set_to_none=True)
+                    raise BehaviorPolicyLogprobMismatchError(
+                        "Behavior-policy logprob parity failed before PPO ratio/backward: "
+                        f"adapter={adapter_name!r}, minibatch_start={start_idx}, "
+                        f"violations={check_result.num_violations}/"
+                        f"{check_result.num_checked_tokens}, "
+                        f"max_abs_diff={check_result.max_abs_logprob_diff:.9g}, "
+                        f"abs_tol={self.config.on_policy_logprob_abs_tol:.9g}."
                     )
             if trained_tokens == 0:
                 continue
@@ -974,26 +1111,42 @@ class MultiAdapterTrainer:
                 "num_dropped_overlength": float(num_dropped_overlength),
                 "num_trained_tokens": 0.0,
                 "on_policy_logprob_checked_tokens": float(on_policy_checked_tokens),
-                "trained_tokens_checked": float(on_policy_checked_tokens),
-                "zero_advantage_loss_mask_tokens_skipped": float(
-                    on_policy_zero_advantage_loss_mask_tokens_skipped
+                "completion_tokens_checked": float(on_policy_checked_tokens),
+                "trained_tokens_checked": float(on_policy_trained_tokens_checked),
+                "zero_advantage_loss_mask_tokens_checked": float(
+                    on_policy_zero_advantage_loss_mask_tokens_checked
+                ),
+                "zero_advantage_loss_mask_tokens_skipped": 0.0,
+                "injected_loss_mask_tokens_skipped": float(
+                    on_policy_injected_loss_mask_tokens_skipped
                 ),
                 "trained_token_mean_abs_diff": (
-                    on_policy_sum_abs_diff / on_policy_checked_tokens
-                    if on_policy_checked_tokens > 0
+                    on_policy_trained_sum_abs_diff / on_policy_trained_tokens_checked
+                    if on_policy_trained_tokens_checked > 0
                     else 0.0
                 ),
-                "trained_token_max_abs_diff": float(on_policy_max_abs_diff),
-                "on_policy_logprob_trained_tokens_checked": float(on_policy_checked_tokens),
-                "on_policy_logprob_zero_advantage_loss_mask_tokens_skipped": float(
-                    on_policy_zero_advantage_loss_mask_tokens_skipped
+                "trained_token_max_abs_diff": float(on_policy_trained_max_abs_diff),
+                "on_policy_logprob_trained_tokens_checked": float(
+                    on_policy_trained_tokens_checked
+                ),
+                "on_policy_logprob_trained_token_violations": float(
+                    on_policy_trained_token_violations
+                ),
+                "on_policy_logprob_zero_advantage_loss_mask_tokens_checked": float(
+                    on_policy_zero_advantage_loss_mask_tokens_checked
+                ),
+                "on_policy_logprob_zero_advantage_loss_mask_tokens_skipped": 0.0,
+                "on_policy_logprob_injected_loss_mask_tokens_skipped": float(
+                    on_policy_injected_loss_mask_tokens_skipped
                 ),
                 "on_policy_logprob_trained_token_mean_abs_diff": (
-                    on_policy_sum_abs_diff / on_policy_checked_tokens
-                    if on_policy_checked_tokens > 0
+                    on_policy_trained_sum_abs_diff / on_policy_trained_tokens_checked
+                    if on_policy_trained_tokens_checked > 0
                     else 0.0
                 ),
-                "on_policy_logprob_trained_token_max_abs_diff": float(on_policy_max_abs_diff),
+                "on_policy_logprob_trained_token_max_abs_diff": float(
+                    on_policy_trained_max_abs_diff
+                ),
                 "on_policy_logprob_violations": float(on_policy_violations),
                 "on_policy_logprob_mean_abs_diff": (
                     on_policy_sum_abs_diff / on_policy_checked_tokens
@@ -1105,26 +1258,42 @@ class MultiAdapterTrainer:
                 total_lm_head_positions / total_padded_input_tokens if total_padded_input_tokens > 0 else 0.0
             ),
             "on_policy_logprob_checked_tokens": float(on_policy_checked_tokens),
-            "trained_tokens_checked": float(on_policy_checked_tokens),
-            "zero_advantage_loss_mask_tokens_skipped": float(
-                on_policy_zero_advantage_loss_mask_tokens_skipped
+            "completion_tokens_checked": float(on_policy_checked_tokens),
+            "trained_tokens_checked": float(on_policy_trained_tokens_checked),
+            "zero_advantage_loss_mask_tokens_checked": float(
+                on_policy_zero_advantage_loss_mask_tokens_checked
+            ),
+            "zero_advantage_loss_mask_tokens_skipped": 0.0,
+            "injected_loss_mask_tokens_skipped": float(
+                on_policy_injected_loss_mask_tokens_skipped
             ),
             "trained_token_mean_abs_diff": (
-                on_policy_sum_abs_diff / on_policy_checked_tokens
-                if on_policy_checked_tokens > 0
+                on_policy_trained_sum_abs_diff / on_policy_trained_tokens_checked
+                if on_policy_trained_tokens_checked > 0
                 else 0.0
             ),
-            "trained_token_max_abs_diff": float(on_policy_max_abs_diff),
-            "on_policy_logprob_trained_tokens_checked": float(on_policy_checked_tokens),
-            "on_policy_logprob_zero_advantage_loss_mask_tokens_skipped": float(
-                on_policy_zero_advantage_loss_mask_tokens_skipped
+            "trained_token_max_abs_diff": float(on_policy_trained_max_abs_diff),
+            "on_policy_logprob_trained_tokens_checked": float(
+                on_policy_trained_tokens_checked
+            ),
+            "on_policy_logprob_trained_token_violations": float(
+                on_policy_trained_token_violations
+            ),
+            "on_policy_logprob_zero_advantage_loss_mask_tokens_checked": float(
+                on_policy_zero_advantage_loss_mask_tokens_checked
+            ),
+            "on_policy_logprob_zero_advantage_loss_mask_tokens_skipped": 0.0,
+            "on_policy_logprob_injected_loss_mask_tokens_skipped": float(
+                on_policy_injected_loss_mask_tokens_skipped
             ),
             "on_policy_logprob_trained_token_mean_abs_diff": (
-                on_policy_sum_abs_diff / on_policy_checked_tokens
-                if on_policy_checked_tokens > 0
+                on_policy_trained_sum_abs_diff / on_policy_trained_tokens_checked
+                if on_policy_trained_tokens_checked > 0
                 else 0.0
             ),
-            "on_policy_logprob_trained_token_max_abs_diff": float(on_policy_max_abs_diff),
+            "on_policy_logprob_trained_token_max_abs_diff": float(
+                on_policy_trained_max_abs_diff
+            ),
             "on_policy_logprob_violations": float(on_policy_violations),
             "on_policy_logprob_mean_abs_diff": (
                 on_policy_sum_abs_diff / on_policy_checked_tokens

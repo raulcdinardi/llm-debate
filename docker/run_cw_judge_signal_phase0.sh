@@ -91,7 +91,7 @@ wait_for_server() {
 
 start_policy_server() {
   log "policy_server_start"
-  env -u PYTORCH_CUDA_ALLOC_CONF python3 -m sglang.launch_server \
+  env -u PYTORCH_CUDA_ALLOC_CONF SGLANG_RETURN_ORIGINAL_LOGPROB=false python3 -m sglang.launch_server \
     --model-path "${MODEL_4B}" \
     --tokenizer-path "${MODEL_4B}" \
     --host 127.0.0.1 \
@@ -124,7 +124,7 @@ start_judge_server() {
   local log_path="${RUN_ROOT}/judge_${arm}_sglang.log"
   stop_judge
   log "judge_server_start arm=${arm}"
-  env -u PYTORCH_CUDA_ALLOC_CONF python3 -m sglang.launch_server \
+  env -u PYTORCH_CUDA_ALLOC_CONF SGLANG_RETURN_ORIGINAL_LOGPROB=false python3 -m sglang.launch_server \
     --model-path "${model_path}" \
     --tokenizer-path "${model_path}" \
     --host 127.0.0.1 \

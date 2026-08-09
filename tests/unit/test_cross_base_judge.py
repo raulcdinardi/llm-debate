@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 from llm_local_rl import debate_runtime as debate_runtime_module
+from llm_local_rl.behavior_policy import BEHAVIOR_POLICY_LOGPROBS, BehaviorPolicySpec
 from llm_local_rl.config import RolloutConfig, TrainRunConfig
 from llm_local_rl.debate_parity import DebateConfig
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
@@ -89,6 +90,8 @@ class RecordingPolicySampler:
                     completion_token_ids=token_ids,
                     completion_logprobs=[-0.1] * len(token_ids),
                     text=text,
+                    behavior_policy=BehaviorPolicySpec.from_sampling_request(request),
+                    completion_logprob_semantics=BEHAVIOR_POLICY_LOGPROBS,
                     raw={"fake_policy": True},
                 )
             )

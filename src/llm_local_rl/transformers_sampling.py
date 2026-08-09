@@ -6,6 +6,13 @@ from typing import Any
 import torch
 from transformers import GenerationConfig
 
+from llm_local_rl.behavior_policy import (
+    BEHAVIOR_POLICY_LOGPROBS,
+    RAW_MODEL_LOGPROBS,
+    TEMPERATURE_SCALED_MODEL_LOGPROBS,
+    BehaviorPolicySpec,
+    behavior_policy_contract_record,
+)
 from llm_local_rl.model_io_trace import get_model_io_tracer
 from llm_local_rl.trainer import MultiAdapterTrainer
 from llm_local_rl.types import AdapterName, SamplingRequest, SamplingResult
@@ -44,6 +51,15 @@ class TrainerTransformersSampler:
         for idx, request in enumerate(requests):
             if request.stop_strings:
                 raise NotImplementedError("String stops are pinned to the SGLang sampler backend.")
+            if (
+                request.top_k != -1
+                or request.presence_penalty != 0.0
+                or request.repetition_penalty != 1.0
+            ):
+                raise NotImplementedError(
+                    "top_k, presence_penalty, and repetition_penalty request overrides "
+                    "are currently implemented only by the vLLM sampler."
+                )
             key = (
                 request.adapter_name,
                 float(request.temperature),
@@ -58,7 +74,7 @@ class TrainerTransformersSampler:
         results: list[SamplingResult | None] = [None] * len(requests)
         pad_token_id = int(self.tokenizer.pad_token_id)
 
-        for (adapter_name, temperature, _min_p, top_p, max_tokens, stop_token_ids, seed), grouped_requests in grouped.items():
+        for (adapter_name, temperature, min_p, top_p, max_tokens, stop_token_ids, seed), grouped_requests in grouped.items():
             self._set_active_adapter(adapter_name=str(adapter_name))
             self.trainer.model.eval()
 
@@ -76,6 +92,8 @@ class TrainerTransformersSampler:
                 temperature=(max(1e-6, temperature) if do_sample else 1.0),
                 top_p=top_p,
                 top_k=0,
+                min_p=min_p,
+                repetition_penalty=1.0,
                 pad_token_id=pad_token_id,
                 eos_token_id=stop_token_id,
             )
@@ -134,16 +152,26 @@ class TrainerTransformersSampler:
 
             batch_size = len(grouped_requests)
             for row_idx in range(batch_size):
-                completion_token_ids, completion_logprobs = self._completion_tokens_and_raw_logprobs(
+                completion_token_ids, completion_logprobs = self._completion_tokens_and_behavior_logprobs(
                     logits=raw_outputs.logits[row_idx],
                     sequence=sequences[row_idx],
                     completion_start=max_prompt_len,
                     generated_len=generated_len,
                     stop_token_id=stop_token_id,
                     pad_token_id=pad_token_id,
+                    behavior_temperature=temperature,
                 )
 
                 request = grouped_requests[row_idx][1]
+                behavior_policy = BehaviorPolicySpec.from_sampling_request(request)
+                if behavior_policy.exact_trainer_reconstruction_supported():
+                    logprob_semantics = BEHAVIOR_POLICY_LOGPROBS
+                elif behavior_policy.temperature == 0.0:
+                    logprob_semantics = RAW_MODEL_LOGPROBS
+                else:
+                    # This explicit forward pass reproduces temperature but
+                    # does not renormalize top-p/min-p truncation.
+                    logprob_semantics = TEMPERATURE_SCALED_MODEL_LOGPROBS
                 text = self.tokenizer.decode(completion_token_ids, skip_special_tokens=True)
                 result = SamplingResult(
                     adapter_name=request.adapter_name,
@@ -151,7 +179,20 @@ class TrainerTransformersSampler:
                     completion_token_ids=completion_token_ids,
                     completion_logprobs=completion_logprobs,
                     text=text,
-                    raw={"sampler_backend": "transformers", "completion_logprobs": "raw_model_logprobs"},
+                    behavior_policy=behavior_policy,
+                    completion_logprob_semantics=logprob_semantics,
+                    raw={
+                        "sampler_backend": "transformers",
+                        "completion_logprobs": logprob_semantics,
+                        "behavior_policy_contract": behavior_policy_contract_record(
+                            policy=behavior_policy,
+                            backend="transformers",
+                            backend_mode="generate_then_full_forward",
+                            return_original_logprobs=False,
+                            semantics=logprob_semantics,
+                            scoring_dtype="float32",
+                        ),
+                    },
                 )
                 get_model_io_tracer().record_generation(
                     request=request,
@@ -167,7 +208,7 @@ class TrainerTransformersSampler:
         return [result for result in results if result is not None]
 
     @staticmethod
-    def _completion_tokens_and_raw_logprobs(
+    def _completion_tokens_and_behavior_logprobs(
         *,
         logits: torch.Tensor,
         sequence: torch.Tensor,
@@ -175,6 +216,7 @@ class TrainerTransformersSampler:
         generated_len: int,
         stop_token_id: int | None,
         pad_token_id: int,
+        behavior_temperature: float,
     ) -> tuple[list[int], list[float]]:
         completion_token_ids: list[int] = []
         logprob_positions: list[int] = []
@@ -199,9 +241,14 @@ class TrainerTransformersSampler:
         chunk_size = 16
         for start in range(0, len(logprob_positions), chunk_size):
             end = start + chunk_size
-            logits_chunk = logits.index_select(0, positions[start:end])
+            scoring_temperature = (
+                float(behavior_temperature)
+                if float(behavior_temperature) > 0.0
+                else 1.0
+            )
+            logits_chunk = logits.index_select(0, positions[start:end]).float() / scoring_temperature
             target_logits = logits_chunk.gather(dim=-1, index=target_ids[start:end, None]).squeeze(-1).float()
-            normalizers = torch.logsumexp(logits_chunk.float(), dim=-1)
+            normalizers = torch.logsumexp(logits_chunk, dim=-1)
             completion_logprobs.extend((target_logits - normalizers).detach().cpu().tolist())
 
         return completion_token_ids, [float(logprob) for logprob in completion_logprobs]

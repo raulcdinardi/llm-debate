@@ -9,6 +9,15 @@ import types
 from llm_local_rl import debate_parity as new
 
 
+def _source_compatible_training_data(data) -> list[dict]:
+    rows = []
+    for datum in data:
+        row = asdict(datum)
+        row.pop("completion_logprob_mask", None)
+        rows.append(row)
+    return rows
+
+
 def _import_source_modules():
     candidates = [
         Path("/mnt/c/Users/raulc/Desktop/llm-debate/src"),
@@ -137,7 +146,11 @@ def test_assemble_training_data_r1_r23_matches_source_exactly() -> None:
         r23_symmetric=True,
     )
 
-    assert [asdict(x) for x in new_data] == [asdict(x) for x in old_data]
+    assert _source_compatible_training_data(new_data) == [asdict(x) for x in old_data]
+    assert all(
+        datum.completion_logprob_mask == [1, 1, 0, 0, 1, 1, 0, 1, 1]
+        for datum in new_data
+    )
 
 
 def test_assemble_training_data_r1_r2_matches_source_exactly() -> None:
@@ -173,7 +186,11 @@ def test_assemble_training_data_r1_r2_matches_source_exactly() -> None:
         r2_symmetric=False,
     )
 
-    assert [asdict(x) for x in new_data] == [asdict(x) for x in old_data]
+    assert _source_compatible_training_data(new_data) == [asdict(x) for x in old_data]
+    assert all(
+        datum.completion_logprob_mask == [1, 1, 0, 0, 1, 1]
+        for datum in new_data
+    )
 
 
 def test_assemble_training_data_r1_only_compare_matches_source_exactly() -> None:
@@ -196,7 +213,14 @@ def test_assemble_training_data_r1_only_compare_matches_source_exactly() -> None
         r1_symmetric=True,
     )
 
-    assert ([asdict(x) for x in new_training_data], new_skipped) == ([asdict(x) for x in old_training_data], old_skipped)
+    assert (
+        _source_compatible_training_data(new_training_data),
+        new_skipped,
+    ) == ([asdict(x) for x in old_training_data], old_skipped)
+    assert all(
+        datum.completion_logprob_mask == [1, 1]
+        for datum in new_training_data
+    )
 
 
 def test_assemble_training_data_grpo_matches_source_exactly() -> None:
@@ -205,7 +229,11 @@ def test_assemble_training_data_grpo_matches_source_exactly() -> None:
     old_data = old_types.assemble_training_data_grpo([old_debate], reward_fn=lambda _traj, _debate: 1.5)
     new_data = new.assemble_training_data_grpo([new_debate], reward_fn=lambda _traj, _debate: 1.5)
 
-    assert [asdict(x) for x in new_data] == [asdict(x) for x in old_data]
+    assert _source_compatible_training_data(new_data) == [asdict(x) for x in old_data]
+    assert all(
+        datum.completion_logprob_mask == [1, 1, 0, 0, 1, 1, 0, 1, 1]
+        for datum in new_data
+    )
 
 
 def test_training_datum_to_train_example_preserves_exact_completion_fields() -> None:
@@ -213,6 +241,7 @@ def test_training_datum_to_train_example_preserves_exact_completion_fields() -> 
         prompt_tokens=[10, 11],
         completion_tokens=[12, 20, 21, 22],
         completion_logprobs=[-0.1, 0.0, -0.2, -0.3],
+        completion_logprob_mask=[1, 0, 1, 1],
         completion_advantages=[0.25, 0.0, 0.25, 0.25],
         metadata={"k": "v"},
     )
@@ -223,6 +252,7 @@ def test_training_datum_to_train_example_preserves_exact_completion_fields() -> 
     assert example.input_ids == [10, 11, 12, 20, 21]
     assert example.target_ids == [11, 12, 20, 21, 22]
     assert example.loss_mask == [0, 1, 1, 1, 1]
+    assert example.behavior_logprob_mask == [0, 1, 0, 1, 1]
     assert example.old_logprobs == [0.0, -0.1, 0.0, -0.2, -0.3]
     assert example.advantages == [0.0, 0.25, 0.0, 0.25, 0.25]
     assert example.metadata == {"k": "v"}
