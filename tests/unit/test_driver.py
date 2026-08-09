@@ -21,6 +21,13 @@ def test_config_and_manifest_roundtrip() -> None:
             steps=1,
             debate_external_judge_url="http://judge.test:8123",
             debate_external_judge_timeout_s=123.0,
+            debate_judge_prompt_format="base_model_sft",
+            debate_judge_max_tokens=512,
+            debate_judge_temperature=1.0,
+            debate_judge_top_p=0.95,
+            debate_judge_top_k=20,
+            debate_judge_presence_penalty=1.5,
+            debate_judge_seed=0,
             thinking_mode="no_think",
             rollout=RolloutConfig(mode="single_turn", num_rollouts_per_instance=2, request_seed_mode="per_request"),
             trace_model_io=False,
@@ -69,6 +76,13 @@ def test_config_and_manifest_roundtrip() -> None:
         assert restored_config.rollout.request_seed_mode == "per_request"
         assert restored_config.debate_external_judge_url == "http://judge.test:8123"
         assert restored_config.debate_external_judge_timeout_s == 123.0
+        assert restored_config.debate_judge_prompt_format == "base_model_sft"
+        assert restored_config.debate_judge_max_tokens == 512
+        assert restored_config.debate_judge_temperature == 1.0
+        assert restored_config.debate_judge_top_p == 0.95
+        assert restored_config.debate_judge_top_k == 20
+        assert restored_config.debate_judge_presence_penalty == 1.5
+        assert restored_config.debate_judge_seed == 0
         assert restored_config.thinking_mode == "no_think"
         assert restored_config.tokenizer_path == "/tmp/nonexistent_tokenizer_for_shape_only"
         assert restored_config.init_adapter_dirs == {"shared": str(Path(tmpdir) / "adapter")}
@@ -441,9 +455,32 @@ def test_split_adapter_names_include_judge_only_when_requested() -> None:
         model_path="/tmp/nonexistent_model_for_shape_only",
         output_dir="/tmp/out",
         adapter_layout="split",
+        debate_judge_adapter="judge",
+        train_adapter_names=("solution", "debate"),
+    )
+    assert driver._train_adapter_names() == {"solution", "debate"}
+    assert "judge" not in driver._train_adapter_names()
+
+    driver.config = TrainRunConfig(
+        model_path="/tmp/nonexistent_model_for_shape_only",
+        output_dir="/tmp/out",
+        adapter_layout="split",
         debate_judge_adapter="debate",
     )
     assert driver._adapter_names() == ("solution", "debate")
+
+
+def test_base_sft_internal_judge_requires_complete_three_round_debate() -> None:
+    with pytest.raises(ValueError, match="requires debate_rounds=3"):
+        TrainRunConfig(
+            model_path="/tmp/nonexistent_model_for_shape_only",
+            output_dir="/tmp/out",
+            adapter_layout="split",
+            debate_judge_adapter="judge",
+            debate_judge_prompt_format="base_model_sft",
+            debate_rounds=1,
+            sampler_backend="vllm",
+        )
 
 
 def test_split_vllm_sampler_can_sleep_instead_of_teardown() -> None:

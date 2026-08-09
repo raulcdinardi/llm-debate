@@ -51,6 +51,15 @@ class TrainerTransformersSampler:
         for idx, request in enumerate(requests):
             if request.stop_strings:
                 raise NotImplementedError("String stops are pinned to the SGLang sampler backend.")
+            if (
+                request.top_k != -1
+                or request.presence_penalty != 0.0
+                or request.repetition_penalty != 1.0
+            ):
+                raise NotImplementedError(
+                    "top_k, presence_penalty, and repetition_penalty request overrides "
+                    "are currently implemented only by the vLLM sampler."
+                )
             key = (
                 request.adapter_name,
                 float(request.temperature),
