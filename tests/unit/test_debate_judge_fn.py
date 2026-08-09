@@ -153,3 +153,37 @@ def test_external_judge_fn_short_circuits_three_round_policy_judge_sampling() ->
         "debate",
         "debate",
     ]
+
+
+def test_three_round_external_judge_uses_one_ordered_batch() -> None:
+    tokenizer = TinyChatTokenizer()
+    sampler = RecordingSampler(tokenizer=tokenizer, requests=[])
+
+    class BatchJudge:
+        def __init__(self) -> None:
+            self.batches = []
+
+        def __call__(self, *args):
+            raise AssertionError("serial judge path should not be used")
+
+        def judge_many(self, debates):
+            self.batches.append(debates)
+            return [("B", "judge zero"), ("A", "judge one")]
+
+    judge = BatchJudge()
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(num_rounds=3, num_groups=2, group_size=2, judge_adapter="policy"),
+        adapter_layout="split",
+        judge_fn=judge,
+    )
+
+    output = runtime.rollout(step_seed=0)
+
+    assert len(judge.batches) == 1
+    assert len(judge.batches[0]) == 2
+    assert [debate.verdict for debate in output.debates] == ["B", "A"]
+    assert [debate.judge_reasoning for debate in output.debates] == ["judge zero", "judge one"]

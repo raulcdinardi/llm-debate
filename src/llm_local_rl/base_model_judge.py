@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import Sequence
 from urllib import request
 
 from llm_local_rl.debate_parity import Verdict
@@ -65,57 +66,116 @@ class RemoteBaseJudgeConfig:
 
 
 def build_remote_base_judge(config: RemoteBaseJudgeConfig):
-    def judge(
-        question: str,
-        constitution: str,
-        r1_a: str,
-        r1_b: str,
-        r2_a: str,
-        r2_b: str,
-        r3_a: str,
-        r3_b: str,
-    ) -> tuple[Verdict, str]:
-        prompt_text = build_base_judge_prompt(
-            question=question,
-            constitution=constitution,
-            r1_a=r1_a,
-            r1_b=r1_b,
-            r2_a=r2_a,
-            r2_b=r2_b,
-            r3_a=r3_a,
-            r3_b=r3_b,
-        )
-        request_body = {"prompt_text": prompt_text}
-        body = json.dumps(request_body).encode("utf-8")
-        url = config.url.rstrip("/") + "/judge"
-        req = request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
+    class RemoteBaseJudge:
+        def _post(self, *, request_body: dict) -> dict:
+            body = json.dumps(request_body).encode("utf-8")
+            url = config.url.rstrip("/") + "/judge"
+            req = request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
             with request.urlopen(req, timeout=config.timeout_s) as resp:
-                reply = json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:
+                return json.loads(resp.read().decode("utf-8"))
+
+        def __call__(
+            self,
+            question: str,
+            constitution: str,
+            r1_a: str,
+            r1_b: str,
+            r2_a: str,
+            r2_b: str,
+            r3_a: str,
+            r3_b: str,
+        ) -> tuple[Verdict, str]:
+            prompt_text = build_base_judge_prompt(
+                question=question,
+                constitution=constitution,
+                r1_a=r1_a,
+                r1_b=r1_b,
+                r2_a=r2_a,
+                r2_b=r2_b,
+                r3_a=r3_a,
+                r3_b=r3_b,
+            )
+            request_body = {"prompt_text": prompt_text}
+            url = config.url.rstrip("/") + "/judge"
+            try:
+                reply = self._post(request_body=request_body)
+            except Exception as exc:
+                get_model_io_tracer().record_external_judge(
+                    url=url,
+                    prompt_text=prompt_text,
+                    request_body=request_body,
+                    raw_text=None,
+                    verdict=None,
+                    error=exc,
+                )
+                raise
+            raw_text = str(reply["raw_text"])
+            verdict = extract_strict_verdict(raw_text)
             get_model_io_tracer().record_external_judge(
                 url=url,
                 prompt_text=prompt_text,
                 request_body=request_body,
-                raw_text=None,
-                verdict=None,
-                error=exc,
+                raw_text=raw_text,
+                verdict=verdict,
             )
-            raise
-        raw_text = str(reply["raw_text"])
-        verdict = extract_strict_verdict(raw_text)
-        get_model_io_tracer().record_external_judge(
-            url=url,
-            prompt_text=prompt_text,
-            request_body=request_body,
-            raw_text=raw_text,
-            verdict=verdict,
-        )
-        return verdict, raw_text
+            return verdict, raw_text
 
-    return judge
+        def judge_many(
+            self,
+            debates: Sequence[tuple[str, str, str, str, str, str, str, str]],
+        ) -> list[tuple[Verdict, str]]:
+            prompt_texts = [
+                build_base_judge_prompt(
+                    question=question,
+                    constitution=constitution,
+                    r1_a=r1_a,
+                    r1_b=r1_b,
+                    r2_a=r2_a,
+                    r2_b=r2_b,
+                    r3_a=r3_a,
+                    r3_b=r3_b,
+                )
+                for question, constitution, r1_a, r1_b, r2_a, r2_b, r3_a, r3_b in debates
+            ]
+            request_body = {"prompt_texts": prompt_texts}
+            url = config.url.rstrip("/") + "/judge"
+            try:
+                reply = self._post(request_body=request_body)
+                results = reply["results"]
+                if not isinstance(results, list) or len(results) != len(prompt_texts):
+                    raise ValueError(
+                        f"External judge returned {len(results) if isinstance(results, list) else 'non-list'} "
+                        f"results for {len(prompt_texts)} prompts"
+                    )
+            except Exception as exc:
+                for prompt_text in prompt_texts:
+                    get_model_io_tracer().record_external_judge(
+                        url=url,
+                        prompt_text=prompt_text,
+                        request_body=request_body,
+                        raw_text=None,
+                        verdict=None,
+                        error=exc,
+                    )
+                raise
+
+            judged: list[tuple[Verdict, str]] = []
+            for prompt_text, result in zip(prompt_texts, results, strict=True):
+                raw_text = str(result["raw_text"])
+                verdict = extract_strict_verdict(raw_text)
+                get_model_io_tracer().record_external_judge(
+                    url=url,
+                    prompt_text=prompt_text,
+                    request_body=request_body,
+                    raw_text=raw_text,
+                    verdict=verdict,
+                )
+                judged.append((verdict, raw_text))
+            return judged
+
+    return RemoteBaseJudge()

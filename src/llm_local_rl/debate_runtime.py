@@ -212,19 +212,46 @@ class DebateRuntime:
         completion_logprobs: list[list[float]] = []
         raw_responses: list[dict] = []
         retry_flags: list[bool] = []
+        debate_payloads: list[tuple[str, str, str, str, str, str, str, str]] = []
         for debate_idx, (inst_a, _inst_b) in enumerate(inst_pairs):
             a_idx = 2 * debate_idx
             b_idx = 2 * debate_idx + 1
-            verdict, reasoning = self._run_external_judge(
-                question=self.task.judge_context_text(inst=inst_a),
-                constitution=self.task.judge_constitution_text(inst=inst_a),
-                r1_a=r1_visible_text[a_idx],
-                r1_b=r1_visible_text[b_idx],
-                r2_a=r2_visible_text[a_idx],
-                r2_b=r2_visible_text[b_idx],
-                r3_a=r3_visible_text[a_idx],
-                r3_b=r3_visible_text[b_idx],
+            debate_payloads.append(
+                (
+                    self.task.judge_context_text(inst=inst_a),
+                    self.task.judge_constitution_text(inst=inst_a),
+                    r1_visible_text[a_idx],
+                    r1_visible_text[b_idx],
+                    r2_visible_text[a_idx],
+                    r2_visible_text[b_idx],
+                    r3_visible_text[a_idx],
+                    r3_visible_text[b_idx],
+                )
             )
+
+        judge_many = getattr(self.judge_fn, "judge_many", None)
+        if callable(judge_many):
+            judged = judge_many(debate_payloads)
+            if len(judged) != len(debate_payloads):
+                raise ValueError(
+                    f"External judge returned {len(judged)} results for {len(debate_payloads)} debates"
+                )
+        else:
+            judged = [
+                self._run_external_judge(
+                    question=payload[0],
+                    constitution=payload[1],
+                    r1_a=payload[2],
+                    r1_b=payload[3],
+                    r2_a=payload[4],
+                    r2_b=payload[5],
+                    r3_a=payload[6],
+                    r3_b=payload[7],
+                )
+                for payload in debate_payloads
+            ]
+
+        for verdict, reasoning in judged:
             verdicts.append(verdict)
             reasonings.append(reasoning)
             prompt_tokens.append([])
