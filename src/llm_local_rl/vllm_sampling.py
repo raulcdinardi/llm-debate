@@ -18,6 +18,11 @@ from llm_local_rl.types import SamplingRequest, SamplingResult
 
 _RAW_LOGPROBS_LEGACY_MAX_VERSION = (0, 9, 99)
 
+# vLLM >= 0.26 moved this setting from SamplingParams to EngineArgs. The
+# "*_logits" alternatives are deliberately excluded because PPO needs
+# normalized log-probabilities, not logits.
+_ENGINE_LOGPROBS_MODES = frozenset({"raw_logprobs", "processed_logprobs"})
+
 
 def _logprob_value(entry: object) -> float:
     if hasattr(entry, "logprob"):
@@ -105,6 +110,32 @@ class VllmRuntimeConfig:
     enable_sleep_mode: bool = False
     max_lora_rank: int = 32
     max_loras: int = 4
+    logprobs_mode: str = "processed_logprobs"
+
+
+def _engine_accepts_logprobs_mode() -> bool:
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+    except Exception:
+        return False
+    return "logprobs_mode" in getattr(EngineArgs, "__dataclass_fields__", {})
+
+
+def _effective_engine_logprobs_mode(llm) -> str | None:
+    for path in (
+        ("llm_engine", "model_config"),
+        ("llm_engine", "vllm_config", "model_config"),
+    ):
+        obj = llm
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None:
+            value = getattr(obj, "logprobs_mode", None)
+            if value is not None:
+                return str(getattr(value, "value", value))
+    return None
 
 
 def _import_vllm_symbols():
@@ -145,6 +176,7 @@ def _behavior_logprobs_mode(
     SamplingParams,
     *,
     policy: BehaviorPolicySpec,
+    engine_logprobs_mode: str | None = None,
 ) -> tuple[dict[str, str], str]:
     try:
         sampling_params_parameters = inspect.signature(SamplingParams).parameters
@@ -152,6 +184,13 @@ def _behavior_logprobs_mode(
         sampling_params_parameters = {}
     if "logprobs_mode" in sampling_params_parameters:
         return {"logprobs_mode": "processed_logprobs"}, "processed_logprobs"
+
+    # vLLM 0.26 moved logprobs_mode to engine construction. Only trust a
+    # value that was read back from the constructed engine; otherwise keep
+    # failing closed so raw T=1 logprobs cannot masquerade as behavior-policy
+    # logprobs for a temperature-scaled rollout.
+    if engine_logprobs_mode in _ENGINE_LOGPROBS_MODES:
+        return {}, engine_logprobs_mode
 
     version = _vllm_version()
     parsed_version = _parse_version_tuple(version)
@@ -198,6 +237,7 @@ def _build_sampling_params(
     top_k: int = -1,
     presence_penalty: float = 0.0,
     repetition_penalty: float = 1.0,
+    engine_logprobs_mode: str | None = None,
 ):
     logprobs = max(1, trace_top_logprobs)
     policy = BehaviorPolicySpec(
@@ -211,6 +251,7 @@ def _build_sampling_params(
     logprobs_mode_kwargs, _backend_mode = _behavior_logprobs_mode(
         SamplingParams,
         policy=policy,
+        engine_logprobs_mode=engine_logprobs_mode,
     )
     kwargs = {
         "temperature": float(temperature),
@@ -259,7 +300,24 @@ class VllmSampler:
             llm_kwargs["max_num_seqs"] = runtime.max_num_seqs
         if runtime.enable_sleep_mode:
             llm_kwargs["enable_sleep_mode"] = True
+        engine_supports_logprobs_mode = _engine_accepts_logprobs_mode()
+        if engine_supports_logprobs_mode:
+            if runtime.logprobs_mode not in _ENGINE_LOGPROBS_MODES:
+                raise ValueError(
+                    f"logprobs_mode={runtime.logprobs_mode!r} is not usable; "
+                    f"expected one of {sorted(_ENGINE_LOGPROBS_MODES)}."
+                )
+            llm_kwargs["logprobs_mode"] = runtime.logprobs_mode
         self._llm = LLM(**llm_kwargs)
+        self._engine_logprobs_mode: str | None = None
+        if engine_supports_logprobs_mode:
+            observed = _effective_engine_logprobs_mode(self._llm)
+            if observed != runtime.logprobs_mode:
+                raise RuntimeError(
+                    "vLLM did not honour the requested engine logprobs_mode: "
+                    f"requested {runtime.logprobs_mode!r}, engine reports {observed!r}."
+                )
+            self._engine_logprobs_mode = observed
         self._sleep_level: int | None = None
 
     @property
@@ -361,6 +419,7 @@ class VllmSampler:
             _mode_kwargs, backend_mode = _behavior_logprobs_mode(
                 SamplingParams,
                 policy=behavior_policy,
+                engine_logprobs_mode=self._engine_logprobs_mode,
             )
             logprob_semantics = _completion_logprob_semantics(
                 policy=behavior_policy,
@@ -374,6 +433,7 @@ class VllmSampler:
                 top_k=top_k,
                 presence_penalty=presence_penalty,
                 repetition_penalty=repetition_penalty,
+                engine_logprobs_mode=self._engine_logprobs_mode,
                 max_tokens=max_tokens,
                 stop_token_ids=stop_token_ids,
                 seed=seed,
@@ -449,9 +509,13 @@ def direct_vllm_sample(
     _ = _LLM
     trace_top_logprobs = get_trace_top_logprobs()
     behavior_policy = BehaviorPolicySpec.from_sampling_request(request)
+    engine_logprobs_mode = (
+        _effective_engine_logprobs_mode(llm) if _engine_accepts_logprobs_mode() else None
+    )
     _mode_kwargs, backend_mode = _behavior_logprobs_mode(
         SamplingParams,
         policy=behavior_policy,
+        engine_logprobs_mode=engine_logprobs_mode,
     )
     logprob_semantics = _completion_logprob_semantics(
         policy=behavior_policy,
@@ -466,6 +530,7 @@ def direct_vllm_sample(
         top_k=int(request.top_k),
         presence_penalty=float(request.presence_penalty),
         repetition_penalty=float(request.repetition_penalty),
+        engine_logprobs_mode=engine_logprobs_mode,
         max_tokens=int(request.max_tokens),
         stop_token_ids=request.stop_token_ids,
         seed=request.seed,

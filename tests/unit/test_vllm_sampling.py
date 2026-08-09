@@ -175,3 +175,37 @@ def test_vllm_sampling_params_reject_modern_versions_without_logprobs_mode(monke
             seed=None,
             trace_top_logprobs=0,
         )
+
+
+def test_vllm_sampling_params_accept_verified_engine_level_mode() -> None:
+    params = vllm_sampling._build_sampling_params(
+        SamplingParamsWithoutLogprobsMode,
+        temperature=0.8,
+        top_p=1.0,
+        min_p=0.0,
+        max_tokens=8,
+        stop_token_ids=(),
+        seed=None,
+        trace_top_logprobs=0,
+        engine_logprobs_mode="processed_logprobs",
+    )
+
+    assert "logprobs_mode" not in params.kwargs
+
+
+@pytest.mark.parametrize("mode", [None, "raw_logits", "processed_logits", "unknown"])
+def test_vllm_engine_level_mode_still_fails_closed_when_unverified(monkeypatch, mode) -> None:
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(__version__="0.26.0"))
+
+    with pytest.raises(RuntimeError, match="cannot be pinned"):
+        vllm_sampling._build_sampling_params(
+            SamplingParamsWithoutLogprobsMode,
+            temperature=0.8,
+            top_p=1.0,
+            min_p=0.0,
+            max_tokens=8,
+            stop_token_ids=(),
+            seed=None,
+            trace_top_logprobs=0,
+            engine_logprobs_mode=mode,
+        )
