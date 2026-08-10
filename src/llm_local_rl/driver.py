@@ -353,7 +353,7 @@ class TrainingDriver:
                     max_model_len=self.config.sampler_max_model_len,
                     max_num_seqs=None if self.config.sampler_max_num_seqs <= 0 else self.config.sampler_max_num_seqs,
                     enforce_eager=self.config.sampler_enforce_eager,
-                    enable_sleep_mode=self.config.sampler_sleep_before_training,
+                    enable_sleep_mode=self._should_sleep_sampler_before_training(),
                     max_lora_rank=self.config.sampler_max_lora_rank,
                     max_loras=self.config.sampler_max_loras,
                 ),
@@ -382,9 +382,16 @@ class TrainingDriver:
             return False
         if self.config.sampler_sleep_before_training:
             return False
-        return self.config.sampler_teardown_before_training or (
+        if self.config.sampler_teardown_before_training:
+            return True
+        return self.config.sampler_backend != "vllm" and (
             self.config.rollout.mode == "debate" and self.config.adapter_layout == "split"
         )
+
+    def _should_sleep_sampler_before_training(self) -> bool:
+        if self.config.sampler_backend == "transformers" or self._should_teardown_sampler_before_training():
+            return False
+        return self.config.sampler_backend == "vllm" or self.config.sampler_sleep_before_training
 
     def _teardown_sampler(self) -> None:
         if self.sampler is None:
@@ -917,11 +924,30 @@ class TrainingDriver:
                         mean_reward_metrics.update(debate_metrics)
                     if self._should_teardown_sampler_before_training():
                         self._teardown_sampler()
-                    else:
-                        with self._stage("sampler_sleep", step=step_num, level=2):
-                            self._progress("sampler_sleep_start", step=step_num, level=2)
-                            self.sampler.sleep(level=2)
-                            self._progress("sampler_sleep_done", step=step_num, level=2)
+                    elif self._should_sleep_sampler_before_training():
+                        train_adapter_names = self._train_adapter_names()
+                        adapter_names_to_unload = (
+                            set(grouped_examples)
+                            if train_adapter_names is None
+                            else set(grouped_examples) & train_adapter_names
+                        )
+                        with self._stage("sampler_unload_trainable_loras", step=step_num):
+                            self._progress(
+                                "sampler_unload_trainable_loras_start",
+                                step=step_num,
+                                adapter_names=sorted(adapter_names_to_unload),
+                            )
+                            self.sampler.unload_adapters(adapter_names=adapter_names_to_unload)
+                            self._progress(
+                                "sampler_unload_trainable_loras_done",
+                                step=step_num,
+                                adapter_names=sorted(adapter_names_to_unload),
+                            )
+                        sleep_level = int(self.config.sampler_sleep_level)
+                        with self._stage("sampler_sleep", step=step_num, level=sleep_level):
+                            self._progress("sampler_sleep_start", step=step_num, level=sleep_level)
+                            self.sampler.sleep(level=sleep_level)
+                            self._progress("sampler_sleep_done", step=step_num, level=sleep_level)
 
                     with self._stage("trainer_wake", step=step_num):
                         self._progress("trainer_wake_start", step=step_num)

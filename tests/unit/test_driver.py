@@ -45,6 +45,7 @@ def test_config_and_manifest_roundtrip() -> None:
             on_policy_logprob_warning_path=str(Path(tmpdir) / "on_policy.jsonl"),
             on_policy_logprob_max_records_per_batch=3,
             sampler_sleep_before_training=True,
+            sampler_sleep_level=2,
             sampler_backend="sglang",
             sampler_sglang_base_url="http://sglang.test:30000",
             sampler_sglang_timeout_s=42.0,
@@ -99,6 +100,7 @@ def test_config_and_manifest_roundtrip() -> None:
         assert restored_config.on_policy_logprob_warning_path == str(Path(tmpdir) / "on_policy.jsonl")
         assert restored_config.on_policy_logprob_max_records_per_batch == 3
         assert restored_config.sampler_sleep_before_training is True
+        assert restored_config.sampler_sleep_level == 2
         assert restored_config.sampler_backend == "sglang"
         assert restored_config.sampler_sglang_base_url == "http://sglang.test:30000"
         assert restored_config.sampler_sglang_timeout_s == 42.0
@@ -120,6 +122,23 @@ def test_config_from_dict_preserves_missing_rollout_prefill_as_empty_string() ->
     restored = TrainRunConfig.from_dict(payload)
 
     assert restored.rollout_assistant_prefill == ""
+
+
+def test_sampler_lifecycle_config_rejects_conflicts_and_unknown_sleep_levels() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        TrainRunConfig(
+            model_path="/tmp/nonexistent_model_for_shape_only",
+            output_dir="/tmp/out",
+            sampler_teardown_before_training=True,
+            sampler_sleep_before_training=True,
+        )
+
+    with pytest.raises(ValueError, match="must be 1 or 2"):
+        TrainRunConfig(
+            model_path="/tmp/nonexistent_model_for_shape_only",
+            output_dir="/tmp/out",
+            sampler_sleep_level=3,
+        )
 
 
 def test_judge_rejection_task_config_roundtrip_and_fail_closed() -> None:
@@ -483,7 +502,7 @@ def test_base_sft_internal_judge_requires_complete_three_round_debate() -> None:
         )
 
 
-def test_split_vllm_sampler_can_sleep_instead_of_teardown() -> None:
+def test_split_vllm_sampler_sleeps_by_default_instead_of_teardown() -> None:
     from llm_local_rl.driver import TrainingDriver
 
     driver = object.__new__(TrainingDriver)
@@ -494,7 +513,8 @@ def test_split_vllm_sampler_can_sleep_instead_of_teardown() -> None:
         rollout=RolloutConfig(mode="debate"),
         sampler_backend="vllm",
     )
-    assert driver._should_teardown_sampler_before_training() is True
+    assert driver._should_teardown_sampler_before_training() is False
+    assert driver._should_sleep_sampler_before_training() is True
 
     driver.config = TrainRunConfig(
         model_path="/tmp/nonexistent_model_for_shape_only",
@@ -505,6 +525,18 @@ def test_split_vllm_sampler_can_sleep_instead_of_teardown() -> None:
         sampler_sleep_before_training=True,
     )
     assert driver._should_teardown_sampler_before_training() is False
+    assert driver._should_sleep_sampler_before_training() is True
+
+    driver.config = TrainRunConfig(
+        model_path="/tmp/nonexistent_model_for_shape_only",
+        output_dir="/tmp/out",
+        adapter_layout="split",
+        rollout=RolloutConfig(mode="debate"),
+        sampler_backend="vllm",
+        sampler_teardown_before_training=True,
+    )
+    assert driver._should_teardown_sampler_before_training() is True
+    assert driver._should_sleep_sampler_before_training() is False
 
     driver.config = TrainRunConfig(
         model_path="/tmp/nonexistent_model_for_shape_only",
@@ -516,9 +548,10 @@ def test_split_vllm_sampler_can_sleep_instead_of_teardown() -> None:
         sampler_teardown_before_training=True,
     )
     assert driver._should_teardown_sampler_before_training() is False
+    assert driver._should_sleep_sampler_before_training() is False
 
 
-def test_vllm_sleep_before_training_enables_vllm_sleep_allocator(monkeypatch) -> None:
+def test_vllm_enables_sleep_allocator_by_default(monkeypatch) -> None:
     from llm_local_rl import driver as driver_module
     from llm_local_rl.driver import TrainingDriver
 
@@ -538,7 +571,6 @@ def test_vllm_sleep_before_training_enables_vllm_sleep_allocator(monkeypatch) ->
         adapter_layout="split",
         rollout=RolloutConfig(mode="debate"),
         sampler_backend="vllm",
-        sampler_sleep_before_training=True,
     )
 
     driver._make_sampler()

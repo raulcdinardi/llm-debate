@@ -29,6 +29,19 @@ This avoids the previous shape where debate mechanics and task/environment logic
 
 Heavy integration tests are opt-in and require a local model path.
 
+## Tested vLLM lifecycle
+
+Install the pinned GPU integration stack with `pip install -e '.[integration]'`.
+It follows the vLLM 0.26 CUDA compatibility set (`torch==2.11.0`) and the exact
+Transformers/PEFT versions used by the LFM2.5 training runtime.
+
+vLLM now uses level-1 sleep between rollout and HF backward by default. The
+base model remains CPU-offloaded, the KV cache is discarded, and only LoRAs
+that will be trained are explicitly evicted. Frozen adapters such as `judge`
+remain registered across the cycle. Use `--sampler-teardown-before-training`
+only as a compatibility fallback; use `--sampler-sleep-level 2` only when CPU
+memory cannot retain the base weights.
+
 ## PPO behavior-policy contract
 
 PPO rollouts and trainer recomputation share one serialized

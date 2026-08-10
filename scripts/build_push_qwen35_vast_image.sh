@@ -17,7 +17,7 @@ fi
 RUNTIME_IMAGE_URI="${RUNTIME_IMAGE_URI:-${IMAGE_URI%-preloaded}}"
 PRELOAD_MODEL_ID="${PRELOAD_MODEL_ID:-Qwen/Qwen3.5-4B-Base}"
 PRELOAD_MODEL_DIR="${PRELOAD_MODEL_DIR:-/opt/models/qwen35-4b-base}"
-VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:latest}"
+VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.26.0}"
 PUSH="${PUSH:-1}"
 
 echo "Building runtime image: ${RUNTIME_IMAGE_URI}"

@@ -163,8 +163,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sampler-max-model-len", type=int, default=512)
     parser.add_argument("--sampler-max-num-seqs", type=int, default=0)
     parser.add_argument("--sampler-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--sampler-teardown-before-training", action="store_true")
-    parser.add_argument("--sampler-sleep-before-training", action="store_true")
+    parser.add_argument(
+        "--sampler-teardown-before-training",
+        action="store_true",
+        help="Legacy fallback that rebuilds the engine; vLLM now sleeps by default when this is omitted.",
+    )
+    parser.add_argument(
+        "--sampler-sleep-before-training",
+        action="store_true",
+        help="Enable memory-saver sleep explicitly (automatic for vLLM; required for SGLang).",
+    )
+    parser.add_argument(
+        "--sampler-sleep-level",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help="vLLM sleep level; level 1 preserves CPU-offloaded base weights and is fastest for LoRA-only updates.",
+    )
     parser.add_argument(
         "--sampler-backend",
         default="vllm",
@@ -307,6 +322,7 @@ def main() -> int:
                 sampler_enforce_eager=args.sampler_enforce_eager,
                 sampler_teardown_before_training=args.sampler_teardown_before_training,
                 sampler_sleep_before_training=args.sampler_sleep_before_training,
+                sampler_sleep_level=args.sampler_sleep_level,
                 sampler_backend=args.sampler_backend,
                 sampler_sglang_base_url=args.sampler_sglang_base_url,
                 sampler_sglang_timeout_s=args.sampler_sglang_timeout_s,

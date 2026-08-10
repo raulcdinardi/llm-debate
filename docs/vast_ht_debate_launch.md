@@ -63,7 +63,7 @@ This image includes the code and model files. Vast still spends time pulling the
 Use a Vast image that already has vLLM:
 
 ```text
-vllm/vllm-openai:latest
+vllm/vllm-openai:v0.26.0
 ```
 
 Use at least:

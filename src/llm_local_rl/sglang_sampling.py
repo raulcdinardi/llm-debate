@@ -212,6 +212,12 @@ class SglangSampler:
             for request_name in stale_request_names:
                 self._unload_adapter(request_name=request_name)
 
+    def unload_adapters(self, *, adapter_names: set[str]) -> None:
+        for logical_name in sorted(adapter_names):
+            request_name = self._adapter_request_names.get(logical_name)
+            if request_name in self._loaded_request_names:
+                self._unload_adapter(request_name=request_name)
+
     def _load_adapter(self, *, request_name: str, adapter_path: str) -> None:
         payload = {
             "lora_name": request_name,

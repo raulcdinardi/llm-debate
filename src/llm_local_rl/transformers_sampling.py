@@ -30,6 +30,9 @@ class TrainerTransformersSampler:
     def set_adapter_paths(self, *, adapter_paths: dict[str, str]) -> None:
         self.adapter_paths = dict(adapter_paths)
 
+    def unload_adapters(self, *, adapter_names: set[str]) -> None:
+        _ = adapter_names
+
     def wake_up(self, *, level: int = 1) -> None:
         _ = level
         self.trainer.wake_up()

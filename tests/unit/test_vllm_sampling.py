@@ -209,3 +209,44 @@ def test_vllm_engine_level_mode_still_fails_closed_when_unverified(monkeypatch, 
             trace_top_logprobs=0,
             engine_logprobs_mode=mode,
         )
+
+
+def test_unload_adapters_evicts_only_trainable_loras_and_preserves_frozen_judge() -> None:
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.loaded = {11, 12, 13}
+            self.removed = []
+
+        def list_loras(self):
+            return set(self.loaded)
+
+        def remove_lora(self, adapter_id):
+            self.removed.append(adapter_id)
+            self.loaded.remove(adapter_id)
+            return True
+
+    sampler = object.__new__(vllm_sampling.VllmSampler)
+    sampler._llm = SimpleNamespace(llm_engine=FakeEngine())
+    sampler._adapter_ids = {"solution": 11, "debate": 12, "judge": 13}
+
+    sampler.unload_adapters(adapter_names={"solution", "debate"})
+
+    assert sampler._llm.llm_engine.removed == [11, 12]
+    assert sampler._llm.llm_engine.list_loras() == {13}
+
+
+def test_unload_adapters_fails_closed_when_vllm_cannot_verify_eviction() -> None:
+    class RefusingEngine:
+        def list_loras(self):
+            return {7}
+
+        def remove_lora(self, adapter_id):
+            _ = adapter_id
+            return False
+
+    sampler = object.__new__(vllm_sampling.VllmSampler)
+    sampler._llm = SimpleNamespace(llm_engine=RefusingEngine())
+    sampler._adapter_ids = {"solution": 7}
+
+    with pytest.raises(RuntimeError, match="refused to unload"):
+        sampler.unload_adapters(adapter_names={"solution"})
