@@ -1,4 +1,4 @@
-ARG VLLM_IMAGE=vllm/vllm-openai:latest
+ARG VLLM_IMAGE=vllm/vllm-openai:v0.26.0
 FROM ${VLLM_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -14,10 +14,12 @@ WORKDIR /workspace/llm-local-rl
 
 RUN python3 -m pip install --upgrade pip && \
     python3 -m pip install \
-      "transformers>=4.57.0" \
-      "accelerate>=1.10.0" \
-      "peft>=0.17.0" \
-      "pytest>=8.0"
+      "accelerate==1.14.0" \
+      "peft==0.20.0" \
+      "pytest==9.1.1" \
+      "safetensors==0.8.0" \
+      "tokenizers==0.22.2" \
+      "transformers==5.14.1"
 
 COPY pyproject.toml README.md ./
 COPY src ./src

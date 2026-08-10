@@ -337,6 +337,30 @@ class VllmSampler:
             self._adapter_ids[name] = adapter_id
             self._adapter_request_names[name] = f"{name}__loraid_{adapter_id}"
 
+    def unload_adapters(self, *, adapter_names: set[str]) -> None:
+        """Evict trainable LoRAs before sleeping while retaining frozen LoRAs."""
+        llm_engine = getattr(self._llm, "llm_engine", None)
+        if llm_engine is None or not hasattr(llm_engine, "list_loras") or not hasattr(llm_engine, "remove_lora"):
+            raise RuntimeError(
+                "The configured vLLM does not expose list_loras/remove_lora; "
+                "use the pinned vLLM integration extra or sampler teardown."
+            )
+
+        loaded_ids = {int(adapter_id) for adapter_id in llm_engine.list_loras()}
+        requested_ids = {
+            int(self._adapter_ids[name])
+            for name in adapter_names
+            if name in self._adapter_ids
+        }
+        for adapter_id in sorted(requested_ids & loaded_ids):
+            if not llm_engine.remove_lora(adapter_id):
+                raise RuntimeError(f"vLLM refused to unload LoRA id {adapter_id}.")
+
+        remaining_ids = {int(adapter_id) for adapter_id in llm_engine.list_loras()}
+        stale_ids = requested_ids & remaining_ids
+        if stale_ids:
+            raise RuntimeError(f"vLLM retained stale trainable LoRA ids: {sorted(stale_ids)}")
+
     def sleep(self, *, level: int = 1) -> None:
         self._llm.sleep(level=level)
         self._sleep_level = level

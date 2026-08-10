@@ -113,6 +113,7 @@ class TrainRunConfig:
     sampler_max_loras: int = 4
     sampler_teardown_before_training: bool = False
     sampler_sleep_before_training: bool = False
+    sampler_sleep_level: int = 1
     sampler_backend: str = "vllm"
     sampler_sglang_base_url: str = "http://127.0.0.1:30000"
     sampler_sglang_timeout_s: float = 600.0
@@ -137,6 +138,13 @@ class TrainRunConfig:
         return BehaviorPolicySpec.from_rollout_config(self.rollout)
 
     def __post_init__(self) -> None:
+        if self.sampler_teardown_before_training and self.sampler_sleep_before_training:
+            raise ValueError(
+                "sampler_teardown_before_training and sampler_sleep_before_training "
+                "are mutually exclusive"
+            )
+        if self.sampler_sleep_level not in (1, 2):
+            raise ValueError("sampler_sleep_level must be 1 or 2")
         judge_modes = sum(
             value is not None
             for value in (
@@ -307,6 +315,7 @@ class TrainRunConfig:
             sampler_max_loras=data.get("sampler_max_loras", 4),
             sampler_teardown_before_training=data.get("sampler_teardown_before_training", False),
             sampler_sleep_before_training=data.get("sampler_sleep_before_training", False),
+            sampler_sleep_level=data.get("sampler_sleep_level", 1),
             sampler_backend=data.get("sampler_backend", "vllm"),
             sampler_sglang_base_url=data.get("sampler_sglang_base_url", "http://127.0.0.1:30000"),
             sampler_sglang_timeout_s=data.get("sampler_sglang_timeout_s", 600.0),

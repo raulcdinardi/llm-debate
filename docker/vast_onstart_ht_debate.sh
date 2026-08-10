@@ -201,31 +201,42 @@ install_python_deps() {
   cd "${SOURCE_DIR}"
   if [[ "${SKIP_PYTHON_DEPS:-0}" == "1" ]]; then
     echo "SKIP_PYTHON_DEPS=1; using Python environment baked into the image."
-    python3 - <<'PY'
+  else
+    python3 -m pip install --upgrade pip
+    python3 -m pip install --no-cache-dir \
+      "accelerate==1.14.0" \
+      "peft==0.20.0" \
+      "pytest==9.1.1" \
+      "safetensors==0.8.0" \
+      "tokenizers==0.22.2" \
+      "transformers==5.14.1"
+    if [[ "${INSTALL_VLLM:-0}" == "1" ]]; then
+      python3 -m pip install --no-cache-dir "vllm==0.26.0"
+    fi
+    python3 -m pip install -e .
+  fi
+  python3 - <<'PY'
+import importlib.metadata
 import importlib.util
 missing = [name for name in ("torch", "transformers", "peft", "vllm", "llm_local_rl") if importlib.util.find_spec(name) is None]
 if missing:
     raise SystemExit("Missing required packages: " + ", ".join(missing))
-print("required Python packages available")
-PY
-    return 0
-  fi
-
-  python3 -m pip install --upgrade pip
-  python3 -m pip install --no-cache-dir \
-    "transformers>=4.57.0" \
-    "accelerate>=1.10.0" \
-    "peft>=0.17.0" \
-    "pytest>=8.0"
-  if [[ "${INSTALL_VLLM:-0}" == "1" ]]; then
-    python3 -m pip install --no-cache-dir "vllm>=0.8.0"
-  fi
-  python3 -m pip install -e .
-  python3 - <<'PY'
-import importlib.util
-missing = [name for name in ("torch", "transformers", "peft", "vllm") if importlib.util.find_spec(name) is None]
-if missing:
-    raise SystemExit("Missing required packages: " + ", ".join(missing))
+expected = {
+    "accelerate": "1.14.0",
+    "peft": "0.20.0",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.22.2",
+    "torch": "2.11.0",
+    "transformers": "5.14.1",
+    "vllm": "0.26.0",
+}
+wrong = {
+    name: importlib.metadata.version(name)
+    for name, wanted in expected.items()
+    if importlib.metadata.version(name).split("+", 1)[0] != wanted
+}
+if wrong:
+    raise SystemExit(f"Incompatible package versions: {wrong}; expected {expected}")
 print("required Python packages available")
 PY
 }
