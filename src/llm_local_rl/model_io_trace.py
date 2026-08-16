@@ -251,6 +251,8 @@ class ModelIOTracer:
         request_body: dict[str, Any],
         raw_text: str | None,
         verdict: str | None,
+        harness_id: str,
+        harness_fingerprint: str,
         error: BaseException | None = None,
     ) -> None:
         if not self.enabled:
@@ -260,6 +262,12 @@ class ModelIOTracer:
             {
                 "phase": "external_judge",
                 "boundary": "llm_local_rl.base_model_judge.remote_judge",
+                "model": {
+                    **dict(self.config.metadata or {}),
+                    "provider": "external_http_judge",
+                    "judge_harness_id": harness_id,
+                    "judge_harness_fingerprint": harness_fingerprint,
+                },
                 "request": {
                     "url": url,
                     "body": request_body,

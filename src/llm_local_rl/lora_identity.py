@@ -19,5 +19,9 @@ def _adapter_file_stat(path: Path) -> tuple[str, int, int]:
 
 def adapter_identity(adapter_path: str) -> AdapterIdentity:
     adapter_dir = Path(adapter_path).expanduser().resolve()
-    tracked_files = (adapter_dir / "adapter_config.json",) + _adapter_weight_paths(adapter_dir)
+    metadata = [adapter_dir / "adapter_config.json"]
+    harness_manifest = adapter_dir / "judge_harness.json"
+    if harness_manifest.is_file():
+        metadata.append(harness_manifest)
+    tracked_files = tuple(metadata) + _adapter_weight_paths(adapter_dir)
     return (str(adapter_dir), tuple(_adapter_file_stat(path) for path in tracked_files))

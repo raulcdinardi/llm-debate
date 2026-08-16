@@ -4,6 +4,10 @@ import argparse
 import json
 
 from llm_local_rl.config import RolloutConfig, TrainRunConfig
+from llm_local_rl.judge_harness import (
+    judge_harness_ids,
+    resolve_judge_harness_id,
+)
 
 
 def _parse_init_adapter_dirs(values: list[str]) -> dict[str, str]:
@@ -86,9 +90,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--debate-mock-judge-seed", type=int, default=None)
     parser.add_argument("--debate-external-judge-timeout-s", type=float, default=600.0)
     parser.add_argument(
+        "--debate-judge-harness",
+        default=None,
+        choices=judge_harness_ids(),
+        help="Versioned judge harness controlling rendering, parsing, prefill, and output contract.",
+    )
+    parser.add_argument(
         "--debate-judge-prompt-format",
-        default="chat",
+        default=None,
         choices=["chat", "base_model_sft", "single_token_sft"],
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--debate-judge-max-tokens", type=int, default=0)
     parser.add_argument("--debate-judge-temperature", type=float, default=1.0)
@@ -310,7 +321,11 @@ def main() -> int:
                 debate_judge_server_adapter_path=args.debate_judge_server_adapter_path,
                 debate_mock_judge_seed=args.debate_mock_judge_seed,
                 debate_external_judge_timeout_s=args.debate_external_judge_timeout_s,
-                debate_judge_prompt_format=args.debate_judge_prompt_format,
+                debate_judge_harness=resolve_judge_harness_id(
+                    harness_id=args.debate_judge_harness,
+                    legacy_prompt_format=args.debate_judge_prompt_format,
+                    num_rounds=args.debate_rounds,
+                ),
                 debate_judge_max_tokens=args.debate_judge_max_tokens,
                 debate_judge_temperature=args.debate_judge_temperature,
                 debate_judge_top_p=args.debate_judge_top_p,

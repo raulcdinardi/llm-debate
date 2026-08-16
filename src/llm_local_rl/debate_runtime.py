@@ -6,10 +6,11 @@ import re
 from typing import Callable
 
 from llm_local_rl.behavior_policy import validate_sampling_result_contract
-from llm_local_rl.base_model_judge import (
-    build_sft_judge_prompt,
-    extract_single_token_verdict,
-    extract_strict_verdict,
+from llm_local_rl.judge_harness import (
+    AgentDebateText,
+    CHAT_SOLUTION_TAGGED_V1,
+    JudgeTranscript,
+    get_judge_harness,
 )
 from llm_local_rl.chat_templates import get_chat_adapter
 from llm_local_rl.debate_parity import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
@@ -154,7 +155,7 @@ class DebateRuntimeConfig:
     stop_on_concluded: bool = False
     base_r2_prefill: str = "The reasons that my solution is better than my opponent's are:\n1)"
     base_r3_prefill: str = "Responding to my opponent's criticism:\n1)"
-    judge_prompt_format: str = "chat"
+    judge_harness_id: str = CHAT_SOLUTION_TAGGED_V1
     judge_max_tokens: int = 0
     judge_temperature: float = 1.0
     judge_top_p: float = 1.0
@@ -258,13 +259,11 @@ class DebateRuntime:
     def rollout(self, *, step_seed: int | None) -> DebateRolloutOutput:
         if self.runtime_config.group_size % 2 != 0:
             raise ValueError("Debate requires even group_size.")
-        if (
-            self.runtime_config.judge_prompt_format in ("base_model_sft", "single_token_sft")
-            and self.runtime_config.num_rounds != 3
-        ):
+        harness = get_judge_harness(self.runtime_config.judge_harness_id)
+        if self.judge_fn is None and self.runtime_config.num_rounds < harness.required_rounds:
             raise ValueError(
-                "SFT judge prompting requires a complete three-round debate; "
-                f"got num_rounds={self.runtime_config.num_rounds}"
+                f"Judge harness {harness.harness_id!r} requires at least "
+                f"{harness.required_rounds} rounds; got num_rounds={self.runtime_config.num_rounds}"
             )
         instances = self.task.sample_instances(n=self.runtime_config.num_groups, seed=step_seed)
         instances_repeated: list[TaskInstance] = []
@@ -683,65 +682,50 @@ class DebateRuntime:
         return out
 
     def _judge_prompts(self, *, inst_pairs: list[tuple[TaskInstance, TaskInstance]], r1_visible_text: list[str], r2_visible_text: list[str], r3_visible_text: list[str], reverse_order: bool = False) -> list[list[int]]:
-        if self.runtime_config.judge_prompt_format in ("base_model_sft", "single_token_sft"):
-            return [
-                list(
-                    self.tokenizer.encode(
-                        build_sft_judge_prompt(
-                            prompt_format=self.runtime_config.judge_prompt_format,
-                            question=self.task.judge_context_text(inst=inst_a),
-                            constitution=self.task.judge_constitution_text(inst=inst_a),
-                            r1_a=r1_visible_text[2 * debate_idx + int(reverse_order)],
-                            r1_b=r1_visible_text[2 * debate_idx + int(not reverse_order)],
-                            r2_a=r2_visible_text[2 * debate_idx + int(reverse_order)],
-                            r2_b=r2_visible_text[2 * debate_idx + int(not reverse_order)],
-                            r3_a=r3_visible_text[2 * debate_idx + int(reverse_order)],
-                            r3_b=r3_visible_text[2 * debate_idx + int(not reverse_order)],
-                        ),
-                        add_special_tokens=False,
-                    )
-                )
-                for debate_idx, (inst_a, _inst_b) in enumerate(inst_pairs)
-            ]
-        adapter = get_chat_adapter(self.tokenizer)
         prompts: list[list[int]] = []
         for debate_idx, (inst_a, _inst_b) in enumerate(inst_pairs):
-            a_idx = 2 * debate_idx + int(reverse_order)
-            b_idx = 2 * debate_idx + int(not reverse_order)
-            system = (
-                self.debate_config.system_judge
-                + "\n\nIMPORTANT: Output exactly one tag: <VERDICT>...</VERDICT>. VERDICT must be A or B only. Do not emit <think> tags or any reasoning."
+            transcript = JudgeTranscript(
+                question=self.task.judge_context_text(inst=inst_a),
+                constitution=self.task.judge_constitution_text(inst=inst_a),
+                agent_a=AgentDebateText(
+                    r1=r1_visible_text[2 * debate_idx],
+                    r2=r2_visible_text[2 * debate_idx],
+                    r3=r3_visible_text[2 * debate_idx],
+                ),
+                agent_b=AgentDebateText(
+                    r1=r1_visible_text[2 * debate_idx + 1],
+                    r2=r2_visible_text[2 * debate_idx + 1],
+                    r3=r3_visible_text[2 * debate_idx + 1],
+                ),
             )
-            user = (
-                f"Question: {self.task.judge_context_text(inst=inst_a)}\n\n"
-                f"Constitution:\n{self.task.judge_constitution_text(inst=inst_a)}\n\n"
-                "=== AGENT A ===\n"
-                "Round 1 (Proposal):\n"
-                f"{r1_visible_text[a_idx]}\n\n"
-                "Round 2 (Argument):\n"
-                f"{r2_visible_text[a_idx]}\n\n"
-                "Round 3 (Response):\n"
-                f"{r3_visible_text[a_idx]}\n\n"
-                "=== AGENT B ===\n"
-                "Round 1 (Proposal):\n"
-                f"{r1_visible_text[b_idx]}\n\n"
-                "Round 2 (Argument):\n"
-                f"{r2_visible_text[b_idx]}\n\n"
-                "Round 3 (Response):\n"
-                f"{r3_visible_text[b_idx]}\n\n"
-                "Based on the debate above, which agent's Round 1 response best satisfies the user "
-                "under the constitution?\n"
-                "Consider the debate only as evidence about the responses themselves.\n"
-                "Return only <VERDICT>A</VERDICT> or <VERDICT>B</VERDICT>.\n"
-            )
-            prompts.append(
-                adapter.encode_messages(
-                    [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
-            )
+            if reverse_order:
+                transcript = transcript.swapped()
+            prompts.append(self._encode_judge_transcript(transcript))
         return prompts
+
+    def _encode_judge_transcript(self, transcript: JudgeTranscript) -> list[int]:
+        harness = get_judge_harness(self.runtime_config.judge_harness_id)
+        rendered = harness.render_checked(
+            transcript=transcript,
+            base_system_text=self.debate_config.system_judge,
+        )
+        if rendered.raw_text is not None:
+            return list(self.tokenizer.encode(rendered.raw_text, add_special_tokens=False))
+        return get_chat_adapter(self.tokenizer).encode_messages(
+            list(rendered.messages),
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+
+    def _judge_max_tokens(self) -> int:
+        if self.runtime_config.judge_max_tokens > 0:
+            return self.runtime_config.judge_max_tokens
+        harness_default = get_judge_harness(
+            self.runtime_config.judge_harness_id
+        ).default_max_tokens
+        if harness_default is not None:
+            return harness_default
+        return self._max_tokens_for_round(round_num=1)
 
     def _rollout_three_rounds(self, *, instances_repeated: list[TaskInstance], step_seed: int | None) -> DebateRolloutOutput:
         use_base_text_prefill = self._use_base_text_prefill()
@@ -1114,34 +1098,30 @@ class DebateRuntime:
                 judge_completion_logprobs.append([])
                 judge_raw_responses.append({"external_judge": True, "raw_text": reasoning})
         else:
-            adapter = get_chat_adapter(self.tokenizer)
             judge_prompt_tokens = []
             for idx, (inst_a, _inst_b) in enumerate(inst_pairs):
                 a_idx = 2 * idx
                 b_idx = 2 * idx + 1
-                system = (
-                    self.debate_config.system_judge
-                    + "\n\nIMPORTANT: Output exactly one tag: <VERDICT>...</VERDICT>. Judge task compliance first. VERDICT must be A or B only."
+                judge_prompt_tokens.append(
+                    self._encode_judge_transcript(
+                        JudgeTranscript(
+                            question=self.task.judge_context_text(inst=inst_a),
+                            constitution=self.task.judge_constitution_text(inst=inst_a),
+                            agent_a=AgentDebateText(
+                                r1=r1_visible_text[a_idx], r2="", r3=""
+                            ),
+                            agent_b=AgentDebateText(
+                                r1=r1_visible_text[b_idx], r2="", r3=""
+                            ),
+                        )
+                    )
                 )
-                user = (
-                    f"Task context:\n{self.task.judge_context_text(inst=inst_a)}\n\n"
-                    f"Constitution:\n{self.task.judge_constitution_text(inst=inst_a)}\n\n"
-                    "=== AGENT A ===\nAnswer:\n"
-                    f"{r1_visible_text[a_idx]}\n\n"
-                    "=== AGENT B ===\nAnswer:\n"
-                    f"{r1_visible_text[b_idx]}\n\n"
-                    "Compare the two answers only.\nWhich agent gave the better answer?\nReturn only <VERDICT>A</VERDICT> or <VERDICT>B</VERDICT>.\n"
-                )
-                judge_prompt_tokens.append(adapter.encode_messages([{"role": "system", "content": system}, {"role": "user", "content": user}], add_generation_prompt=True, enable_thinking=False))
             judge_results = self._sample_judge_many(
                 prompt_tokens_list=judge_prompt_tokens,
                 round_num=99,
                 step_seed=step_seed,
                 stop_token_ids=stop_token_ids,
-                max_tokens=(
-                    self.runtime_config.judge_max_tokens
-                    or self._max_tokens_for_round(round_num=1)
-                ),
+                max_tokens=self._judge_max_tokens(),
                 temperature=float(self.runtime_config.judge_temperature),
             )
             verdicts = []
@@ -1150,11 +1130,9 @@ class DebateRuntime:
             judge_completion_logprobs = []
             judge_raw_responses = []
             for idx, (comp, lps, text, raw) in enumerate(judge_results):
-                verdict = (
-                    extract_strict_verdict(text)
-                    if self.runtime_config.judge_prompt_format == "base_model_sft"
-                    else extract_verdict(_strip_think_blocks(text))
-                )
+                verdict = get_judge_harness(
+                    self.runtime_config.judge_harness_id
+                ).parse_verdict(text)
                 if verdict == "INVALID" and self.runtime_config.debate_r1_reward != "judge_rejection_task":
                     verdict = _fallback_verdict_from_invalid_judge(step_seed=step_seed, debate_idx=idx)
                 verdicts.append(verdict)
@@ -1216,10 +1194,7 @@ class DebateRuntime:
             round_num=99,
             step_seed=step_seed,
             stop_token_ids=stop_token_ids,
-            max_tokens=(
-                self.runtime_config.judge_max_tokens
-                or self._max_tokens_for_round(round_num=1)
-            ),
+            max_tokens=self._judge_max_tokens(),
             temperature=float(self.runtime_config.judge_temperature),
         )
         verdicts: list[Verdict] = []
@@ -1230,12 +1205,9 @@ class DebateRuntime:
         retry_flags: list[bool] = []
         invalid_indices: list[int] = []
         for idx, (comp, lps, text, raw) in enumerate(results):
-            if self.runtime_config.judge_prompt_format == "base_model_sft":
-                verdict = extract_strict_verdict(text)
-            elif self.runtime_config.judge_prompt_format == "single_token_sft":
-                verdict = extract_single_token_verdict(text)
-            else:
-                verdict = extract_verdict(_strip_think_blocks(text))
+            verdict = get_judge_harness(
+                self.runtime_config.judge_harness_id
+            ).parse_verdict(text)
             verdicts.append(verdict)
             reasonings.append(extract_reasoning(text))
             completion_tokens.append(comp)
@@ -1256,19 +1228,13 @@ class DebateRuntime:
                 round_num=100,
                 step_seed=step_seed,
                 stop_token_ids=stop_token_ids,
-                max_tokens=(
-                    self.runtime_config.judge_max_tokens
-                    or self._max_tokens_for_round(round_num=1)
-                ),
+                max_tokens=self._judge_max_tokens(),
                 temperature=0.0,
             )
             for debate_idx, (comp, lps, text, raw) in zip(invalid_indices, retry_results, strict=True):
-                if self.runtime_config.judge_prompt_format == "base_model_sft":
-                    retry_verdict = extract_strict_verdict(text)
-                elif self.runtime_config.judge_prompt_format == "single_token_sft":
-                    retry_verdict = extract_single_token_verdict(text)
-                else:
-                    retry_verdict = extract_verdict(_strip_think_blocks(text))
+                retry_verdict = get_judge_harness(
+                    self.runtime_config.judge_harness_id
+                ).parse_verdict(text)
                 if retry_verdict == "INVALID":
                     continue
                 verdicts[debate_idx] = retry_verdict

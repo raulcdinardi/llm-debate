@@ -7,6 +7,7 @@ import pytest
 
 from scripts.run_train import _parse_csv_tuple, _parse_init_adapter_dirs, parse_args
 from llm_local_rl.config import RolloutConfig, TrainRunConfig
+from llm_local_rl.judge_harness import SOLUTION_R1_RATIONALE_V1
 
 
 def test_parse_named_init_adapter_dirs() -> None:
@@ -86,6 +87,7 @@ def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:
         ),
         adapter_layout=args.adapter_layout,
         debate_judge_adapter=args.debate_judge_adapter,
+        debate_judge_harness=args.debate_judge_harness,
         debate_judge_temperature=args.debate_judge_temperature,
         debate_judge_top_p=args.debate_judge_top_p,
         debate_judge_top_k=args.debate_judge_top_k,
@@ -99,6 +101,7 @@ def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:
 
     assert config.adapter_layout == "split"
     assert config.debate_judge_adapter == "judge"
+    assert config.debate_judge_harness == SOLUTION_R1_RATIONALE_V1
     assert config.debate_judge_bidirectional is True
     assert config.train_judge_coherence_grpo is True
     assert config.rollout.temperature == config.debate_judge_temperature == 1.0
@@ -252,8 +255,8 @@ def test_cli_parses_same_engine_base_sft_judge_contract() -> None:
             "split",
             "--debate-judge-adapter",
             "judge",
-            "--debate-judge-prompt-format",
-            "base_model_sft",
+            "--debate-judge-harness",
+            SOLUTION_R1_RATIONALE_V1,
             "--debate-judge-max-tokens",
             "512",
             "--debate-judge-temperature",
@@ -270,7 +273,7 @@ def test_cli_parses_same_engine_base_sft_judge_contract() -> None:
     )
 
     assert args.debate_judge_adapter == "judge"
-    assert args.debate_judge_prompt_format == "base_model_sft"
+    assert args.debate_judge_harness == SOLUTION_R1_RATIONALE_V1
     assert args.debate_judge_max_tokens == 512
     assert args.debate_judge_temperature == 1.0
     assert args.debate_judge_top_p == 0.95

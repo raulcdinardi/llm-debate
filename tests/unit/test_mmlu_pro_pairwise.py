@@ -4,10 +4,11 @@ import json
 
 import pytest
 
-from llm_local_rl.base_model_judge import (
-    SINGLE_TOKEN_JUDGE_ASSISTANT_PREFILL,
-    build_single_token_judge_prompt,
-    extract_single_token_verdict,
+from llm_local_rl.judge_harness import (
+    AgentDebateText,
+    CONSTITUTION_SINGLE_TOKEN_V1,
+    JudgeTranscript,
+    get_judge_harness,
 )
 from llm_local_rl.mmlu_pro_pairwise import MMLUProPairwiseDebateTask
 
@@ -56,20 +57,20 @@ def test_mmlu_pair_task_requires_exactly_one_debate_per_question(tmp_path) -> No
 
 
 def test_single_token_judge_prompt_matches_training_harness() -> None:
-    prompt = build_single_token_judge_prompt(
+    harness = get_judge_harness(CONSTITUTION_SINGLE_TOKEN_V1)
+    transcript = JudgeTranscript(
         question="Why is the sky blue?",
         constitution="Prefer the answer that is correct.",
-        r1_a="Rayleigh scattering",
-        r1_b="Ocean reflection",
-        r2_a="A2",
-        r2_b="B2",
-        r3_a="A3",
-        r3_b="B3",
+        agent_a=AgentDebateText("Rayleigh scattering", "A2", "A3"),
+        agent_b=AgentDebateText("Ocean reflection", "B2", "B3"),
     )
+    rendered = harness.render_checked(transcript=transcript, base_system_text="ignored")
+    assert rendered.raw_text is not None
+    prompt = rendered.raw_text
     assert prompt.startswith("System:\nYou are a judge evaluating a debate between two solvers.")
     assert "Question: Why is the sky blue?" in prompt
     assert "Round 1 (Proposal):\nRayleigh scattering" in prompt
-    assert prompt.endswith(SINGLE_TOKEN_JUDGE_ASSISTANT_PREFILL)
-    assert extract_single_token_verdict(" A") == "A"
-    assert extract_single_token_verdict("B<|endoftext|>") == "B"
-    assert extract_single_token_verdict("A because") == "INVALID"
+    assert prompt.endswith(harness.assistant_prefill)
+    assert harness.parse_verdict(" A") == "A"
+    assert harness.parse_verdict("B<|endoftext|>") == "B"
+    assert harness.parse_verdict("A because") == "INVALID"

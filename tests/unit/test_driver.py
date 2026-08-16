@@ -10,6 +10,11 @@ from llm_local_rl.config import CheckpointManifest, RolloutConfig, TrainRunConfi
 from llm_local_rl.qwen35_base_format import COUNTDOWN_JSON_PREAMBLE
 from llm_local_rl.metrics import mean_numeric_metrics
 from llm_local_rl.registry import build_debate_task, build_environment, build_episode_builder
+from llm_local_rl.judge_harness import (
+    CHAT_SOLUTION_TAGGED_V1,
+    SOLUTION_R1_RATIONALE_V1,
+    validate_judge_harness_manifest,
+)
 
 
 def test_sampling_temperature_defaults_are_one_in_config_and_legacy_payloads() -> None:
@@ -28,6 +33,45 @@ def test_sampling_temperature_defaults_are_one_in_config_and_legacy_payloads() -
     assert restored.debate_judge_temperature == 1.0
 
 
+def test_legacy_prompt_format_migrates_to_versioned_harness() -> None:
+    config = TrainRunConfig(
+        model_path="/tmp/nonexistent_model_for_shape_only",
+        output_dir="/tmp/out",
+    )
+    payload = config.to_dict()
+    del payload["debate_judge_harness"]
+    payload["debate_judge_prompt_format"] = "base_model_sft"
+
+    restored = TrainRunConfig.from_dict(payload)
+
+    assert restored.debate_judge_harness == SOLUTION_R1_RATIONALE_V1
+
+
+def test_driver_binds_saved_judge_and_rejects_unbound_initial_judge(tmp_path) -> None:
+    from llm_local_rl.driver import TrainingDriver
+
+    driver = object.__new__(TrainingDriver)
+    driver.config = TrainRunConfig(
+        model_path="/tmp/nonexistent_model_for_shape_only",
+        output_dir=str(tmp_path / "out"),
+        adapter_layout="split",
+        debate_judge_adapter="judge",
+        debate_judge_harness=SOLUTION_R1_RATIONALE_V1,
+    )
+    judge_dir = tmp_path / "judge"
+    judge_dir.mkdir()
+    with pytest.raises(ValueError, match="has no judge_harness.json"):
+        driver._validate_judge_adapter_harness({"judge": str(judge_dir)})
+
+    driver._write_saved_judge_harness(adapter_name="judge", adapter_dir=str(judge_dir))
+    driver._validate_judge_adapter_harness({"judge": str(judge_dir)})
+    payload = validate_judge_harness_manifest(
+        adapter_dir=judge_dir,
+        harness_id=SOLUTION_R1_RATIONALE_V1,
+    )
+    assert payload["harness_id"] == SOLUTION_R1_RATIONALE_V1
+
+
 def test_config_and_manifest_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         config = TrainRunConfig(
@@ -37,7 +81,7 @@ def test_config_and_manifest_roundtrip() -> None:
             steps=1,
             debate_external_judge_url="http://judge.test:8123",
             debate_external_judge_timeout_s=123.0,
-            debate_judge_prompt_format="base_model_sft",
+            debate_judge_harness=SOLUTION_R1_RATIONALE_V1,
             debate_judge_max_tokens=512,
             debate_judge_temperature=1.0,
             debate_judge_top_p=0.95,
@@ -93,7 +137,7 @@ def test_config_and_manifest_roundtrip() -> None:
         assert restored_config.rollout.request_seed_mode == "per_request"
         assert restored_config.debate_external_judge_url == "http://judge.test:8123"
         assert restored_config.debate_external_judge_timeout_s == 123.0
-        assert restored_config.debate_judge_prompt_format == "base_model_sft"
+        assert restored_config.debate_judge_harness == SOLUTION_R1_RATIONALE_V1
         assert restored_config.debate_judge_max_tokens == 512
         assert restored_config.debate_judge_temperature == 1.0
         assert restored_config.debate_judge_top_p == 0.95
@@ -594,16 +638,35 @@ def test_split_adapter_names_include_judge_only_when_requested() -> None:
     assert driver._adapter_names() == ("solution", "debate")
 
 
-def test_base_sft_internal_judge_requires_complete_three_round_debate() -> None:
-    with pytest.raises(ValueError, match="requires debate_rounds=3"):
+def test_solution_rationale_harness_requires_complete_three_round_debate() -> None:
+    with pytest.raises(ValueError, match="requires at least 3 rounds"):
         TrainRunConfig(
             model_path="/tmp/nonexistent_model_for_shape_only",
             output_dir="/tmp/out",
             adapter_layout="split",
             debate_judge_adapter="judge",
-            debate_judge_prompt_format="base_model_sft",
+            debate_judge_harness=SOLUTION_R1_RATIONALE_V1,
             debate_rounds=1,
             sampler_backend="vllm",
+        )
+
+
+def test_external_http_judge_requires_compatible_harness_and_rounds() -> None:
+    with pytest.raises(ValueError, match="supports only.*solution_r1_rationale_v1"):
+        TrainRunConfig(
+            model_path="/tmp/nonexistent_model_for_shape_only",
+            output_dir="/tmp/out",
+            debate_external_judge_url="http://judge.test",
+            debate_judge_harness=CHAT_SOLUTION_TAGGED_V1,
+        )
+
+    with pytest.raises(ValueError, match="requires at least 3 rounds"):
+        TrainRunConfig(
+            model_path="/tmp/nonexistent_model_for_shape_only",
+            output_dir="/tmp/out",
+            debate_external_judge_url="http://judge.test",
+            debate_judge_harness=SOLUTION_R1_RATIONALE_V1,
+            debate_rounds=1,
         )
 
 
