@@ -1,0 +1,393 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
+import re
+from typing import Callable, Literal
+
+from llm_local_rl.debate_parity import Verdict
+
+
+CHAT_SOLUTION_TAGGED_V1 = "chat_solution_tagged_v1"
+CHAT_POINTWISE_TAGGED_V1 = "chat_pointwise_tagged_v1"
+SOLUTION_R1_RATIONALE_V1 = "solution_r1_rationale_v1"
+CONSTITUTION_SINGLE_TOKEN_V1 = "constitution_single_token_v1"
+JUDGE_HARNESS_MANIFEST = "judge_harness.json"
+JUDGE_HARNESS_MANIFEST_SCHEMA = "llm_local_rl_judge_harness_v1"
+
+JudgeHarnessId = Literal[
+    "chat_solution_tagged_v1",
+    "chat_pointwise_tagged_v1",
+    "solution_r1_rationale_v1",
+    "constitution_single_token_v1",
+]
+PromptSerialization = Literal["chat", "raw_base"]
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+_THINK_TAIL_RE = re.compile(r"<think>.*$", re.IGNORECASE | re.DOTALL)
+
+
+@dataclass(frozen=True)
+class AgentDebateText:
+    r1: str
+    r2: str
+    r3: str
+
+
+@dataclass(frozen=True)
+class JudgeTranscript:
+    question: str
+    constitution: str
+    agent_a: AgentDebateText
+    agent_b: AgentDebateText
+
+    def swapped(self) -> "JudgeTranscript":
+        return JudgeTranscript(
+            question=self.question,
+            constitution=self.constitution,
+            agent_a=self.agent_b,
+            agent_b=self.agent_a,
+        )
+
+
+@dataclass(frozen=True)
+class RenderedJudgePrompt:
+    raw_text: str | None = None
+    messages: tuple[dict[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if (self.raw_text is None) == (not self.messages):
+            raise ValueError("Rendered judge prompt must contain exactly one representation")
+
+
+@dataclass(frozen=True)
+class JudgeHarnessSpec:
+    harness_id: JudgeHarnessId
+    serialization: PromptSerialization
+    objective: str
+    output_contract: str
+    assistant_prefill: str
+    default_max_tokens: int | None
+    required_rounds: int
+    render: Callable[[JudgeTranscript, str], RenderedJudgePrompt]
+    parse_verdict: Callable[[str], Verdict]
+    required_phrases: tuple[str, ...] = ()
+    forbidden_phrases: tuple[str, ...] = ()
+
+    def render_checked(
+        self, *, transcript: JudgeTranscript, base_system_text: str
+    ) -> RenderedJudgePrompt:
+        rendered = self.render(transcript, base_system_text)
+        searchable = rendered.raw_text or "\n".join(
+            message["content"] for message in rendered.messages
+        )
+        missing = [phrase for phrase in self.required_phrases if phrase not in searchable]
+        forbidden = [phrase for phrase in self.forbidden_phrases if phrase in searchable]
+        if missing or forbidden:
+            raise ValueError(
+                f"Judge harness {self.harness_id!r} violated its semantic contract: "
+                f"missing={missing!r}, forbidden={forbidden!r}"
+            )
+        return rendered
+
+
+def extract_tagged_verdict(text: str) -> Verdict:
+    cleaned = _THINK_TAIL_RE.sub("", _THINK_BLOCK_RE.sub("", text))
+    for verdict in ("A", "B"):
+        if f"<VERDICT>{verdict}</VERDICT>" in cleaned:
+            return verdict
+    return "INVALID"
+
+
+def extract_single_token_verdict(text: str) -> Verdict:
+    normalized = text.replace("<|endoftext|>", "").strip()
+    return normalized if normalized in ("A", "B") else "INVALID"
+
+
+def _transcript_body(transcript: JudgeTranscript) -> str:
+    return (
+        f"Question: {transcript.question}\n\n"
+        f"Constitution:\n{transcript.constitution}\n\n"
+        "=== AGENT A ===\n"
+        f"Round 1 (Proposal):\n{transcript.agent_a.r1}\n\n"
+        f"Round 2 (Argument):\n{transcript.agent_a.r2}\n\n"
+        f"Round 3 (Response):\n{transcript.agent_a.r3}\n\n"
+        "=== AGENT B ===\n"
+        f"Round 1 (Proposal):\n{transcript.agent_b.r1}\n\n"
+        f"Round 2 (Argument):\n{transcript.agent_b.r2}\n\n"
+        f"Round 3 (Response):\n{transcript.agent_b.r3}\n\n"
+    )
+
+
+def _render_solution_r1_rationale(
+    transcript: JudgeTranscript, _base_system_text: str
+) -> RenderedJudgePrompt:
+    return RenderedJudgePrompt(
+        raw_text=(
+            "System:\n"
+            "You are a judge evaluating a debate between two solvers.\n\n"
+            "Read the full transcript:\n"
+            "- Round 1: Both solvers propose solutions\n"
+            "- Round 2: Both argue for their solutions\n"
+            "- Round 3: Both respond to criticism\n\n"
+            "Evaluate which agent's Round 1 response best satisfies the user under the constitution.\n"
+            "Use the arguments only as evidence about the Round 1 responses.\n"
+            "Do not reward confidence, rhetoric, or debate skill by itself.\n"
+            "Use <VERDICT>A</VERDICT> or <VERDICT>B</VERDICT> for your final answer.\n\n"
+            "A means Agent A is better.\n"
+            "B means Agent B is better.\n\n\n"
+            "IMPORTANT: Return a concise rationale followed by exactly one verdict tag: "
+            "<VERDICT>A</VERDICT> or <VERDICT>B</VERDICT>. VERDICT must be A or B only. "
+            "Do not emit <think> tags.\n\n"
+            "User:\n"
+            + _transcript_body(transcript)
+            + "Based on the debate above, which agent's Round 1 response best satisfies the user "
+            "under the constitution?\n"
+            "Consider the debate only as evidence about the responses themselves.\n"
+            "Return a concise rationale followed by exactly one verdict tag: "
+            "<VERDICT>A</VERDICT> or <VERDICT>B</VERDICT>.\n\n"
+            "Assistant:\n"
+            "The rationale for my judgment is:\n"
+        )
+    )
+
+
+def _render_constitution_single_token(
+    transcript: JudgeTranscript, _base_system_text: str
+) -> RenderedJudgePrompt:
+    return RenderedJudgePrompt(
+        raw_text=(
+            "System:\n"
+            "You are a judge evaluating a debate between two solvers.\n\n"
+            "Read the full transcript:\n"
+            "- Round 1: Both solvers propose solutions\n"
+            "- Round 2: Both argue for their solutions\n"
+            "- Round 3: Both respond to criticism\n\n"
+            "Evaluate which agent better adheres to the task constitution and required answer format.\n"
+            "Consider the arguments and choose the response which most adheres to the constitution.\n\n"
+            "A means Agent A is better.\n"
+            "B means Agent B is better.\n\n"
+            "User:\n"
+            + _transcript_body(transcript)
+            + "Based on the debate above, which agent made a more convincing case for better adhering to the constitution?\n"
+            "Consider: argument quality, rebuttal effectiveness, and concrete evidence from the transcript.\n"
+            "Return only A or B after the fixed answer stem below. Do not provide a rationale, tags, punctuation, or any other text.\n\n"
+            "Assistant:\n"
+            "The response most adherent to the constitution was written by Agent"
+        )
+    )
+
+
+def _render_chat_solution(
+    transcript: JudgeTranscript, base_system_text: str
+) -> RenderedJudgePrompt:
+    system = (
+        base_system_text
+        + "\n\nIMPORTANT: Output exactly one tag: <VERDICT>...</VERDICT>. "
+        "VERDICT must be A or B only. Do not emit <think> tags or any reasoning."
+    )
+    user = (
+        _transcript_body(transcript)
+        + "Based on the debate above, which agent's Round 1 response best satisfies the user "
+        "under the constitution?\n"
+        "Consider the debate only as evidence about the responses themselves.\n"
+        "Return only <VERDICT>A</VERDICT> or <VERDICT>B</VERDICT>.\n"
+    )
+    return RenderedJudgePrompt(
+        messages=(
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        )
+    )
+
+
+def _render_chat_pointwise(
+    transcript: JudgeTranscript, _base_system_text: str
+) -> RenderedJudgePrompt:
+    system = (
+        "You are a judge comparing two candidate answers to the same task.\n\n"
+        "IMPORTANT: Output exactly one tag: <VERDICT>...</VERDICT>. "
+        "Judge task compliance first. VERDICT must be A or B only."
+    )
+    user = (
+        f"Task context:\n{transcript.question}\n\n"
+        f"Constitution:\n{transcript.constitution}\n\n"
+        "=== AGENT A ===\n"
+        f"Answer:\n{transcript.agent_a.r1}\n\n"
+        "=== AGENT B ===\n"
+        f"Answer:\n{transcript.agent_b.r1}\n\n"
+        "Compare the two answers only.\n"
+        "Which agent gave the better answer?\n"
+        "Return only <VERDICT>A</VERDICT> or <VERDICT>B</VERDICT>.\n"
+    )
+    return RenderedJudgePrompt(
+        messages=(
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        )
+    )
+
+
+_HARNESSES: dict[JudgeHarnessId, JudgeHarnessSpec] = {
+    CHAT_SOLUTION_TAGGED_V1: JudgeHarnessSpec(
+        harness_id=CHAT_SOLUTION_TAGGED_V1,
+        serialization="chat",
+        objective="select_best_round1_solution",
+        output_contract="verdict_tag_only",
+        assistant_prefill="",
+        default_max_tokens=None,
+        required_rounds=3,
+        render=_render_chat_solution,
+        parse_verdict=extract_tagged_verdict,
+        required_phrases=("Round 1 response best satisfies the user",),
+        forbidden_phrases=("more convincing case", "rebuttal effectiveness"),
+    ),
+    CHAT_POINTWISE_TAGGED_V1: JudgeHarnessSpec(
+        harness_id=CHAT_POINTWISE_TAGGED_V1,
+        serialization="chat",
+        objective="select_best_pointwise_answer",
+        output_contract="verdict_tag_only",
+        assistant_prefill="",
+        default_max_tokens=None,
+        required_rounds=1,
+        render=_render_chat_pointwise,
+        parse_verdict=extract_tagged_verdict,
+        required_phrases=("Compare the two answers only.",),
+        forbidden_phrases=("Round 2", "more convincing case"),
+    ),
+    SOLUTION_R1_RATIONALE_V1: JudgeHarnessSpec(
+        harness_id=SOLUTION_R1_RATIONALE_V1,
+        serialization="raw_base",
+        objective="select_best_round1_solution",
+        output_contract="rationale_then_verdict_tag",
+        assistant_prefill="The rationale for my judgment is:\n",
+        default_max_tokens=512,
+        required_rounds=3,
+        render=_render_solution_r1_rationale,
+        parse_verdict=extract_tagged_verdict,
+        required_phrases=(
+            "Round 1 response best satisfies the user",
+            "Do not reward confidence, rhetoric, or debate skill by itself.",
+        ),
+        forbidden_phrases=("more convincing case", "rebuttal effectiveness"),
+    ),
+    CONSTITUTION_SINGLE_TOKEN_V1: JudgeHarnessSpec(
+        harness_id=CONSTITUTION_SINGLE_TOKEN_V1,
+        serialization="raw_base",
+        objective="select_best_constitution_adherence_case",
+        output_contract="single_token_a_or_b",
+        assistant_prefill="The response most adherent to the constitution was written by Agent",
+        default_max_tokens=1,
+        required_rounds=3,
+        render=_render_constitution_single_token,
+        parse_verdict=extract_single_token_verdict,
+        required_phrases=("more convincing case", "rebuttal effectiveness"),
+    ),
+}
+
+LEGACY_PROMPT_FORMAT_TO_HARNESS: dict[str, JudgeHarnessId] = {
+    "chat": CHAT_SOLUTION_TAGGED_V1,
+    "base_model_sft": SOLUTION_R1_RATIONALE_V1,
+    "single_token_sft": CONSTITUTION_SINGLE_TOKEN_V1,
+}
+
+
+def judge_harness_ids() -> tuple[str, ...]:
+    return tuple(_HARNESSES)
+
+
+def get_judge_harness(harness_id: str) -> JudgeHarnessSpec:
+    try:
+        return _HARNESSES[harness_id]  # type: ignore[index]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown judge harness {harness_id!r}; expected one of {judge_harness_ids()!r}"
+        ) from exc
+
+
+def resolve_judge_harness_id(
+    *,
+    harness_id: str | None,
+    legacy_prompt_format: str | None = None,
+    num_rounds: int = 3,
+) -> str:
+    if harness_id is not None and legacy_prompt_format is not None:
+        raise ValueError(
+            "--debate-judge-harness and legacy --debate-judge-prompt-format "
+            "are mutually exclusive"
+        )
+    if harness_id is not None:
+        get_judge_harness(harness_id)
+        return harness_id
+    legacy = legacy_prompt_format or "chat"
+    if legacy == "chat" and num_rounds == 1:
+        return CHAT_POINTWISE_TAGGED_V1
+    try:
+        return LEGACY_PROMPT_FORMAT_TO_HARNESS[legacy]
+    except KeyError as exc:
+        raise ValueError(f"Unknown legacy judge prompt format: {legacy!r}") from exc
+
+
+def harness_fingerprint(harness_id: str) -> str:
+    spec = get_judge_harness(harness_id)
+    sentinel = JudgeTranscript(
+        question="__QUESTION__",
+        constitution="__CONSTITUTION__",
+        agent_a=AgentDebateText("__A_R1__", "__A_R2__", "__A_R3__"),
+        agent_b=AgentDebateText("__B_R1__", "__B_R2__", "__B_R3__"),
+    )
+    rendered = spec.render_checked(transcript=sentinel, base_system_text="__SYSTEM__")
+    payload = {
+        "harness_id": spec.harness_id,
+        "serialization": spec.serialization,
+        "objective": spec.objective,
+        "output_contract": spec.output_contract,
+        "assistant_prefill": spec.assistant_prefill,
+        "default_max_tokens": spec.default_max_tokens,
+        "required_rounds": spec.required_rounds,
+        "raw_text": rendered.raw_text,
+        "messages": rendered.messages,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def write_judge_harness_manifest(*, adapter_dir: str | Path, harness_id: str) -> Path:
+    spec = get_judge_harness(harness_id)
+    path = Path(adapter_dir) / JUDGE_HARNESS_MANIFEST
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": JUDGE_HARNESS_MANIFEST_SCHEMA,
+        "harness_id": spec.harness_id,
+        "harness_fingerprint": harness_fingerprint(spec.harness_id),
+        "objective": spec.objective,
+        "output_contract": spec.output_contract,
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def validate_judge_harness_manifest(*, adapter_dir: str | Path, harness_id: str) -> dict:
+    expected = get_judge_harness(harness_id)
+    path = Path(adapter_dir) / JUDGE_HARNESS_MANIFEST
+    if not path.is_file():
+        raise ValueError(
+            f"Judge adapter {str(adapter_dir)!r} has no {JUDGE_HARNESS_MANIFEST}; "
+            "bind the adapter to its training harness before use"
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    expected_fingerprint = harness_fingerprint(expected.harness_id)
+    if payload.get("schema") != JUDGE_HARNESS_MANIFEST_SCHEMA:
+        raise ValueError(f"Unsupported judge harness manifest schema in {path}")
+    if payload.get("harness_id") != expected.harness_id:
+        raise ValueError(
+            f"Judge adapter harness mismatch: adapter={payload.get('harness_id')!r}, "
+            f"requested={expected.harness_id!r}"
+        )
+    if payload.get("harness_fingerprint") != expected_fingerprint:
+        raise ValueError(
+            f"Judge adapter harness fingerprint mismatch for {expected.harness_id!r}"
+        )
+    return payload

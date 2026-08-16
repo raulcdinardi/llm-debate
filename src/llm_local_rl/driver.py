@@ -20,6 +20,11 @@ from llm_local_rl.debate_parity import (
 )
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
 from llm_local_rl.local_renderers import infer_chat_preamble
+from llm_local_rl.judge_harness import (
+    harness_fingerprint,
+    validate_judge_harness_manifest,
+    write_judge_harness_manifest,
+)
 from llm_local_rl.masking import make_train_example
 from llm_local_rl.metrics import mean_numeric_metrics
 from llm_local_rl.mock_judge import SeededRandomJudge
@@ -65,6 +70,8 @@ class TrainingDriver:
             name: str(self.output_dir / f"adapter_init_{name}")
             for name in self._adapter_names()
         }
+        if self.config.init_adapter_dirs is not None:
+            self._validate_judge_adapter_harness(self.config.init_adapter_dirs)
         with self._stage("init_trainer", step=0):
             self.trainer = (
                 self._make_trainer_from_init_adapters()
@@ -75,6 +82,10 @@ class TrainingDriver:
             self.current_adapter_dirs[adapter_name] = self.trainer.save_adapter(
                 adapter_name=adapter_name,
                 output_dir=adapter_dir,
+            )
+            self._write_saved_judge_harness(
+                adapter_name=adapter_name,
+                adapter_dir=self.current_adapter_dirs[adapter_name],
             )
         with self._stage("trainer_sleep", step=0):
             self.trainer.sleep()
@@ -115,6 +126,7 @@ class TrainingDriver:
         driver.step_records_path = driver.output_dir / "step_records.jsonl"
         driver.summary_path = driver.output_dir / "summary.json"
         driver.current_adapter_dirs = dict(manifest.adapter_dirs)
+        driver._validate_judge_adapter_harness(driver.current_adapter_dirs)
         with driver._stage("init_trainer_resume", step=driver.start_step):
             driver.trainer = driver._make_trainer_from_current_adapters()
         with driver._stage("trainer_sleep", step=driver.start_step):
@@ -139,6 +151,23 @@ class TrainingDriver:
         if self.config.debate_judge_adapter == "judge":
             return ("solution", "debate", "judge")
         return ("solution", "debate")
+
+    def _validate_judge_adapter_harness(self, adapter_dirs: dict[str, str]) -> None:
+        judge_dir = adapter_dirs.get("judge")
+        if judge_dir is None or self.config.debate_judge_adapter != "judge":
+            return
+        validate_judge_harness_manifest(
+            adapter_dir=judge_dir,
+            harness_id=self.config.debate_judge_harness,
+        )
+
+    def _write_saved_judge_harness(self, *, adapter_name: str, adapter_dir: str) -> None:
+        if adapter_name != "judge" or self.config.debate_judge_adapter != "judge":
+            return
+        write_judge_harness_manifest(
+            adapter_dir=adapter_dir,
+            harness_id=self.config.debate_judge_harness,
+        )
 
     def _train_adapter_names(self) -> set[str] | None:
         if not self.config.train_adapter_names:
@@ -306,6 +335,10 @@ class TrainingDriver:
                 "model_path": self.config.model_path,
                 "tokenizer_path": self.config.tokenizer_path or self.config.model_path,
                 "behavior_policy_contract": self.config.behavior_policy().to_dict(),
+                "judge_harness_id": self.config.debate_judge_harness,
+                "judge_harness_fingerprint": harness_fingerprint(
+                    self.config.debate_judge_harness
+                ),
             },
         )
 
@@ -545,7 +578,7 @@ class TrainingDriver:
                 stop_on_concluded=self.config.debate_stop_on_concluded,
                 base_r2_prefill=self.config.base_r2_prefill,
                 base_r3_prefill=self.config.base_r3_prefill,
-                judge_prompt_format=self.config.debate_judge_prompt_format,
+                judge_harness_id=self.config.debate_judge_harness,
                 judge_max_tokens=self.config.debate_judge_max_tokens,
                 judge_temperature=self.config.debate_judge_temperature,
                 judge_top_p=self.config.debate_judge_top_p,
@@ -1031,6 +1064,10 @@ class TrainingDriver:
                                 adapter_name=adapter_name,
                                 output_dir=str(adapter_dir),
                             )
+                            self._write_saved_judge_harness(
+                                adapter_name=adapter_name,
+                                adapter_dir=self.current_adapter_dirs[adapter_name],
+                            )
                             self._progress(
                                 "save_adapter_done",
                                 step=step_num,
@@ -1052,6 +1089,12 @@ class TrainingDriver:
                         "train_metrics": train_metrics,
                         "sample_records": record_samples,
                         "adapter_dirs": dict(self.current_adapter_dirs),
+                        "judge_harness": {
+                            "id": self.config.debate_judge_harness,
+                            "fingerprint": harness_fingerprint(
+                                self.config.debate_judge_harness
+                            ),
+                        },
                         **extra_record,
                     }
                     parsed_reward_hacking = self._parsed_reward_hacking_rate(

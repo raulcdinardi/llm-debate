@@ -8,6 +8,10 @@ from llm_local_rl.behavior_policy import BEHAVIOR_POLICY_LOGPROBS, BehaviorPolic
 from llm_local_rl.debate_parity import DebateConfig
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
 from llm_local_rl.debate_tasks import HTSequenceDebateTask
+from llm_local_rl.judge_harness import (
+    CONSTITUTION_SINGLE_TOKEN_V1,
+    SOLUTION_R1_RATIONALE_V1,
+)
 from llm_local_rl.types import SamplingRequest, SamplingResult
 
 
@@ -175,7 +179,7 @@ def test_frozen_base_sft_judge_uses_same_sampler_in_one_ordered_batch() -> None:
             num_groups=2,
             group_size=2,
             judge_adapter="judge",
-            judge_prompt_format="base_model_sft",
+            judge_harness_id=SOLUTION_R1_RATIONALE_V1,
             judge_max_tokens=512,
             judge_temperature=1.0,
             judge_top_p=0.95,
@@ -210,6 +214,35 @@ def test_frozen_base_sft_judge_uses_same_sampler_in_one_ordered_batch() -> None:
     assert all("Round 3 (Response):\nTheir answer violates the format." in prompt for prompt in prompts)
 
 
+def test_single_token_harness_owns_parser_prefill_and_one_token_budget() -> None:
+    tokenizer = TinyChatTokenizer()
+    sampler = RecordingSampler(tokenizer=tokenizer, requests=[], judge_texts=["A"])
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=3,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="judge",
+            judge_harness_id=CONSTITUTION_SINGLE_TOKEN_V1,
+        ),
+        adapter_layout="split",
+    )
+
+    debate = runtime.rollout(step_seed=7).debates[0]
+
+    judge_request = sampler.batches[-1][0]
+    prompt = tokenizer.decode(judge_request.prompt_token_ids)
+    assert judge_request.max_tokens == 1
+    assert prompt.endswith(
+        "The response most adherent to the constitution was written by Agent"
+    )
+    assert debate.verdict == "A"
+
+
 def test_base_sft_reverse_order_swaps_every_a_b_round_argument() -> None:
     tokenizer = TinyChatTokenizer()
     task = HTSequenceDebateTask(sequence_len=4)
@@ -223,7 +256,7 @@ def test_base_sft_reverse_order_swaps_every_a_b_round_argument() -> None:
             num_groups=1,
             group_size=2,
             judge_adapter="judge",
-            judge_prompt_format="base_model_sft",
+            judge_harness_id=SOLUTION_R1_RATIONALE_V1,
         ),
         adapter_layout="split",
     )
@@ -276,7 +309,7 @@ def test_bidirectional_judge_maps_reverse_labels_and_records_coherence() -> None
             num_groups=2,
             group_size=2,
             judge_adapter="judge",
-            judge_prompt_format="base_model_sft",
+            judge_harness_id=SOLUTION_R1_RATIONALE_V1,
             judge_bidirectional=True,
         ),
         adapter_layout="split",
@@ -314,7 +347,7 @@ def test_bidirectional_judge_uses_seeded_random_winner_on_disagreement() -> None
             num_groups=1,
             group_size=2,
             judge_adapter="judge",
-            judge_prompt_format="base_model_sft",
+            judge_harness_id=SOLUTION_R1_RATIONALE_V1,
             judge_bidirectional=True,
         ),
         adapter_layout="split",
@@ -347,7 +380,7 @@ def test_bidirectional_judge_does_not_replace_invalid_grpo_turn_with_greedy_retr
             num_groups=1,
             group_size=2,
             judge_adapter="judge",
-            judge_prompt_format="base_model_sft",
+            judge_harness_id=SOLUTION_R1_RATIONALE_V1,
             judge_bidirectional=True,
             judge_temperature=0.8,
         ),
@@ -364,7 +397,7 @@ def test_bidirectional_judge_does_not_replace_invalid_grpo_turn_with_greedy_retr
     assert tokenizer.decode(turns[0]["completion_tokens"]) == "not a verdict"
 
 
-def test_base_sft_judge_rejects_incomplete_debate_instead_of_blank_rounds() -> None:
+def test_solution_harness_rejects_incomplete_debate_instead_of_blank_rounds() -> None:
     runtime = DebateRuntime(
         task=HTSequenceDebateTask(sequence_len=4),
         tokenizer=TinyChatTokenizer(),
@@ -375,10 +408,10 @@ def test_base_sft_judge_rejects_incomplete_debate_instead_of_blank_rounds() -> N
             num_groups=1,
             group_size=2,
             judge_adapter="judge",
-            judge_prompt_format="base_model_sft",
+            judge_harness_id=SOLUTION_R1_RATIONALE_V1,
         ),
         adapter_layout="split",
     )
 
-    with pytest.raises(ValueError, match="complete three-round debate"):
+    with pytest.raises(ValueError, match="requires at least 3 rounds"):
         runtime.rollout(step_seed=0)

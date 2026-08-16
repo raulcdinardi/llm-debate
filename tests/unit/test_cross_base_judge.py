@@ -9,6 +9,7 @@ from llm_local_rl.behavior_policy import BEHAVIOR_POLICY_LOGPROBS, BehaviorPolic
 from llm_local_rl.config import RolloutConfig, TrainRunConfig
 from llm_local_rl.debate_parity import DebateConfig
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
+from llm_local_rl.judge_harness import CHAT_POINTWISE_TAGGED_V1, CHAT_SOLUTION_TAGGED_V1
 from llm_local_rl.debate_tasks import HTSequenceDebateTask
 from llm_local_rl.types import SamplingRequest, SamplingResult
 
@@ -149,6 +150,9 @@ def _runtime(
             num_groups=1,
             group_size=2,
             judge_adapter="policy",
+            judge_harness_id=(
+                CHAT_POINTWISE_TAGGED_V1 if num_rounds == 1 else CHAT_SOLUTION_TAGGED_V1
+            ),
             debate_judge_server_url=judge_server_url,
             debate_judge_server_adapter_path=judge_server_adapter_path,
         ),

@@ -1,74 +1,156 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from llm_local_rl.base_model_judge import (
-    build_base_judge_prompt,
-    build_sft_judge_prompt,
-    extract_strict_verdict,
+from llm_local_rl.judge_harness import (
+    AgentDebateText,
+    CHAT_POINTWISE_TAGGED_V1,
+    CHAT_SOLUTION_TAGGED_V1,
+    CONSTITUTION_SINGLE_TOKEN_V1,
+    JUDGE_HARNESS_MANIFEST,
+    JudgeTranscript,
+    SOLUTION_R1_RATIONALE_V1,
+    extract_single_token_verdict,
+    extract_tagged_verdict,
+    get_judge_harness,
+    harness_fingerprint,
+    resolve_judge_harness_id,
+    validate_judge_harness_manifest,
+    write_judge_harness_manifest,
 )
+from llm_local_rl.lora_identity import adapter_identity
 
 
-def test_extract_strict_verdict_requires_exact_tag() -> None:
-    assert extract_strict_verdict("<VERDICT>A</VERDICT>") == "A"
-    assert extract_strict_verdict("prefix <VERDICT>B</VERDICT> suffix") == "B"
-    assert extract_strict_verdict("A") == "INVALID"
-
-
-def test_build_base_judge_prompt_includes_context_constitution_and_all_rounds() -> None:
-    prompt = build_base_judge_prompt(
+def _transcript() -> JudgeTranscript:
+    return JudgeTranscript(
         question="Question text",
         constitution="Follow the rules",
-        r1_a="A1",
-        r1_b="B1",
-        r2_a="A2",
-        r2_b="B2",
-        r3_a="A3",
-        r3_b="B3",
+        agent_a=AgentDebateText(r1="A1", r2="A2", r3="A3"),
+        agent_b=AgentDebateText(r1="B1", r2="B2", r3="B3"),
     )
+
+
+def test_tagged_verdict_parser_requires_exact_tag() -> None:
+    assert extract_tagged_verdict("<VERDICT>A</VERDICT>") == "A"
+    assert extract_tagged_verdict("prefix <VERDICT>B</VERDICT> suffix") == "B"
+    assert extract_tagged_verdict("A") == "INVALID"
+
+
+def test_solution_harness_is_canonical_and_solution_focused() -> None:
+    harness = get_judge_harness(SOLUTION_R1_RATIONALE_V1)
+    rendered = harness.render_checked(transcript=_transcript(), base_system_text="ignored")
+    assert rendered.raw_text is not None
+    prompt = rendered.raw_text
     assert "Question text" in prompt
     assert "Follow the rules" in prompt
     assert "Round 1 (Proposal):\nA1" in prompt
     assert "Round 2 (Argument):\nB2" in prompt
     assert "Round 3 (Response):\nA3" in prompt
-    assert "<VERDICT>A</VERDICT>" in prompt
     assert "which agent's Round 1 response best satisfies the user" in prompt
-    assert "The rationale for my judgment is:\n" in prompt
+    assert "Do not reward confidence, rhetoric, or debate skill by itself." in prompt
+    assert prompt.endswith(harness.assistant_prefill)
     assert "more convincing case" not in prompt
     assert "argument quality" not in prompt
+    assert "rebuttal effectiveness" not in prompt
 
 
-def test_base_model_sft_dispatch_is_exactly_the_canonical_solution_harness() -> None:
-    kwargs = {
-        "question": "Question text",
-        "constitution": "Follow the rules",
-        "r1_a": "A1",
-        "r1_b": "B1",
-        "r2_a": "A2",
-        "r2_b": "B2",
-        "r3_a": "A3",
-        "r3_b": "B3",
-    }
-
-    dispatched = build_sft_judge_prompt(prompt_format="base_model_sft", **kwargs)
-
-    assert dispatched == build_base_judge_prompt(**kwargs)
-    assert "Do not reward confidence, rhetoric, or debate skill by itself." in dispatched
-    assert "more convincing case" not in dispatched
-    assert "argument quality" not in dispatched
-    assert "rebuttal effectiveness" not in dispatched
+def test_structured_transcript_swap_is_complete_and_involutive() -> None:
+    transcript = _transcript()
+    swapped = transcript.swapped()
+    assert swapped.agent_a == transcript.agent_b
+    assert swapped.agent_b == transcript.agent_a
+    assert swapped.swapped() == transcript
 
 
-def test_sft_prompt_dispatch_fails_closed_for_unknown_format() -> None:
-    with pytest.raises(ValueError, match="Unknown frozen judge SFT prompt format"):
-        build_sft_judge_prompt(
-            prompt_format="persuasion_harness",  # type: ignore[arg-type]
-            question="Q",
-            constitution="C",
-            r1_a="A1",
-            r1_b="B1",
-            r2_a="A2",
-            r2_b="B2",
-            r3_a="A3",
-            r3_b="B3",
+def test_new_and_legacy_harness_flags_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        resolve_judge_harness_id(
+            harness_id=SOLUTION_R1_RATIONALE_V1,
+            legacy_prompt_format="base_model_sft",
         )
+
+
+def test_versioned_harness_fingerprints_are_golden() -> None:
+    assert harness_fingerprint(CHAT_SOLUTION_TAGGED_V1) == (
+        "ddf47bbc791349aae04e6adf081cc9764a39e6cf225f24ebcf12c4fd4b26156f"
+    )
+    assert harness_fingerprint(CHAT_POINTWISE_TAGGED_V1) == (
+        "f95725a66460a20617f3feea8fb8f333d83d03dc64c8a7da68d561aebfdb66d8"
+    )
+    assert harness_fingerprint(SOLUTION_R1_RATIONALE_V1) == (
+        "28afa8006098fddeec5630680651bc3c1db30608e45463da3f91fc18d2dab67e"
+    )
+    assert harness_fingerprint(CONSTITUTION_SINGLE_TOKEN_V1) == (
+        "2b8f61287b142bf6c82251d146b470b017cab6ea321fba8421e20490bdada930"
+    )
+
+
+def test_single_token_harness_owns_its_parser_and_output_budget() -> None:
+    harness = get_judge_harness(CONSTITUTION_SINGLE_TOKEN_V1)
+    rendered = harness.render_checked(transcript=_transcript(), base_system_text="ignored")
+    assert rendered.raw_text is not None
+    assert rendered.raw_text.endswith(harness.assistant_prefill)
+    assert harness.default_max_tokens == 1
+    assert harness.parse_verdict(" A") == "A"
+    assert extract_single_token_verdict("B<|endoftext|>") == "B"
+    assert harness.parse_verdict("A because") == "INVALID"
+
+
+def test_unknown_harness_fails_closed() -> None:
+    with pytest.raises(ValueError, match="Unknown judge harness"):
+        get_judge_harness("persuasion_harness")
+
+
+def test_adapter_manifest_binds_exact_harness_and_fingerprint(tmp_path) -> None:
+    adapter = tmp_path / "judge"
+    adapter.mkdir()
+    write_judge_harness_manifest(
+        adapter_dir=adapter,
+        harness_id=SOLUTION_R1_RATIONALE_V1,
+    )
+
+    payload = validate_judge_harness_manifest(
+        adapter_dir=adapter,
+        harness_id=SOLUTION_R1_RATIONALE_V1,
+    )
+    assert payload["objective"] == "select_best_round1_solution"
+    with pytest.raises(ValueError, match="harness mismatch"):
+        validate_judge_harness_manifest(
+            adapter_dir=adapter,
+            harness_id=CONSTITUTION_SINGLE_TOKEN_V1,
+        )
+
+    manifest_path = adapter / JUDGE_HARNESS_MANIFEST
+    tampered = json.loads(manifest_path.read_text())
+    tampered["harness_fingerprint"] = "0" * 64
+    manifest_path.write_text(json.dumps(tampered))
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        validate_judge_harness_manifest(
+            adapter_dir=adapter,
+            harness_id=SOLUTION_R1_RATIONALE_V1,
+        )
+
+
+def test_adapter_manifest_is_required(tmp_path) -> None:
+    with pytest.raises(ValueError, match="has no judge_harness.json"):
+        validate_judge_harness_manifest(
+            adapter_dir=tmp_path,
+            harness_id=SOLUTION_R1_RATIONALE_V1,
+        )
+
+
+def test_adapter_identity_tracks_harness_manifest(tmp_path) -> None:
+    (tmp_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "adapter_model.safetensors").write_bytes(b"weights")
+    manifest = write_judge_harness_manifest(
+        adapter_dir=tmp_path,
+        harness_id=SOLUTION_R1_RATIONALE_V1,
+    )
+    before = adapter_identity(str(tmp_path))
+
+    manifest.write_text(manifest.read_text() + "\n", encoding="utf-8")
+    after = adapter_identity(str(tmp_path))
+
+    assert before != after

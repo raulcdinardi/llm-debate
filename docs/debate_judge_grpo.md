@@ -12,6 +12,7 @@ debate adapter:
 ```text
 --adapter-layout split
 --debate-judge-adapter judge
+--debate-judge-harness solution_r1_rationale_v1
 --init-adapter-dir solution=/path/to/solution
 --init-adapter-dir debate=/path/to/debate
 --init-adapter-dir judge=/path/to/judge
@@ -43,6 +44,7 @@ Enable judge optimization with this complete prerequisite set:
 ```text
 --adapter-layout split
 --debate-judge-adapter judge
+--debate-judge-harness solution_r1_rationale_v1
 --debate-judge-bidirectional
 --train-judge-coherence-grpo
 --temperature 1.0
@@ -63,6 +65,19 @@ counterparts to the same values (for example, `--temperature` together with
 `--debate-judge-temperature`, and `--top-p` together with
 `--debate-judge-top-p`). Both temperatures default to `1.0`, but they are shown
 explicitly above so the documented contract stays self-contained.
+
+Judge LoRAs are bound to their training harness by a `judge_harness.json`
+sidecar. Bind an existing adapter once before using it:
+
+```text
+python scripts/bind_judge_harness.py \
+  --adapter-dir /path/to/judge \
+  --harness solution_r1_rationale_v1
+```
+
+Loading fails closed if the sidecar is missing, names another harness, or has a
+stale prompt fingerprint. Newly saved judge checkpoints inherit the configured
+harness automatically.
 
 ## Related reward controls
 

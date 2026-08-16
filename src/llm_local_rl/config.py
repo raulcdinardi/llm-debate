@@ -6,6 +6,11 @@ import math
 from pathlib import Path
 
 from llm_local_rl.behavior_policy import BehaviorPolicySpec
+from llm_local_rl.judge_harness import (
+    CHAT_SOLUTION_TAGGED_V1,
+    get_judge_harness,
+    resolve_judge_harness_id,
+)
 
 
 @dataclass(frozen=True)
@@ -78,7 +83,7 @@ class TrainRunConfig:
     debate_judge_server_adapter_path: str | None = None
     debate_mock_judge_seed: int | None = None
     debate_external_judge_timeout_s: float = 600.0
-    debate_judge_prompt_format: str = "chat"
+    debate_judge_harness: str = CHAT_SOLUTION_TAGGED_V1
     debate_judge_max_tokens: int = 0
     debate_judge_temperature: float = 1.0
     debate_judge_top_p: float = 1.0
@@ -168,11 +173,15 @@ class TrainRunConfig:
             )
         if not 0.0 < float(self.rollout.top_p) <= 1.0:
             raise ValueError(f"rollout.top_p must be in (0, 1], got {self.rollout.top_p}")
-        if self.debate_judge_prompt_format not in ("chat", "base_model_sft", "single_token_sft"):
+        judge_harness = get_judge_harness(self.debate_judge_harness)
+        uses_runtime_harness = (
+            self.debate_external_judge_url is None
+            and self.debate_mock_judge_seed is None
+        )
+        if uses_runtime_harness and self.debate_rounds < judge_harness.required_rounds:
             raise ValueError(
-                "debate_judge_prompt_format must be 'chat', 'base_model_sft', or "
-                "'single_token_sft', got "
-                f"{self.debate_judge_prompt_format!r}"
+                f"Judge harness {judge_harness.harness_id!r} requires at least "
+                f"{judge_harness.required_rounds} rounds"
             )
         if self.debate_judge_max_tokens < 0:
             raise ValueError("debate_judge_max_tokens must be non-negative")
@@ -187,12 +196,10 @@ class TrainRunConfig:
         if (
             judge_modes == 0
             and self.debate_judge_adapter == "judge"
-            and self.debate_judge_prompt_format in ("base_model_sft", "single_token_sft")
+            and judge_harness.serialization == "raw_base"
         ):
-            if self.debate_rounds != 3:
-                raise ValueError("SFT judge prompting requires debate_rounds=3")
             if self.sampler_backend != "vllm":
-                raise ValueError("SFT judge sampling currently requires sampler_backend='vllm'")
+                raise ValueError("Raw-Base judge harnesses currently require sampler_backend='vllm'")
         if self.rollout.env_name == "mmlu_pro_pairwise" and not self.mmlu_pro_data_path:
             raise ValueError("mmlu_pro_pairwise requires mmlu_pro_data_path")
         self.behavior_policy().assert_exact_trainer_reconstruction_supported()
@@ -328,7 +335,11 @@ class TrainRunConfig:
             debate_judge_server_adapter_path=data.get("debate_judge_server_adapter_path"),
             debate_mock_judge_seed=data.get("debate_mock_judge_seed"),
             debate_external_judge_timeout_s=data.get("debate_external_judge_timeout_s", 600.0),
-            debate_judge_prompt_format=data.get("debate_judge_prompt_format", "chat"),
+            debate_judge_harness=resolve_judge_harness_id(
+                harness_id=data.get("debate_judge_harness"),
+                legacy_prompt_format=data.get("debate_judge_prompt_format"),
+                num_rounds=int(data.get("debate_rounds", 3)),
+            ),
             debate_judge_max_tokens=data.get("debate_judge_max_tokens", 0),
             debate_judge_temperature=data.get("debate_judge_temperature", 1.0),
             debate_judge_top_p=data.get("debate_judge_top_p", 1.0),

@@ -18,12 +18,17 @@ from llm_local_rl.debate_tasks import CountdownCodeDebateTask, HTSequenceDebateT
 from llm_local_rl.types import SamplingRequest, SamplingResult
 from llm_local_rl.debate_parity import DebateConfig
 from llm_local_rl.task_types import TaskInstance
+from llm_local_rl.judge_harness import (
+    CHAT_POINTWISE_TAGGED_V1,
+    CHAT_SOLUTION_TAGGED_V1,
+)
 
 
 def test_debate_runtime_sampling_temperature_defaults_are_one() -> None:
     assert DebateConfig().temperature == 1.0
     assert DebateConfig.cheap().temperature == 1.0
     assert DebateRuntimeConfig().judge_temperature == 1.0
+    assert DebateRuntimeConfig().judge_harness_id == CHAT_SOLUTION_TAGGED_V1
 
 
 def _real_tokenizer():
@@ -328,7 +333,13 @@ def test_debate_runtime_shared_routes_all_rounds_to_shared_with_real_tokenizer()
         tokenizer=tokenizer,
         sampler=RecordingSampler(tokenizer=tokenizer, requests=[]),
         debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
-        runtime_config=DebateRuntimeConfig(num_rounds=1, num_groups=1, group_size=2, judge_adapter="policy"),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=1,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="policy",
+            judge_harness_id=CHAT_POINTWISE_TAGGED_V1,
+        ),
         adapter_layout="shared",
     )
     runtime.rollout(step_seed=0)
