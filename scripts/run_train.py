@@ -36,6 +36,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "quality_debate",
             "countdown_code",
             "constrained_writing",
+            "mmlu_pro_pairwise",
         ],
     )
     parser.add_argument("--mode", default="debate", choices=["single_turn", "debate"])
@@ -62,6 +63,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--quality-source", default="Gutenberg")
     parser.add_argument("--quality-topic-contains", default="Science fiction")
     parser.add_argument("--quality-download", action="store_true")
+    parser.add_argument("--mmlu-pro-data-path", default=None)
     parser.add_argument("--thinking-mode", default="default", choices=["default", "no_think", "force_think"])
     parser.add_argument("--advantage-mode", default="zscore", choices=["identity", "centered_mean", "zscore"])
     parser.add_argument("--ppo-clip-epsilon", type=float, default=0.2)
@@ -86,7 +88,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--debate-judge-prompt-format",
         default="chat",
-        choices=["chat", "base_model_sft"],
+        choices=["chat", "base_model_sft", "single_token_sft"],
     )
     parser.add_argument("--debate-judge-max-tokens", type=int, default=0)
     parser.add_argument("--debate-judge-temperature", type=float, default=0.3)
@@ -290,6 +292,7 @@ def main() -> int:
                 quality_source=args.quality_source,
                 quality_topic_contains=args.quality_topic_contains,
                 quality_download=args.quality_download,
+                mmlu_pro_data_path=args.mmlu_pro_data_path,
                 thinking_mode=args.thinking_mode,
                 advantage_mode=args.advantage_mode,
                 ppo_clip_epsilon=args.ppo_clip_epsilon,

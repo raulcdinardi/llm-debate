@@ -7,8 +7,8 @@ from typing import Callable
 
 from llm_local_rl.behavior_policy import validate_sampling_result_contract
 from llm_local_rl.base_model_judge import (
-    POLICY_JUDGE_ASSISTANT_PREFILL,
-    build_qwen35_base_policy_judge_prompt,
+    build_sft_judge_prompt,
+    extract_single_token_verdict,
     extract_strict_verdict,
 )
 from llm_local_rl.chat_templates import get_chat_adapter
@@ -259,11 +259,11 @@ class DebateRuntime:
         if self.runtime_config.group_size % 2 != 0:
             raise ValueError("Debate requires even group_size.")
         if (
-            self.runtime_config.judge_prompt_format == "base_model_sft"
+            self.runtime_config.judge_prompt_format in ("base_model_sft", "single_token_sft")
             and self.runtime_config.num_rounds != 3
         ):
             raise ValueError(
-                "judge_prompt_format='base_model_sft' requires a complete three-round debate; "
+                "SFT judge prompting requires a complete three-round debate; "
                 f"got num_rounds={self.runtime_config.num_rounds}"
             )
         instances = self.task.sample_instances(n=self.runtime_config.num_groups, seed=step_seed)
@@ -683,13 +683,12 @@ class DebateRuntime:
         return out
 
     def _judge_prompts(self, *, inst_pairs: list[tuple[TaskInstance, TaskInstance]], r1_visible_text: list[str], r2_visible_text: list[str], r3_visible_text: list[str], reverse_order: bool = False) -> list[list[int]]:
-        if self.runtime_config.judge_prompt_format == "base_model_sft":
+        if self.runtime_config.judge_prompt_format in ("base_model_sft", "single_token_sft"):
             return [
                 list(
                     self.tokenizer.encode(
-                        build_qwen35_base_policy_judge_prompt(
-                            base_system_text=self.debate_config.system_judge,
-                            assistant_prefill=POLICY_JUDGE_ASSISTANT_PREFILL,
+                        build_sft_judge_prompt(
+                            prompt_format=self.runtime_config.judge_prompt_format,
                             question=self.task.judge_context_text(inst=inst_a),
                             constitution=self.task.judge_constitution_text(inst=inst_a),
                             r1_a=r1_visible_text[2 * debate_idx + int(reverse_order)],
@@ -780,19 +779,34 @@ class DebateRuntime:
             for inst in instances_repeated
         ]
         stop_token_ids = self.task.stop_token_ids(tokenizer=self.tokenizer)
-        r1_results = self._sample_many(
-            prompt_tokens_list=base_r1_prompt_tokens,
-            round_num=1,
-            step_seed=step_seed,
-            stop_token_ids=stop_token_ids,
-            max_tokens=self._max_tokens_for_round(round_num=1),
-            temperature=float(self.debate_config.temperature),
-        )
+        fixed_r1_builder = getattr(self.task, "fixed_r1_completion_text", None)
+        if callable(fixed_r1_builder):
+            r1_results = []
+            for inst in instances_repeated:
+                text = str(fixed_r1_builder(inst=inst))
+                tokens = list(self.tokenizer.encode(text, add_special_tokens=False))
+                if not tokens:
+                    raise ValueError("Fixed R1 completion must contain at least one token")
+                r1_results.append(
+                    (tokens, [0.0] * len(tokens), text, {"fixed_r1": True, "sampled": False})
+                )
+        else:
+            r1_results = self._sample_many(
+                prompt_tokens_list=base_r1_prompt_tokens,
+                round_num=1,
+                step_seed=step_seed,
+                stop_token_ids=stop_token_ids,
+                max_tokens=self._max_tokens_for_round(round_num=1),
+                temperature=float(self.debate_config.temperature),
+            )
         r1_tokens = [comp for comp, _lps, _text, _raw in r1_results]
         r1_lps = [lps for _comp, lps, _text, _raw in r1_results]
         r1_text = [text for _comp, _lps, text, _raw in r1_results]
         r1_visible_text, r1_visible_metrics = self._postprocess_visible_texts(instances=instances_repeated, texts=r1_text)
-        r1_sol = [extract_solution(text) for text in r1_visible_text]
+        r1_sol = [
+            text if callable(fixed_r1_builder) else extract_solution(text)
+            for text in r1_visible_text
+        ]
         r1_raw = [raw for _comp, _lps, _text, raw in r1_results]
         r1_task_rewards = []
         r1_task_reward_metrics = []
@@ -1216,11 +1230,12 @@ class DebateRuntime:
         retry_flags: list[bool] = []
         invalid_indices: list[int] = []
         for idx, (comp, lps, text, raw) in enumerate(results):
-            verdict = (
-                extract_strict_verdict(text)
-                if self.runtime_config.judge_prompt_format == "base_model_sft"
-                else extract_verdict(_strip_think_blocks(text))
-            )
+            if self.runtime_config.judge_prompt_format == "base_model_sft":
+                verdict = extract_strict_verdict(text)
+            elif self.runtime_config.judge_prompt_format == "single_token_sft":
+                verdict = extract_single_token_verdict(text)
+            else:
+                verdict = extract_verdict(_strip_think_blocks(text))
             verdicts.append(verdict)
             reasonings.append(extract_reasoning(text))
             completion_tokens.append(comp)
@@ -1248,11 +1263,12 @@ class DebateRuntime:
                 temperature=0.0,
             )
             for debate_idx, (comp, lps, text, raw) in zip(invalid_indices, retry_results, strict=True):
-                retry_verdict = (
-                    extract_strict_verdict(text)
-                    if self.runtime_config.judge_prompt_format == "base_model_sft"
-                    else extract_verdict(_strip_think_blocks(text))
-                )
+                if self.runtime_config.judge_prompt_format == "base_model_sft":
+                    retry_verdict = extract_strict_verdict(text)
+                elif self.runtime_config.judge_prompt_format == "single_token_sft":
+                    retry_verdict = extract_single_token_verdict(text)
+                else:
+                    retry_verdict = extract_verdict(_strip_think_blocks(text))
                 if retry_verdict == "INVALID":
                     continue
                 verdicts[debate_idx] = retry_verdict

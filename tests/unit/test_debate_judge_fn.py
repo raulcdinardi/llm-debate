@@ -202,10 +202,56 @@ def test_frozen_base_sft_judge_uses_same_sampler_in_one_ordered_batch() -> None:
     assert all(prompt.startswith("System:\n") for prompt in prompts)
     assert all(prompt.endswith("The rationale for my judgment is:\n") for prompt in prompts)
     assert all("Evaluate which agent's Round 1 response best satisfies the user" in prompt for prompt in prompts)
-    assert all("which agent made a more convincing case" in prompt for prompt in prompts)
-    assert all("argument quality, rebuttal effectiveness, and concrete evidence" in prompt for prompt in prompts)
+    assert all("Do not reward confidence, rhetoric, or debate skill by itself." in prompt for prompt in prompts)
+    assert all("which agent made a more convincing case" not in prompt for prompt in prompts)
+    assert all("argument quality" not in prompt for prompt in prompts)
+    assert all("rebuttal effectiveness" not in prompt for prompt in prompts)
     assert all("Round 2 (Argument):\nTheir answer violates the format." in prompt for prompt in prompts)
     assert all("Round 3 (Response):\nTheir answer violates the format." in prompt for prompt in prompts)
+
+
+def test_base_sft_reverse_order_swaps_every_a_b_round_argument() -> None:
+    tokenizer = TinyChatTokenizer()
+    task = HTSequenceDebateTask(sequence_len=4)
+    runtime = DebateRuntime(
+        task=task,
+        tokenizer=tokenizer,
+        sampler=RecordingSampler(tokenizer=tokenizer, requests=[]),
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=3,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="judge",
+            judge_prompt_format="base_model_sft",
+        ),
+        adapter_layout="split",
+    )
+    instances = task.sample_instances(n=2, seed=3)
+    inst_pairs = [(instances[0], instances[1])]
+
+    [forward_tokens] = runtime._judge_prompts(
+        inst_pairs=inst_pairs,
+        r1_visible_text=["A1", "B1"],
+        r2_visible_text=["A2", "B2"],
+        r3_visible_text=["A3", "B3"],
+    )
+    [reverse_tokens] = runtime._judge_prompts(
+        inst_pairs=inst_pairs,
+        r1_visible_text=["A1", "B1"],
+        r2_visible_text=["A2", "B2"],
+        r3_visible_text=["A3", "B3"],
+        reverse_order=True,
+    )
+    forward = tokenizer.decode(forward_tokens)
+    reverse = tokenizer.decode(reverse_tokens)
+
+    assert "=== AGENT A ===\nRound 1 (Proposal):\nA1" in forward
+    assert "=== AGENT B ===\nRound 1 (Proposal):\nB1" in forward
+    assert "=== AGENT A ===\nRound 1 (Proposal):\nB1" in reverse
+    assert "Round 2 (Argument):\nB2" in reverse
+    assert "Round 3 (Response):\nB3" in reverse
+    assert "=== AGENT B ===\nRound 1 (Proposal):\nA1" in reverse
 
 
 def test_bidirectional_judge_maps_reverse_labels_and_records_coherence() -> None:

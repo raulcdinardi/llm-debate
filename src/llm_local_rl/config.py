@@ -60,6 +60,7 @@ class TrainRunConfig:
     quality_source: str | None = "Gutenberg"
     quality_topic_contains: str | None = "Science fiction"
     quality_download: bool = False
+    mmlu_pro_data_path: str | None = None
     thinking_mode: str = "default"
     advantage_mode: str = "zscore"
     ppo_clip_epsilon: float = 0.2
@@ -167,9 +168,10 @@ class TrainRunConfig:
             )
         if not 0.0 < float(self.rollout.top_p) <= 1.0:
             raise ValueError(f"rollout.top_p must be in (0, 1], got {self.rollout.top_p}")
-        if self.debate_judge_prompt_format not in ("chat", "base_model_sft"):
+        if self.debate_judge_prompt_format not in ("chat", "base_model_sft", "single_token_sft"):
             raise ValueError(
-                "debate_judge_prompt_format must be 'chat' or 'base_model_sft', got "
+                "debate_judge_prompt_format must be 'chat', 'base_model_sft', or "
+                "'single_token_sft', got "
                 f"{self.debate_judge_prompt_format!r}"
             )
         if self.debate_judge_max_tokens < 0:
@@ -185,12 +187,14 @@ class TrainRunConfig:
         if (
             judge_modes == 0
             and self.debate_judge_adapter == "judge"
-            and self.debate_judge_prompt_format == "base_model_sft"
+            and self.debate_judge_prompt_format in ("base_model_sft", "single_token_sft")
         ):
             if self.debate_rounds != 3:
-                raise ValueError("base_model_sft judge prompting requires debate_rounds=3")
+                raise ValueError("SFT judge prompting requires debate_rounds=3")
             if self.sampler_backend != "vllm":
-                raise ValueError("base_model_sft judge sampling currently requires sampler_backend='vllm'")
+                raise ValueError("SFT judge sampling currently requires sampler_backend='vllm'")
+        if self.rollout.env_name == "mmlu_pro_pairwise" and not self.mmlu_pro_data_path:
+            raise ValueError("mmlu_pro_pairwise requires mmlu_pro_data_path")
         self.behavior_policy().assert_exact_trainer_reconstruction_supported()
         if not self.on_policy_logprob_check:
             raise ValueError(
@@ -306,6 +310,7 @@ class TrainRunConfig:
             quality_source=data.get("quality_source", "Gutenberg"),
             quality_topic_contains=data.get("quality_topic_contains", "Science fiction"),
             quality_download=data.get("quality_download", False),
+            mmlu_pro_data_path=data.get("mmlu_pro_data_path"),
             thinking_mode=data.get("thinking_mode", "default"),
             advantage_mode=data.get("advantage_mode", "zscore"),
             ppo_clip_epsilon=data.get("ppo_clip_epsilon", 0.2),

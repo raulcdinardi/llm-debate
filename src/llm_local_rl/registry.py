@@ -10,6 +10,7 @@ from llm_local_rl.debate_tasks import (
 )
 from llm_local_rl.envs import CoinFlipEnv, CountdownCodeEnv, HTSequenceEnv, QualityEnv, ShortStoryEnv
 from llm_local_rl.constrained_writing import ConstrainedWritingDebateTask, ConstrainedWritingEnv
+from llm_local_rl.mmlu_pro_pairwise import MMLUProPairwiseDebateTask
 from llm_local_rl.episodes import SingleTurnEpisodeBuilder
 
 
@@ -49,6 +50,8 @@ def build_environment(config: TrainRunConfig):
             topic_contains=config.quality_topic_contains,
             download=config.quality_download,
         )
+    if config.rollout.env_name == "mmlu_pro_pairwise":
+        raise ValueError("mmlu_pro_pairwise supports debate mode only")
     raise ValueError(f"Unknown env_name={config.rollout.env_name!r}")
 
 
@@ -83,4 +86,7 @@ def build_debate_task(config: TrainRunConfig):
             topic_contains=config.quality_topic_contains,
             download=config.quality_download,
         )
+    if config.rollout.env_name == "mmlu_pro_pairwise":
+        assert config.mmlu_pro_data_path is not None
+        return MMLUProPairwiseDebateTask(data_path=config.mmlu_pro_data_path)
     raise ValueError(f"Unknown env_name={config.rollout.env_name!r} for debate mode.")
