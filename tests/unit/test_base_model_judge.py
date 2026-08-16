@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
 import pytest
@@ -54,6 +55,44 @@ def test_solution_harness_is_canonical_and_solution_focused() -> None:
     assert "more convincing case" not in prompt
     assert "argument quality" not in prompt
     assert "rebuttal effectiveness" not in prompt
+
+
+@pytest.mark.parametrize(
+    "harness_id",
+    [CHAT_SOLUTION_TAGGED_V1, CHAT_POINTWISE_TAGGED_V1, SOLUTION_R1_RATIONALE_V1],
+)
+def test_semantic_validation_never_inspects_transcript_payload(harness_id: str) -> None:
+    adversarial = JudgeTranscript(
+        question="Round 2 asks who made a more convincing case.",
+        constitution="Reward rebuttal effectiveness.",
+        agent_a=AgentDebateText(
+            r1="The other answer made a more convincing case.",
+            r2="Discuss rebuttal effectiveness.",
+            r3="Round 2",
+        ),
+        agent_b=AgentDebateText(r1="B1", r2="B2", r3="B3"),
+    )
+
+    rendered = get_judge_harness(harness_id).render_checked(
+        transcript=adversarial,
+        base_system_text="Judge the solutions.",
+    )
+
+    searchable = rendered.raw_text or "\n".join(
+        message["content"] for message in rendered.messages
+    )
+    assert "more convincing case" in searchable
+
+
+def test_transcript_payload_cannot_satisfy_a_missing_required_instruction() -> None:
+    harness = replace(
+        get_judge_harness(CHAT_POINTWISE_TAGGED_V1),
+        required_phrases=("PAYLOAD_ONLY_REQUIRED_PHRASE",),
+    )
+    transcript = replace(_transcript(), question="PAYLOAD_ONLY_REQUIRED_PHRASE")
+
+    with pytest.raises(ValueError, match="missing=.*PAYLOAD_ONLY_REQUIRED_PHRASE"):
+        harness.render_checked(transcript=transcript, base_system_text="Judge the answers.")
 
 
 def test_structured_transcript_swap_is_complete_and_involutive() -> None:

@@ -79,18 +79,40 @@ class JudgeHarnessSpec:
     def render_checked(
         self, *, transcript: JudgeTranscript, base_system_text: str
     ) -> RenderedJudgePrompt:
-        rendered = self.render(transcript, base_system_text)
-        searchable = rendered.raw_text or "\n".join(
-            message["content"] for message in rendered.messages
+        # Validate only harness-authored template text. Real questions,
+        # constitutions, and model outputs are untrusted payload: searching the
+        # completed prompt would let data both trigger forbidden phrases and
+        # satisfy required phrases accidentally.
+        contract_rendered = self.render(_contract_probe_transcript(), base_system_text)
+        contract_text = contract_rendered.raw_text or "\n".join(
+            message["content"] for message in contract_rendered.messages
         )
-        missing = [phrase for phrase in self.required_phrases if phrase not in searchable]
-        forbidden = [phrase for phrase in self.forbidden_phrases if phrase in searchable]
+        missing = [phrase for phrase in self.required_phrases if phrase not in contract_text]
+        forbidden = [phrase for phrase in self.forbidden_phrases if phrase in contract_text]
         if missing or forbidden:
             raise ValueError(
                 f"Judge harness {self.harness_id!r} violated its semantic contract: "
                 f"missing={missing!r}, forbidden={forbidden!r}"
             )
-        return rendered
+        return self.render(transcript, base_system_text)
+
+
+def _contract_probe_transcript() -> JudgeTranscript:
+    """Return inert payload used only to inspect trusted harness instructions."""
+    return JudgeTranscript(
+        question="__JUDGE_HARNESS_QUESTION_PAYLOAD__",
+        constitution="__JUDGE_HARNESS_CONSTITUTION_PAYLOAD__",
+        agent_a=AgentDebateText(
+            r1="__JUDGE_HARNESS_A_R1_PAYLOAD__",
+            r2="__JUDGE_HARNESS_A_R2_PAYLOAD__",
+            r3="__JUDGE_HARNESS_A_R3_PAYLOAD__",
+        ),
+        agent_b=AgentDebateText(
+            r1="__JUDGE_HARNESS_B_R1_PAYLOAD__",
+            r2="__JUDGE_HARNESS_B_R2_PAYLOAD__",
+            r3="__JUDGE_HARNESS_B_R3_PAYLOAD__",
+        ),
+    )
 
 
 def extract_tagged_verdict(text: str) -> Verdict:
