@@ -156,7 +156,7 @@ class DebateRuntimeConfig:
     base_r3_prefill: str = "Responding to my opponent's criticism:\n1)"
     judge_prompt_format: str = "chat"
     judge_max_tokens: int = 0
-    judge_temperature: float = 0.3
+    judge_temperature: float = 1.0
     judge_top_p: float = 1.0
     judge_top_k: int = -1
     judge_min_p: float = 0.0

@@ -70,7 +70,7 @@ class DebateConfig:
     max_tokens_r23: int | None = None
     max_tokens_r2: int | None = None
     max_tokens_r3: int | None = None
-    temperature: float = 0.8
+    temperature: float = 1.0
     kl_coef: float = 0.01
     learning_rate: float = 1e-5
     system_propose: str = load_prompt("debate/system_propose.md")
@@ -82,7 +82,7 @@ class DebateConfig:
 
     @staticmethod
     def cheap(*, chat_preamble: str = "") -> "DebateConfig":
-        return DebateConfig(max_tokens_per_turn=None, temperature=0.7, chat_preamble=chat_preamble)
+        return DebateConfig(max_tokens_per_turn=None, temperature=1.0, chat_preamble=chat_preamble)
 
 
 @dataclass

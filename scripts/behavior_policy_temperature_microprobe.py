@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a zero-update four-cell temperature/logprob semantic probe."
     )
-    parser.add_argument("--behavior-temperature", type=float, default=0.8)
+    parser.add_argument("--behavior-temperature", type=float, default=1.0)
     parser.add_argument("--rows", type=int, default=128)
     parser.add_argument("--vocab-size", type=int, default=257)
     parser.add_argument("--seed", type=int, default=20260723)

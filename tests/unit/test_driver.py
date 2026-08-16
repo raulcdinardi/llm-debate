@@ -12,6 +12,22 @@ from llm_local_rl.metrics import mean_numeric_metrics
 from llm_local_rl.registry import build_debate_task, build_environment, build_episode_builder
 
 
+def test_sampling_temperature_defaults_are_one_in_config_and_legacy_payloads() -> None:
+    config = TrainRunConfig(
+        model_path="/tmp/nonexistent_model_for_shape_only",
+        output_dir="/tmp/out",
+    )
+    assert config.rollout.temperature == 1.0
+    assert config.debate_judge_temperature == 1.0
+
+    payload = config.to_dict()
+    del payload["rollout"]["temperature"]
+    del payload["debate_judge_temperature"]
+    restored = TrainRunConfig.from_dict(payload)
+    assert restored.rollout.temperature == 1.0
+    assert restored.debate_judge_temperature == 1.0
+
+
 def test_config_and_manifest_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         config = TrainRunConfig(

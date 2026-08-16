@@ -47,7 +47,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--rollout-batch-size", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=None)
@@ -91,7 +91,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["chat", "base_model_sft", "single_token_sft"],
     )
     parser.add_argument("--debate-judge-max-tokens", type=int, default=0)
-    parser.add_argument("--debate-judge-temperature", type=float, default=0.3)
+    parser.add_argument("--debate-judge-temperature", type=float, default=1.0)
     parser.add_argument("--debate-judge-top-p", type=float, default=1.0)
     parser.add_argument("--debate-judge-top-k", type=int, default=-1)
     parser.add_argument("--debate-judge-min-p", type=float, default=0.0)

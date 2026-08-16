@@ -26,7 +26,7 @@ class RolloutConfig:
     group_size: int = 8
     rollout_batch_size: int = 0
     max_tokens: int = 1024
-    temperature: float = 0.7
+    temperature: float = 1.0
     top_p: float = 1.0
     min_p: float = 0.0
     seed: int | None = None
@@ -80,7 +80,7 @@ class TrainRunConfig:
     debate_external_judge_timeout_s: float = 600.0
     debate_judge_prompt_format: str = "chat"
     debate_judge_max_tokens: int = 0
-    debate_judge_temperature: float = 0.3
+    debate_judge_temperature: float = 1.0
     debate_judge_top_p: float = 1.0
     debate_judge_top_k: int = -1
     debate_judge_min_p: float = 0.0
@@ -283,7 +283,7 @@ class TrainRunConfig:
                 group_size=rollout_data.get("group_size", 8),
                 rollout_batch_size=rollout_data.get("rollout_batch_size", 0),
                 max_tokens=rollout_data.get("max_tokens", 1024),
-                temperature=rollout_data.get("temperature", 0.7),
+                temperature=rollout_data.get("temperature", 1.0),
                 top_p=rollout_data.get("top_p", 1.0),
                 min_p=rollout_data.get("min_p", 0.0),
                 seed=rollout_data.get("seed"),
@@ -330,7 +330,7 @@ class TrainRunConfig:
             debate_external_judge_timeout_s=data.get("debate_external_judge_timeout_s", 600.0),
             debate_judge_prompt_format=data.get("debate_judge_prompt_format", "chat"),
             debate_judge_max_tokens=data.get("debate_judge_max_tokens", 0),
-            debate_judge_temperature=data.get("debate_judge_temperature", 0.3),
+            debate_judge_temperature=data.get("debate_judge_temperature", 1.0),
             debate_judge_top_p=data.get("debate_judge_top_p", 1.0),
             debate_judge_top_k=data.get("debate_judge_top_k", -1),
             debate_judge_min_p=data.get("debate_judge_min_p", 0.0),

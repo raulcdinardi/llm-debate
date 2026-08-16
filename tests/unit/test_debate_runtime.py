@@ -20,6 +20,12 @@ from llm_local_rl.debate_parity import DebateConfig
 from llm_local_rl.task_types import TaskInstance
 
 
+def test_debate_runtime_sampling_temperature_defaults_are_one() -> None:
+    assert DebateConfig().temperature == 1.0
+    assert DebateConfig.cheap().temperature == 1.0
+    assert DebateRuntimeConfig().judge_temperature == 1.0
+
+
 def _real_tokenizer():
     if AutoTokenizer is None:
         pytest.skip("transformers is required for real-tokenizer debate runtime tests.")
