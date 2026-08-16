@@ -9,8 +9,8 @@ from llm_local_rl.judge_harness import (
     AgentDebateText,
     JudgeTranscript,
     SOLUTION_R1_RATIONALE_V1,
-    extract_tagged_verdict,
     get_judge_harness,
+    harness_fingerprint,
 )
 from llm_local_rl.model_io_trace import get_model_io_tracer
 
@@ -18,10 +18,22 @@ from llm_local_rl.model_io_trace import get_model_io_tracer
 @dataclass(frozen=True)
 class RemoteBaseJudgeConfig:
     url: str
+    harness_id: str
     timeout_s: float = 600.0
+
+    def __post_init__(self) -> None:
+        harness = get_judge_harness(self.harness_id)
+        if harness.harness_id != SOLUTION_R1_RATIONALE_V1:
+            raise ValueError(
+                "External HTTP judge supports only "
+                f"{SOLUTION_R1_RATIONALE_V1!r}; got {harness.harness_id!r}"
+            )
 
 
 def build_remote_base_judge(config: RemoteBaseJudgeConfig):
+    harness = get_judge_harness(config.harness_id)
+    fingerprint = harness_fingerprint(harness.harness_id)
+
     def judge(
         question: str,
         constitution: str,
@@ -32,7 +44,6 @@ def build_remote_base_judge(config: RemoteBaseJudgeConfig):
         r3_a: str,
         r3_b: str,
     ) -> tuple[Verdict, str]:
-        harness = get_judge_harness(SOLUTION_R1_RATIONALE_V1)
         transcript = JudgeTranscript(
             question=question,
             constitution=constitution,
@@ -61,6 +72,8 @@ def build_remote_base_judge(config: RemoteBaseJudgeConfig):
                 request_body=request_body,
                 raw_text=None,
                 verdict=None,
+                harness_id=harness.harness_id,
+                harness_fingerprint=fingerprint,
                 error=exc,
             )
             raise
@@ -72,6 +85,8 @@ def build_remote_base_judge(config: RemoteBaseJudgeConfig):
             request_body=request_body,
             raw_text=raw_text,
             verdict=verdict,
+            harness_id=harness.harness_id,
+            harness_fingerprint=fingerprint,
         )
         return verdict, raw_text
 

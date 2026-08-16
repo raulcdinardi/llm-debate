@@ -44,6 +44,13 @@ template fingerprint before loading the adapter. Saved judge checkpoints write
 the sidecar automatically. The harness ID and fingerprint are also recorded in
 the run configuration, model-I/O trace metadata, and each step record.
 
+The external HTTP judge receives the same resolved harness ID used by the
+runtime and provenance records. Its `/judge` API currently implements only
+`solution_r1_rationale_v1`, so any other configured harness fails before launch;
+it never silently substitutes the supported harness. External judge traces
+record the effective harness ID and fingerprint alongside the exact HTTP prompt
+and response.
+
 Binding is a provenance assertion, not automatic discovery. The operator must
 choose the harness that generated the adapter's training examples; the command
 cannot infer that history from LoRA weights.

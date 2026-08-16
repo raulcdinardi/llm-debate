@@ -8,6 +8,8 @@ from pathlib import Path
 from llm_local_rl.behavior_policy import BehaviorPolicySpec
 from llm_local_rl.judge_harness import (
     CHAT_SOLUTION_TAGGED_V1,
+    JudgeHarnessSpec,
+    SOLUTION_R1_RATIONALE_V1,
     get_judge_harness,
     resolve_judge_harness_id,
 )
@@ -150,6 +152,10 @@ class TrainRunConfig:
     def behavior_policy(self) -> BehaviorPolicySpec:
         return BehaviorPolicySpec.from_rollout_config(self.rollout)
 
+    def judge_harness(self) -> JudgeHarnessSpec:
+        """Return the single resolved judge contract used by every execution path."""
+        return get_judge_harness(self.debate_judge_harness)
+
     def __post_init__(self) -> None:
         if self.sampler_teardown_before_training and self.sampler_sleep_before_training:
             raise ValueError(
@@ -173,15 +179,20 @@ class TrainRunConfig:
             )
         if not 0.0 < float(self.rollout.top_p) <= 1.0:
             raise ValueError(f"rollout.top_p must be in (0, 1], got {self.rollout.top_p}")
-        judge_harness = get_judge_harness(self.debate_judge_harness)
-        uses_runtime_harness = (
-            self.debate_external_judge_url is None
-            and self.debate_mock_judge_seed is None
-        )
-        if uses_runtime_harness and self.debate_rounds < judge_harness.required_rounds:
+        judge_harness = self.judge_harness()
+        uses_configured_harness = self.debate_mock_judge_seed is None
+        if uses_configured_harness and self.debate_rounds < judge_harness.required_rounds:
             raise ValueError(
                 f"Judge harness {judge_harness.harness_id!r} requires at least "
                 f"{judge_harness.required_rounds} rounds"
+            )
+        if (
+            self.debate_external_judge_url is not None
+            and judge_harness.harness_id != SOLUTION_R1_RATIONALE_V1
+        ):
+            raise ValueError(
+                "External HTTP judge supports only "
+                f"{SOLUTION_R1_RATIONALE_V1!r}; got {judge_harness.harness_id!r}"
             )
         if self.debate_judge_max_tokens < 0:
             raise ValueError("debate_judge_max_tokens must be non-negative")

@@ -11,6 +11,7 @@ from llm_local_rl.qwen35_base_format import COUNTDOWN_JSON_PREAMBLE
 from llm_local_rl.metrics import mean_numeric_metrics
 from llm_local_rl.registry import build_debate_task, build_environment, build_episode_builder
 from llm_local_rl.judge_harness import (
+    CHAT_SOLUTION_TAGGED_V1,
     SOLUTION_R1_RATIONALE_V1,
     validate_judge_harness_manifest,
 )
@@ -647,6 +648,25 @@ def test_solution_rationale_harness_requires_complete_three_round_debate() -> No
             debate_judge_harness=SOLUTION_R1_RATIONALE_V1,
             debate_rounds=1,
             sampler_backend="vllm",
+        )
+
+
+def test_external_http_judge_requires_compatible_harness_and_rounds() -> None:
+    with pytest.raises(ValueError, match="supports only.*solution_r1_rationale_v1"):
+        TrainRunConfig(
+            model_path="/tmp/nonexistent_model_for_shape_only",
+            output_dir="/tmp/out",
+            debate_external_judge_url="http://judge.test",
+            debate_judge_harness=CHAT_SOLUTION_TAGGED_V1,
+        )
+
+    with pytest.raises(ValueError, match="requires at least 3 rounds"):
+        TrainRunConfig(
+            model_path="/tmp/nonexistent_model_for_shape_only",
+            output_dir="/tmp/out",
+            debate_external_judge_url="http://judge.test",
+            debate_judge_harness=SOLUTION_R1_RATIONALE_V1,
+            debate_rounds=1,
         )
 
 

@@ -5,7 +5,13 @@ from pathlib import Path
 import tempfile
 
 import llm_local_rl.base_model_judge as base_model_judge
+import pytest
 from llm_local_rl.base_model_judge import RemoteBaseJudgeConfig, build_remote_base_judge
+from llm_local_rl.judge_harness import (
+    CHAT_SOLUTION_TAGGED_V1,
+    SOLUTION_R1_RATIONALE_V1,
+    harness_fingerprint,
+)
 from llm_local_rl.model_io_trace import (
     configure_model_io_tracing,
     reset_model_io_tracing,
@@ -176,9 +182,22 @@ def test_external_judge_trace_records_prompt_body_and_raw_response(monkeypatch) 
 
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
-            configure_model_io_tracing(enabled=True, output_dir=tmpdir, tokenizer=TinyTokenizer())
+            configure_model_io_tracing(
+                enabled=True,
+                output_dir=tmpdir,
+                tokenizer=TinyTokenizer(),
+                metadata={
+                    "judge_harness_id": "stale_global_value",
+                    "judge_harness_fingerprint": "stale_global_value",
+                },
+            )
             monkeypatch.setattr(base_model_judge.request, "urlopen", fake_urlopen)
-            judge = build_remote_base_judge(RemoteBaseJudgeConfig(url="http://judge.test"))
+            judge = build_remote_base_judge(
+                RemoteBaseJudgeConfig(
+                    url="http://judge.test",
+                    harness_id=SOLUTION_R1_RATIONALE_V1,
+                )
+            )
 
             verdict, raw_text = judge("Question", "Rules", "A1", "B1", "A2", "B2", "A3", "B3")
 
@@ -188,6 +207,18 @@ def test_external_judge_trace_records_prompt_body_and_raw_response(monkeypatch) 
             assert record["phase"] == "external_judge"
             assert record["request"]["body"]["prompt_text"].startswith("System:")
             assert record["response"]["verdict"] == "A"
+            assert record["model"]["judge_harness_id"] == SOLUTION_R1_RATIONALE_V1
+            assert record["model"]["judge_harness_fingerprint"] == harness_fingerprint(
+                SOLUTION_R1_RATIONALE_V1
+            )
             assert record["exactness"]["token_ids"] == "local_visualization_only"
         finally:
             reset_model_io_tracing()
+
+
+def test_external_judge_rejects_unsupported_harness() -> None:
+    with pytest.raises(ValueError, match="supports only.*solution_r1_rationale_v1"):
+        RemoteBaseJudgeConfig(
+            url="http://judge.test",
+            harness_id=CHAT_SOLUTION_TAGGED_V1,
+        )

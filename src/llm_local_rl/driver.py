@@ -158,7 +158,7 @@ class TrainingDriver:
             return
         validate_judge_harness_manifest(
             adapter_dir=judge_dir,
-            harness_id=self.config.debate_judge_harness,
+            harness_id=self.config.judge_harness().harness_id,
         )
 
     def _write_saved_judge_harness(self, *, adapter_name: str, adapter_dir: str) -> None:
@@ -166,7 +166,7 @@ class TrainingDriver:
             return
         write_judge_harness_manifest(
             adapter_dir=adapter_dir,
-            harness_id=self.config.debate_judge_harness,
+            harness_id=self.config.judge_harness().harness_id,
         )
 
     def _train_adapter_names(self) -> set[str] | None:
@@ -321,6 +321,7 @@ class TrainingDriver:
         )
 
     def _configure_tracing(self) -> None:
+        judge_harness = self.config.judge_harness()
         trace_output_dir = (
             Path(self.config.trace_model_io_dir)
             if self.config.trace_model_io_dir is not None
@@ -335,9 +336,9 @@ class TrainingDriver:
                 "model_path": self.config.model_path,
                 "tokenizer_path": self.config.tokenizer_path or self.config.model_path,
                 "behavior_policy_contract": self.config.behavior_policy().to_dict(),
-                "judge_harness_id": self.config.debate_judge_harness,
+                "judge_harness_id": judge_harness.harness_id,
                 "judge_harness_fingerprint": harness_fingerprint(
-                    self.config.debate_judge_harness
+                    judge_harness.harness_id
                 ),
             },
         )
@@ -545,10 +546,12 @@ class TrainingDriver:
         if self.debate_task is None:
             raise ValueError("Debate task is not initialized.")
         judge_fn = None
+        judge_harness = self.config.judge_harness()
         if self.config.debate_external_judge_url is not None:
             judge_fn = build_remote_base_judge(
                 RemoteBaseJudgeConfig(
                     url=self.config.debate_external_judge_url,
+                    harness_id=judge_harness.harness_id,
                     timeout_s=self.config.debate_external_judge_timeout_s,
                 )
             )
@@ -578,7 +581,7 @@ class TrainingDriver:
                 stop_on_concluded=self.config.debate_stop_on_concluded,
                 base_r2_prefill=self.config.base_r2_prefill,
                 base_r3_prefill=self.config.base_r3_prefill,
-                judge_harness_id=self.config.debate_judge_harness,
+                judge_harness_id=judge_harness.harness_id,
                 judge_max_tokens=self.config.debate_judge_max_tokens,
                 judge_temperature=self.config.debate_judge_temperature,
                 judge_top_p=self.config.debate_judge_top_p,
@@ -1090,9 +1093,9 @@ class TrainingDriver:
                         "sample_records": record_samples,
                         "adapter_dirs": dict(self.current_adapter_dirs),
                         "judge_harness": {
-                            "id": self.config.debate_judge_harness,
+                            "id": self.config.judge_harness().harness_id,
                             "fingerprint": harness_fingerprint(
-                                self.config.debate_judge_harness
+                                self.config.judge_harness().harness_id
                             ),
                         },
                         **extra_record,
