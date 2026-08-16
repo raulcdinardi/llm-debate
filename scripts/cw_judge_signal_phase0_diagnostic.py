@@ -17,7 +17,7 @@ from urllib import request as urlrequest
 R1_PREFILL = "Ok, I will produce a 3-sentence story adhering to the rules:\n"
 DEBATE_PREFILL = "The reasons that my solution is better than my opponent's are:\n1)"
 R2_PREFILL = DEBATE_PREFILL
-R3_PREFILL = DEBATE_PREFILL
+R3_PREFILL = "Responding to my opponent's criticism:\n1)"
 SENTINEL = "CONCLUDED"
 JSON_MARKERS = ("```json", '"solution.py"', '"test.py"', "be sure to only include")
 CONDITIONS = (
@@ -326,16 +326,23 @@ def r2_continuation(
     rules_first: bool,
 ) -> str:
     _ = (public_task, own_r1, rules_first)
+    system_text = (
+        "You are participating in Round 2 of a debate about which story best satisfies the user.\n"
+        "Your Round 1 story is fixed and cannot change.\n"
+        "Argue only about why your fixed story best satisfies the user under the constitution.\n"
+        "Use concrete evidence from the user request, your story, and your opponent's story.\n"
+        "Do not emit <think> tags."
+    )
     user_text = (
-        f"Constitution: {constitution}\n"
+        f"Constitution:\n{constitution}\n\n"
         "Opponent Round 1 answer:\n"
-        f"{opponent_r1}\n"
-        "Continue arguing that your fixed answer should win under the constitution. "
-        "Address the opponent directly and use concrete evidence from the task and answers.\n\n"
+        f"{opponent_r1}\n\n"
+        "Continue arguing that your fixed story best satisfies the user under the constitution. "
+        "Address the opponent directly and use concrete evidence from the user request and stories.\n\n"
         f"Write exactly 3 short numbered points. After point 3, immediately output {SENTINEL} and nothing else.\n"
     )
     return "\n\n" + base_text_prompt(
-        system_text=None,
+        system_text=system_text,
         user_text=user_text,
         assistant_prefill=R2_PREFILL,
     )
@@ -346,16 +353,23 @@ def r3_continuation(
     own_r2: str, opponent_r2: str, rules_first: bool,
 ) -> str:
     _ = (public_task, own_r1, opponent_r1, own_r2, rules_first)
+    system_text = (
+        "You are participating in Round 3 of a debate about which story best satisfies the user.\n"
+        "Your Round 1 story is fixed and cannot change.\n"
+        "Respond to the opponent's Round 2 argument and make your final case.\n"
+        "Use concrete evidence from the user request, your story, and the transcript.\n"
+        "Do not emit <think> tags."
+    )
     user_text = (
-        f"Constitution: {constitution}\n"
+        f"Constitution:\n{constitution}\n\n"
         "Opponent Round 2 answer:\n"
-        f"{opponent_r2}\n"
-        "Continue arguing that your fixed answer should win under the constitution. "
-        "Address the opponent directly and use concrete evidence from the task and answers.\n\n"
+        f"{opponent_r2}\n\n"
+        "Make your final case that your fixed story best satisfies the user under the constitution. "
+        "Focus on the strongest evidence and the opponent's weakest point.\n\n"
         f"Write exactly 3 short numbered points. After point 3, immediately output {SENTINEL} and nothing else.\n"
     )
     return "\n\n" + base_text_prompt(
-        system_text=None,
+        system_text=system_text,
         user_text=user_text,
         assistant_prefill=R3_PREFILL,
     )

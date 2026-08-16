@@ -145,7 +145,7 @@ def test_judge_rejection_task_config_roundtrip_and_fail_closed() -> None:
     config = TrainRunConfig(
         model_path="/tmp/nonexistent_model_for_shape_only",
         output_dir="/tmp/out",
-        rollout=RolloutConfig(mode="debate"),
+        rollout=RolloutConfig(mode="debate", temperature=0.8),
         adapter_layout="split",
         debate_r1_reward="judge_rejection_task",
     )
@@ -175,6 +175,95 @@ def test_judge_rejection_task_config_roundtrip_and_fail_closed() -> None:
             adapter_layout="split",
             debate_r1_reward="judge_rejection_task",
             debate_round_adapter_names=("solution", "solution", "debate"),
+        )
+
+
+def test_judge_delta_task_config_roundtrip_and_fail_closed() -> None:
+    config = TrainRunConfig(
+        model_path="/tmp/model",
+        output_dir="/tmp/out",
+        rollout=RolloutConfig(mode="debate", temperature=0.8),
+        adapter_layout="split",
+        debate_r1_reward="judge_delta_task",
+        debate_r1_judge_delta_q=1.0,
+        debate_incoherent_r23_reward=-0.5,
+        debate_judge_bidirectional=True,
+    )
+    restored = TrainRunConfig.from_dict(config.to_dict())
+    assert restored.debate_r1_reward == "judge_delta_task"
+    assert restored.debate_r1_judge_delta_q == 1.0
+    assert restored.debate_incoherent_r23_reward == -0.5
+    assert restored.debate_judge_bidirectional is True
+
+    with pytest.raises(ValueError, match="bidirectional"):
+        TrainRunConfig(
+            model_path="/tmp/model",
+            output_dir="/tmp/out",
+            rollout=RolloutConfig(mode="debate"),
+            adapter_layout="split",
+            debate_r1_reward="judge_delta_task",
+            debate_judge_bidirectional=False,
+        )
+
+
+def test_judge_coherence_grpo_config_roundtrip_and_fail_closed() -> None:
+    config = TrainRunConfig(
+        model_path="/tmp/model",
+        output_dir="/tmp/out",
+        rollout=RolloutConfig(mode="debate", temperature=0.8),
+        adapter_layout="split",
+        debate_judge_adapter="judge",
+        debate_judge_bidirectional=True,
+        debate_judge_temperature=0.8,
+        train_judge_coherence_grpo=True,
+        train_adapter_names=("solution", "debate", "judge"),
+    )
+    restored = TrainRunConfig.from_dict(config.to_dict())
+    assert restored.train_judge_coherence_grpo is True
+
+    with pytest.raises(ValueError, match="behavior distributions to match"):
+        TrainRunConfig(
+            model_path="/tmp/model",
+            output_dir="/tmp/out",
+            rollout=RolloutConfig(mode="debate", temperature=0.8),
+            adapter_layout="split",
+            debate_judge_adapter="judge",
+            debate_judge_bidirectional=True,
+            debate_judge_temperature=1.0,
+            train_judge_coherence_grpo=True,
+            train_adapter_names=("solution", "debate", "judge"),
+        )
+
+    with pytest.raises(ValueError, match="bidirectional"):
+        TrainRunConfig(
+            model_path="/tmp/model",
+            output_dir="/tmp/out",
+            rollout=RolloutConfig(mode="debate"),
+            adapter_layout="split",
+            debate_judge_adapter="judge",
+            debate_judge_bidirectional=False,
+            train_judge_coherence_grpo=True,
+        )
+    with pytest.raises(ValueError, match="judge in train_adapter_names"):
+        TrainRunConfig(
+            model_path="/tmp/model",
+            output_dir="/tmp/out",
+            rollout=RolloutConfig(mode="debate"),
+            adapter_layout="split",
+            debate_judge_adapter="judge",
+            debate_judge_bidirectional=True,
+            train_judge_coherence_grpo=True,
+            train_adapter_names=("solution", "debate"),
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        TrainRunConfig(
+            model_path="/tmp/model",
+            output_dir="/tmp/out",
+            rollout=RolloutConfig(mode="debate"),
+            adapter_layout="split",
+            debate_r1_reward="judge_delta_task",
+            debate_r1_judge_delta_q=-1.0,
+            debate_judge_bidirectional=True,
         )
 
 

@@ -26,3 +26,7 @@ def test_build_base_judge_prompt_includes_context_constitution_and_all_rounds() 
     assert "Round 2 (Argument):\nB2" in prompt
     assert "Round 3 (Response):\nA3" in prompt
     assert "<VERDICT>A</VERDICT>" in prompt
+    assert "which agent's Round 1 response best satisfies the user" in prompt
+    assert "The rationale for my judgment is:\n" in prompt
+    assert "more convincing case" not in prompt
+    assert "argument quality" not in prompt

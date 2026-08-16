@@ -58,7 +58,7 @@ def test_diagnostic_prompt_bytes_match_runtime_task_contract() -> None:
         rules_first=False,
     )
     assert diagnostic_r2 == "\n\n" + base_text_prompt(
-        system_text=None,
+        system_text=runtime_r2.system_text,
         user_text=runtime_r2.user_text,
         assistant_prefill=runtime_r2.assistant_prefill,
     )
@@ -79,10 +79,11 @@ def test_diagnostic_prompt_bytes_match_runtime_task_contract() -> None:
         rules_first=False,
     )
     assert diagnostic_r3 == "\n\n" + base_text_prompt(
-        system_text=None,
+        system_text=runtime_r3.system_text,
         user_text=runtime_r3.user_text,
         assistant_prefill=runtime_r3.assistant_prefill,
     )
-    assert runtime_r3.assistant_prefill == R3_PREFILL == R2_PREFILL
+    assert runtime_r3.assistant_prefill == R3_PREFILL
+    assert R3_PREFILL != R2_PREFILL
 
     assert prompt_loss_mask_violation_count([prompt_ids], completion_token_id=0) == 0

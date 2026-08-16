@@ -8,11 +8,80 @@ from llm_local_rl.debate_parity import (
     DebateResult,
     DebateTrajectory,
     Transition,
+    assemble_judge_coherence_grpo_examples,
     assemble_split_train_examples,
     assemble_training_data_by_mode,
     assemble_training_data_r1_r23,
     summarize_judge_rejection_r1_projection,
 )
+
+
+def _judge_turns(offset: int = 0) -> list[dict[str, object]]:
+    return [
+        {
+            "order": "forward",
+            "prompt_tokens": [101 + offset, 102 + offset],
+            "completion_tokens": [103 + offset, 104 + offset],
+            "completion_logprobs": [-0.1, -0.2],
+        },
+        {
+            "order": "reverse",
+            "prompt_tokens": [201 + offset, 202 + offset],
+            "completion_tokens": [203 + offset, 204 + offset],
+            "completion_logprobs": [-0.3, -0.4],
+        },
+    ]
+
+
+def test_judge_coherence_grpo_normalizes_across_all_judgments() -> None:
+    coherent = _make_debate(
+        question="coherent",
+        judge_raw_response={
+            "bidirectional_judge": True,
+            "order_invariant": True,
+            "_training_judge_turns": _judge_turns(),
+        },
+    )
+    incoherent = _make_debate(
+        question="incoherent",
+        token_offset=30,
+        judge_raw_response={
+            "bidirectional_judge": True,
+            "order_invariant": False,
+            "_training_judge_turns": _judge_turns(30),
+        },
+    )
+
+    examples, metrics = assemble_judge_coherence_grpo_examples([coherent, incoherent])
+
+    assert len(examples) == 4
+    assert metrics == {
+        "judge_grpo_group_size": 4,
+        "judge_grpo_reward_mean": 0.0,
+        "judge_grpo_reward_std": 1.0,
+        "judge_grpo_coherent_debates": 1,
+        "judge_grpo_incoherent_debates": 1,
+    }
+    assert [example.metadata["judge_coherence_reward"] for example in examples] == [1.0, 1.0, -1.0, -1.0]
+    assert [example.metadata["judge_grpo_zscore"] for example in examples] == [1.0, 1.0, -1.0, -1.0]
+    assert [example.metadata["judge_order"] for example in examples] == ["forward", "reverse", "forward", "reverse"]
+    assert examples[0].advantages[-2:] == [0.5, 0.5]
+    assert examples[2].advantages[-2:] == [-0.5, -0.5]
+
+
+def test_judge_coherence_grpo_pairwise_normalization_would_not_be_used() -> None:
+    debates = [
+        _make_debate(
+            judge_raw_response={
+                "bidirectional_judge": True,
+                "order_invariant": True,
+                "_training_judge_turns": _judge_turns(),
+            }
+        )
+    ]
+    examples, metrics = assemble_judge_coherence_grpo_examples(debates)
+    assert metrics["judge_grpo_reward_std"] == 0.0
+    assert all(not any(example.advantages) for example in examples)
 
 
 def _make_debate(
@@ -23,6 +92,7 @@ def _make_debate(
     reward_b: float = 0.0,
     token_offset: int = 0,
     instance_id: str | None = None,
+    judge_raw_response: dict[str, object] | None = None,
 ) -> DebateResult:
     traj_a = DebateTrajectory(
         agent="A",
@@ -51,6 +121,7 @@ def _make_debate(
         trajectory_b=traj_b,
         verdict=verdict,
         judge_reasoning="judge",
+        judge_raw_response=judge_raw_response,
     )
 
 
@@ -171,6 +242,95 @@ def test_split_training_data_supports_judge_compare_for_three_rounds() -> None:
     assert split["solution"][1].advantages[-2:] == [-0.25, -0.25]
     assert split["debate"][0].advantages[-5:] == [0.25, 0.25, 0.0, 0.25, 0.25]
     assert split["debate"][1].advantages[-5:] == [-0.25, -0.25, 0.0, -0.25, -0.25]
+
+
+def test_judge_delta_task_adds_delta_to_winner_and_subtracts_it_from_loser() -> None:
+    debate = _make_debate(
+        verdict="A",
+        reward_a=5.0,
+        reward_b=2.0,
+        judge_raw_response={"bidirectional_judge": True, "order_invariant": True},
+    )
+    split = assemble_split_train_examples(
+        debates=[debate],
+        num_rounds=3,
+        round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="judge_delta_task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        r1_judge_delta_q=1.0,
+    )
+
+    solution_a, solution_b = split["solution"]
+    assert solution_a.metadata["r1_task_reward"] == 5.0
+    assert solution_b.metadata["r1_task_reward"] == 2.0
+    assert solution_a.metadata["r1_task_reward_delta"] == 3.0
+    assert solution_b.metadata["r1_task_reward_delta"] == 3.0
+    assert solution_a.metadata["r1_modulated_reward"] == 8.0
+    assert solution_b.metadata["r1_modulated_reward"] == -1.0
+    assert solution_a.advantages[-2:] == [0.5, 0.5]
+    assert solution_b.advantages[-2:] == [-0.5, -0.5]
+
+
+def test_judge_delta_task_follows_judge_even_when_judge_prefers_lower_task_reward() -> None:
+    debate = _make_debate(
+        verdict="B",
+        reward_a=5.0,
+        reward_b=2.0,
+        judge_raw_response={"bidirectional_judge": True, "order_invariant": True},
+    )
+    split = assemble_split_train_examples(
+        debates=[debate],
+        num_rounds=3,
+        round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="judge_delta_task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+    )
+
+    solution_a, solution_b = split["solution"]
+    assert solution_a.metadata["r1_modulated_reward"] == 2.0
+    assert solution_b.metadata["r1_modulated_reward"] == 5.0
+    assert solution_a.advantages[-2:] == [-0.5, -0.5]
+    assert solution_b.advantages[-2:] == [0.5, 0.5]
+
+
+def test_incoherent_judgment_uses_coin_flip_winner_for_r1_and_penalizes_both_debate_paths() -> None:
+    debate = _make_debate(
+        verdict="A",
+        reward_a=5.0,
+        reward_b=2.0,
+        judge_raw_response={"bidirectional_judge": True, "order_invariant": False},
+    )
+    split = assemble_split_train_examples(
+        debates=[debate],
+        num_rounds=3,
+        round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="judge_delta_task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        incoherent_r23_reward=-0.5,
+    )
+
+    solution_a, solution_b = split["solution"]
+    # debate.verdict is the seeded coin-flip result produced on order disagreement.
+    assert solution_a.metadata["r1_modulated_reward"] == 8.0
+    assert solution_b.metadata["r1_modulated_reward"] == -1.0
+    assert solution_a.metadata["judge_order_invariant"] is False
+    assert solution_b.metadata["judge_order_invariant"] is False
+    assert solution_a.metadata["r1_winner_source"] == "seeded_coin_flip"
+    assert solution_b.metadata["r1_winner_source"] == "seeded_coin_flip"
+    assert solution_a.advantages[-2:] == [0.5, 0.5]
+    assert solution_b.advantages[-2:] == [-0.5, -0.5]
+    assert [example.metadata["r23_reward"] for example in split["debate"]] == [-0.5, -0.5]
+    assert all(example.metadata["r23_incoherent_reward_applied"] is True for example in split["debate"])
+    assert all(example.advantages[-5:] == [-0.25, -0.25, 0.0, -0.25, -0.25] for example in split["debate"])
 
 
 def test_judge_rejection_task_selects_only_winners_and_zscores_selected_task_rewards() -> None:

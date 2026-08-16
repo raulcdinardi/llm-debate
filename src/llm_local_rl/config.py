@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import math
 from pathlib import Path
 
 from llm_local_rl.behavior_policy import BehaviorPolicySpec
@@ -66,6 +67,8 @@ class TrainRunConfig:
     debate_r1_reward: str = "task"
     debate_r23_reward: str = "constant"
     debate_r23_constant: float = 1.0
+    debate_r1_judge_delta_q: float = 1.0
+    debate_incoherent_r23_reward: float = -0.5
     debate_r23_mode: str = "symmetric"
     debate_r23_advantage_scope: str = "per_round"
     debate_judge_adapter: str = "policy"
@@ -83,6 +86,8 @@ class TrainRunConfig:
     debate_judge_presence_penalty: float = 0.0
     debate_judge_repetition_penalty: float = 1.0
     debate_judge_seed: int | None = None
+    debate_judge_bidirectional: bool = False
+    train_judge_coherence_grpo: bool = False
     debate_round_adapter_names: tuple[str, ...] = ("solution", "debate", "debate")
     debate_prompt_format: str = "chat"
     debate_stop_on_concluded: bool = False
@@ -90,6 +95,8 @@ class TrainRunConfig:
     base_r3_prefill: str = "Responding to my opponent's criticism:\n1)"
     debate_r1_max_tokens: int = 0
     debate_r23_max_tokens: int = 0
+    debate_r2_max_tokens: int = 0
+    debate_r3_max_tokens: int = 0
     rollout_grad_accum_steps: int = 1
     rollout_assistant_prefill: str | None = None
     train_minibatch_size: int = 0
@@ -215,6 +222,46 @@ class TrainRunConfig:
                     "judge_rejection_task requires round adapters "
                     f"{expected_round_adapters!r}, got {configured_round_adapters!r}"
                 )
+        if self.debate_r1_reward == "judge_delta_task":
+            if self.rollout.mode != "debate":
+                raise ValueError("judge_delta_task is only valid for debate rollouts")
+            if self.adapter_layout != "split":
+                raise ValueError("judge_delta_task requires adapter_layout='split'")
+            if not math.isfinite(self.debate_r1_judge_delta_q) or self.debate_r1_judge_delta_q < 0:
+                raise ValueError("debate_r1_judge_delta_q must be finite and non-negative")
+            if not math.isfinite(self.debate_incoherent_r23_reward):
+                raise ValueError("debate_incoherent_r23_reward must be finite")
+            if not self.debate_judge_bidirectional:
+                raise ValueError("judge_delta_task requires bidirectional judge sampling")
+        if self.debate_judge_bidirectional:
+            if judge_modes != 0:
+                raise ValueError("bidirectional judge sampling requires the in-process judge sampler")
+            if self.rollout.mode != "debate" or self.debate_rounds != 3:
+                raise ValueError("bidirectional judge sampling requires a complete three-round debate")
+        if self.train_judge_coherence_grpo:
+            if not self.debate_judge_bidirectional:
+                raise ValueError("judge coherence GRPO requires bidirectional judge sampling")
+            if self.debate_judge_adapter != "judge":
+                raise ValueError("judge coherence GRPO requires debate_judge_adapter='judge'")
+            if self.adapter_layout != "split":
+                raise ValueError("judge coherence GRPO requires adapter_layout='split'")
+            if self.train_adapter_names and "judge" not in self.train_adapter_names:
+                raise ValueError("judge coherence GRPO requires judge in train_adapter_names")
+            judge_behavior_policy = BehaviorPolicySpec(
+                temperature=self.debate_judge_temperature,
+                top_p=self.debate_judge_top_p,
+                top_k=self.debate_judge_top_k,
+                min_p=self.debate_judge_min_p,
+                presence_penalty=self.debate_judge_presence_penalty,
+                repetition_penalty=self.debate_judge_repetition_penalty,
+            )
+            judge_behavior_policy.assert_exact_trainer_reconstruction_supported()
+            if judge_behavior_policy != self.behavior_policy():
+                raise ValueError(
+                    "judge coherence GRPO requires the judge and policy rollout behavior "
+                    "distributions to match until trainer behavior-policy configuration "
+                    "is adapter-specific"
+                )
 
     @classmethod
     def from_dict(cls, data: dict) -> "TrainRunConfig":
@@ -266,6 +313,8 @@ class TrainRunConfig:
             debate_r1_reward=data.get("debate_r1_reward", "task"),
             debate_r23_reward=data.get("debate_r23_reward", "constant"),
             debate_r23_constant=data.get("debate_r23_constant", 1.0),
+            debate_r1_judge_delta_q=data.get("debate_r1_judge_delta_q", 1.0),
+            debate_incoherent_r23_reward=data.get("debate_incoherent_r23_reward", -0.5),
             debate_r23_mode=data.get("debate_r23_mode", "symmetric"),
             debate_r23_advantage_scope=data.get("debate_r23_advantage_scope", "per_round"),
             debate_judge_adapter=data.get("debate_judge_adapter", "policy"),
@@ -283,6 +332,8 @@ class TrainRunConfig:
             debate_judge_presence_penalty=data.get("debate_judge_presence_penalty", 0.0),
             debate_judge_repetition_penalty=data.get("debate_judge_repetition_penalty", 1.0),
             debate_judge_seed=data.get("debate_judge_seed"),
+            debate_judge_bidirectional=bool(data.get("debate_judge_bidirectional", False)),
+            train_judge_coherence_grpo=bool(data.get("train_judge_coherence_grpo", False)),
             debate_round_adapter_names=tuple(data.get("debate_round_adapter_names", ("solution", "debate", "debate"))),
             debate_prompt_format=data.get("debate_prompt_format", "chat"),
             debate_stop_on_concluded=data.get("debate_stop_on_concluded", False),
@@ -290,6 +341,8 @@ class TrainRunConfig:
             base_r3_prefill=data.get("base_r3_prefill", "Responding to my opponent's criticism:\n1)"),
             debate_r1_max_tokens=data.get("debate_r1_max_tokens", 0),
             debate_r23_max_tokens=data.get("debate_r23_max_tokens", 0),
+            debate_r2_max_tokens=data.get("debate_r2_max_tokens", 0),
+            debate_r3_max_tokens=data.get("debate_r3_max_tokens", 0),
             rollout_grad_accum_steps=data.get("rollout_grad_accum_steps", 1),
             rollout_assistant_prefill=(
                 data["rollout_assistant_prefill"] if "rollout_assistant_prefill" in data else ""

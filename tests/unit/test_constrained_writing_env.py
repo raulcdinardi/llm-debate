@@ -126,7 +126,7 @@ def test_debate_protocol_surface():
     assert "rule" not in jc.lower()
     assert jc == str(inst.payload["topic"])
     constitution = task.judge_constitution_text(inst=inst)
-    assert "A or B" in constitution
+    assert constitution == "Prefer the agent whose story best satisfies the user."
     assert task.debate_r2_user_template() is None
     assert task.debate_r3_user_template() is None
 
@@ -135,31 +135,40 @@ def test_base_text_debate_extension_contract_is_exact_and_round_specific():
     task = make_task()
     inst = make_instance(["i_only", "no_commas"], ["past_tense_ed", "end_word"])
     constitution = task.judge_constitution_text(inst=inst)
-    expected_prefill = "The reasons that my solution is better than my opponent's are:\n1)"
 
     r2 = task.build_base_text_debate_extension(
         inst=inst,
         opponent_round=1,
         opponent_answer="Opponent story.",
     )
+    assert r2.system_text == (
+        "You are participating in Round 2 of a debate about which story best satisfies the user.\n"
+        "Your Round 1 story is fixed and cannot change.\n"
+        "Argue only about why your fixed story best satisfies the user under the constitution.\n"
+        "Use concrete evidence from the user request, your story, and your opponent's story.\n"
+        "Do not emit <think> tags."
+    )
     assert r2.user_text == (
-        f"Constitution: {constitution}\n"
+        f"Constitution:\n{constitution}\n\n"
         "Opponent Round 1 answer:\n"
-        "Opponent story.\n"
-        "Continue arguing that your fixed answer should win under the constitution. "
-        "Address the opponent directly and use concrete evidence from the task and answers.\n\n"
+        "Opponent story.\n\n"
+        "Continue arguing that your fixed story best satisfies the user under the constitution. "
+        "Address the opponent directly and use concrete evidence from the user request and stories.\n\n"
         "Write exactly 3 short numbered points. After point 3, immediately output "
         "CONCLUDED and nothing else.\n"
     )
-    assert r2.assistant_prefill == expected_prefill
+    assert r2.assistant_prefill == "The reasons that my solution is better than my opponent's are:\n1)"
 
     r3 = task.build_base_text_debate_extension(
         inst=inst,
         opponent_round=2,
         opponent_answer="Opponent argument.",
     )
+    assert "Round 3" in r3.system_text
     assert "Opponent Round 2 answer:\nOpponent argument.\n" in r3.user_text
-    assert r3.assistant_prefill == expected_prefill
+    assert "Make your final case" in r3.user_text
+    assert r3.assistant_prefill == "Responding to my opponent's criticism:\n1)"
+    assert "Your fixed Round 1 answer:" not in r2.user_text + r3.user_text
 
     with pytest.raises(ValueError, match="opponent_round must be 1 or 2"):
         task.build_base_text_debate_extension(

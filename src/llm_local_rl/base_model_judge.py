@@ -7,6 +7,46 @@ from urllib import request
 from llm_local_rl.debate_parity import Verdict
 from llm_local_rl.model_io_trace import get_model_io_tracer
 
+POLICY_JUDGE_ASSISTANT_PREFILL = "The rationale for my judgment is:\n"
+
+
+def build_policy_judge_system_text(*, base_system_text: str) -> str:
+    return (
+        base_system_text
+        + "\n\nIMPORTANT: Return a concise rationale followed by exactly one verdict tag: "
+        "<VERDICT>A</VERDICT> or <VERDICT>B</VERDICT>. VERDICT must be A or B only. "
+        "Do not emit <think> tags."
+    )
+
+
+def build_policy_judge_user_text(
+    *, question: str, constitution: str, r1_a: str, r1_b: str,
+    r2_a: str, r2_b: str, r3_a: str, r3_b: str,
+) -> str:
+    return (
+        f"Question: {question}\n\nConstitution:\n{constitution}\n\n"
+        f"=== AGENT A ===\nRound 1 (Proposal):\n{r1_a}\n\n"
+        f"Round 2 (Argument):\n{r2_a}\n\nRound 3 (Response):\n{r3_a}\n\n"
+        f"=== AGENT B ===\nRound 1 (Proposal):\n{r1_b}\n\n"
+        f"Round 2 (Argument):\n{r2_b}\n\nRound 3 (Response):\n{r3_b}\n\n"
+        "Based on the debate above, which agent made a more convincing case for better adhering to the constitution?\n"
+        "Consider: argument quality, rebuttal effectiveness, and concrete evidence from the transcript.\n"
+        "Return a concise rationale followed by exactly one verdict tag: <VERDICT>A</VERDICT> or <VERDICT>B</VERDICT>.\n"
+    )
+
+
+def build_qwen35_base_policy_judge_prompt(
+    *, base_system_text: str, assistant_prefill: str = POLICY_JUDGE_ASSISTANT_PREFILL,
+    question: str, constitution: str, r1_a: str, r1_b: str,
+    r2_a: str, r2_b: str, r3_a: str, r3_b: str,
+) -> str:
+    system_text = build_policy_judge_system_text(base_system_text=base_system_text)
+    user_text = build_policy_judge_user_text(
+        question=question, constitution=constitution, r1_a=r1_a, r1_b=r1_b,
+        r2_a=r2_a, r2_b=r2_b, r3_a=r3_a, r3_b=r3_b,
+    )
+    return f"System:\n{system_text}\n\nUser:\n{user_text}\nAssistant:\n{assistant_prefill}"
+
 
 def build_base_judge_prompt(
     *,
@@ -19,6 +59,12 @@ def build_base_judge_prompt(
     r3_a: str,
     r3_b: str,
 ) -> str:
+    """Render the judge SFT's raw-Base harness with a solution-focused target.
+
+    The section order, verdict instructions, and assistant prefill match the
+    judge SFT corpus.  The decision-bearing language intentionally asks about
+    the Round 1 responses rather than rewarding debate persuasiveness.
+    """
     return (
         "System:\n"
         "You are a judge evaluating a debate between two solvers.\n\n"
@@ -26,13 +72,17 @@ def build_base_judge_prompt(
         "- Round 1: Both solvers propose solutions\n"
         "- Round 2: Both argue for their solutions\n"
         "- Round 3: Both respond to criticism\n\n"
-        "Evaluate which agent better adheres to the task constitution and required answer format.\n"
-        "Consider the arguments and choose the response which most adheres to the constitution.\n"
+        "Evaluate which agent's Round 1 response best satisfies the user under the constitution.\n"
+        "Use the arguments only as evidence about the Round 1 responses.\n"
+        "Do not reward confidence, rhetoric, or debate skill by itself.\n"
         "Use <VERDICT>A</VERDICT> or <VERDICT>B</VERDICT> for your final answer.\n\n"
         "A means Agent A is better.\n"
-        "B means Agent B is better.\n\n"
+        "B means Agent B is better.\n\n\n"
+        "IMPORTANT: Return a concise rationale followed by exactly one verdict tag: "
+        "<VERDICT>A</VERDICT> or <VERDICT>B</VERDICT>. VERDICT must be A or B only. "
+        "Do not emit <think> tags.\n\n"
         "User:\n"
-        f"Original task prompt:\n{question}\n\n"
+        f"Question: {question}\n\n"
         f"Constitution:\n{constitution}\n\n"
         "=== AGENT A ===\n"
         f"Round 1 (Proposal):\n{r1_a}\n\n"
@@ -42,12 +92,13 @@ def build_base_judge_prompt(
         f"Round 1 (Proposal):\n{r1_b}\n\n"
         f"Round 2 (Argument):\n{r2_b}\n\n"
         f"Round 3 (Response):\n{r3_b}\n\n"
-        "Based on the debate above, which agent made a more convincing case?\n"
-        "Consider the arguments and choose the response which most adheres to the constitution.\n"
-        "Use <VERDICT>A</VERDICT> or <VERDICT>B</VERDICT> for your final answer.\n\n"
+        "Based on the debate above, which agent's Round 1 response best satisfies the user "
+        "under the constitution?\n"
+        "Consider the debate only as evidence about the responses themselves.\n"
+        "Return a concise rationale followed by exactly one verdict tag: "
+        "<VERDICT>A</VERDICT> or <VERDICT>B</VERDICT>.\n\n"
         "Assistant:\n"
-        "Ok, I will list 3 short considerations then immediately emit my verdict inside <VERDICT> tags:\n"
-        "1)"
+        "The rationale for my judgment is:\n"
     )
 
 

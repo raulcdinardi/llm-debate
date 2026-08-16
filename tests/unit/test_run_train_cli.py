@@ -48,6 +48,16 @@ def test_cli_accepts_judge_rejection_task_and_independent_concluded_stop() -> No
     assert args.debate_stop_on_concluded is True
 
 
+def test_cli_preserves_legacy_defaults_for_new_opt_in_features() -> None:
+    args = parse_args(["--model-path", "/tmp/model", "--output-dir", "/tmp/out"])
+
+    assert args.adapter_layout == "shared"
+    assert args.debate_r1_reward == "task"
+    assert args.debate_r1_judge_delta_q == 1.0
+    assert args.debate_incoherent_r23_reward == -0.5
+    assert args.debate_judge_bidirectional is False
+
+
 def test_rollout_assistant_prefill_default_distinguishes_omitted_from_empty(monkeypatch) -> None:
     monkeypatch.setattr(
         "sys.argv",

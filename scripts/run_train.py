@@ -69,10 +69,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--debate-r1-reward",
         default="task",
-        choices=["task", "judge_pointwise", "judge", "judge_rejection_task", "none"],
+        choices=["task", "judge_pointwise", "judge", "judge_rejection_task", "judge_delta_task", "none"],
     )
     parser.add_argument("--debate-r23-reward", default="constant", choices=["constant", "none"])
     parser.add_argument("--debate-r23-constant", type=float, default=1.0)
+    parser.add_argument("--debate-r1-judge-delta-q", type=float, default=1.0)
+    parser.add_argument("--debate-incoherent-r23-reward", type=float, default=-0.5)
     parser.add_argument("--debate-r23-mode", default="symmetric", choices=["symmetric", "winner_only"])
     parser.add_argument("--debate-r23-advantage-scope", default="per_round", choices=["per_round", "merged_r23"])
     parser.add_argument("--debate-judge-adapter", default="policy", choices=["policy", "base", "solution", "debate", "judge"])
@@ -94,6 +96,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--debate-judge-presence-penalty", type=float, default=0.0)
     parser.add_argument("--debate-judge-repetition-penalty", type=float, default=1.0)
     parser.add_argument("--debate-judge-seed", type=int, default=None)
+    parser.add_argument(
+        "--debate-judge-bidirectional",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Judge both A/B orders and require referent agreement for a coherent verdict.",
+    )
+    parser.add_argument(
+        "--train-judge-coherence-grpo",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Train the judge adapter from both orderings. Each judgment receives +1 when "
+            "the pair is referent-coherent and -1 otherwise; advantages are normalized "
+            "once across the complete judgment batch."
+        ),
+    )
     parser.add_argument("--debate-round-adapter-names", nargs="*", default=["solution", "debate", "debate"])
     parser.add_argument(
         "--debate-prompt-format",
@@ -113,6 +131,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-r3-prefill", default="Responding to my opponent's criticism:\n1)")
     parser.add_argument("--debate-r1-max-tokens", type=int, default=0, help="0 uses --max-tokens for debate R1.")
     parser.add_argument("--debate-r23-max-tokens", type=int, default=0, help="0 uses --max-tokens for debate R2/R3.")
+    parser.add_argument("--debate-r2-max-tokens", type=int, default=0, help="0 inherits --debate-r23-max-tokens for debate R2.")
+    parser.add_argument("--debate-r3-max-tokens", type=int, default=0, help="0 inherits --debate-r23-max-tokens for debate R3.")
     parser.add_argument(
         "--rollout-grad-accum-steps",
         type=int,
@@ -277,6 +297,8 @@ def main() -> int:
                 debate_r1_reward=args.debate_r1_reward,
                 debate_r23_reward=args.debate_r23_reward,
                 debate_r23_constant=args.debate_r23_constant,
+                debate_r1_judge_delta_q=args.debate_r1_judge_delta_q,
+                debate_incoherent_r23_reward=args.debate_incoherent_r23_reward,
                 debate_r23_mode=args.debate_r23_mode,
                 debate_r23_advantage_scope=args.debate_r23_advantage_scope,
                 debate_judge_adapter=args.debate_judge_adapter,
@@ -294,6 +316,8 @@ def main() -> int:
                 debate_judge_presence_penalty=args.debate_judge_presence_penalty,
                 debate_judge_repetition_penalty=args.debate_judge_repetition_penalty,
                 debate_judge_seed=args.debate_judge_seed,
+                debate_judge_bidirectional=args.debate_judge_bidirectional,
+                train_judge_coherence_grpo=args.train_judge_coherence_grpo,
                 debate_round_adapter_names=tuple(args.debate_round_adapter_names),
                 debate_prompt_format=args.debate_prompt_format,
                 debate_stop_on_concluded=args.debate_stop_on_concluded,
@@ -301,6 +325,8 @@ def main() -> int:
                 base_r3_prefill=args.base_r3_prefill,
                 debate_r1_max_tokens=args.debate_r1_max_tokens,
                 debate_r23_max_tokens=args.debate_r23_max_tokens,
+                debate_r2_max_tokens=args.debate_r2_max_tokens,
+                debate_r3_max_tokens=args.debate_r3_max_tokens,
                 rollout_grad_accum_steps=args.rollout_grad_accum_steps,
                 rollout_assistant_prefill=args.rollout_assistant_prefill,
                 train_minibatch_size=args.train_minibatch_size,

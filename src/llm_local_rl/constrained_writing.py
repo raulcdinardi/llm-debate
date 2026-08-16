@@ -660,10 +660,7 @@ class ConstrainedWritingDebateTask:
 
     def judge_constitution_text(self, *, inst: TaskInstance) -> str:
         _ = inst
-        return (
-            "Choose the agent that made the more convincing case for its story. "
-            "Output only A or B."
-        )
+        return "Prefer the agent whose story best satisfies the user."
 
     def build_r1_prompt_tokens(
         self,
@@ -856,17 +853,44 @@ class ConstrainedWritingDebateTask:
     ) -> BaseTextDebateExtension:
         if opponent_round not in {1, 2}:
             raise ValueError(f"opponent_round must be 1 or 2, got {opponent_round}")
+        constitution = self.judge_constitution_text(inst=inst)
+        if opponent_round == 1:
+            system_text = (
+                "You are participating in Round 2 of a debate about which story best satisfies the user.\n"
+                "Your Round 1 story is fixed and cannot change.\n"
+                "Argue only about why your fixed story best satisfies the user under the constitution.\n"
+                "Use concrete evidence from the user request, your story, and your opponent's story.\n"
+                "Do not emit <think> tags."
+            )
+            instruction = (
+                "Continue arguing that your fixed story best satisfies the user under the constitution. "
+                "Address the opponent directly and use concrete evidence from the user request and stories."
+            )
+            assistant_prefill = "The reasons that my solution is better than my opponent's are:\n1)"
+        else:
+            system_text = (
+                "You are participating in Round 3 of a debate about which story best satisfies the user.\n"
+                "Your Round 1 story is fixed and cannot change.\n"
+                "Respond to the opponent's Round 2 argument and make your final case.\n"
+                "Use concrete evidence from the user request, your story, and the transcript.\n"
+                "Do not emit <think> tags."
+            )
+            instruction = (
+                "Make your final case that your fixed story best satisfies the user under the constitution. "
+                "Focus on the strongest evidence and the opponent's weakest point."
+            )
+            assistant_prefill = "Responding to my opponent's criticism:\n1)"
         return BaseTextDebateExtension(
+            system_text=system_text,
             user_text=(
-                f"Constitution: {self.judge_constitution_text(inst=inst)}\n"
+                f"Constitution:\n{constitution}\n\n"
                 f"Opponent Round {opponent_round} answer:\n"
-                f"{opponent_answer}\n"
-                "Continue arguing that your fixed answer should win under the constitution. "
-                "Address the opponent directly and use concrete evidence from the task and answers.\n\n"
+                f"{opponent_answer}\n\n"
+                f"{instruction}\n\n"
                 "Write exactly 3 short numbered points. After point 3, immediately output "
                 "CONCLUDED and nothing else.\n"
             ),
-            assistant_prefill="The reasons that my solution is better than my opponent's are:\n1)",
+            assistant_prefill=assistant_prefill,
         )
 
 

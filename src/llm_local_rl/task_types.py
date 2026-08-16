@@ -18,6 +18,7 @@ class TaskReward:
 
 @dataclass(frozen=True)
 class BaseTextDebateExtension:
+    system_text: str
     user_text: str
     assistant_prefill: str
 

@@ -68,6 +68,8 @@ class DebateConfig:
     max_tokens_per_turn: int | None = None
     max_tokens_r1: int | None = None
     max_tokens_r23: int | None = None
+    max_tokens_r2: int | None = None
+    max_tokens_r3: int | None = None
     temperature: float = 0.8
     kl_coef: float = 0.01
     learning_rate: float = 1e-5
@@ -920,6 +922,8 @@ def assemble_split_train_examples(
     r23_constant: float,
     r23_symmetric: bool,
     task_reward_fn: Callable[[DebateTrajectory, DebateResult], float],
+    r1_judge_delta_q: float = 1.0,
+    incoherent_r23_reward: float = -0.5,
     pointwise_reward_map: dict[int, float] | None = None,
     r23_advantage_scope: Literal["per_round", "merged_r23"] = "per_round",
 ) -> dict[str, list[TrainExample]]:
@@ -927,6 +931,10 @@ def assemble_split_train_examples(
         raise ValueError(f"Need at least {num_rounds} round adapter names, got {len(round_adapter_names)}")
     if r23_advantage_scope not in ("per_round", "merged_r23"):
         raise ValueError(f"Unsupported r23_advantage_scope={r23_advantage_scope!r}.")
+    if not math.isfinite(r1_judge_delta_q) or r1_judge_delta_q < 0.0:
+        raise ValueError("r1_judge_delta_q must be finite and non-negative")
+    if not math.isfinite(incoherent_r23_reward):
+        raise ValueError("incoherent_r23_reward must be finite")
     grouped: dict[str, list[TrainExample]] = {}
 
     def _append_turn(*, adapter_name: str, prompt_tokens: list[int], completion_tokens: list[int], completion_logprobs: list[float], advantages: list[float], metadata: dict[str, Any]) -> None:
@@ -986,6 +994,20 @@ def assemble_split_train_examples(
             selected_r1_trajectory_ids.add(id(winner))
             r1_a = winner_task_reward if winner.agent == traj_a.agent else 0.0
             r1_b = winner_task_reward if winner.agent == traj_b.agent else 0.0
+        elif r1_reward_mode == "judge_delta_task":
+            task_a = float(task_reward_fn(traj_a, debate))
+            task_b = float(task_reward_fn(traj_b, debate))
+            if not math.isfinite(task_a) or not math.isfinite(task_b):
+                raise ValueError(f"Non-finite task reward for question={debate.question!r}")
+            judge_audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
+            delta = abs(task_a - task_b)
+            modulation = r1_judge_delta_q * delta
+            # On a coherent bidirectional verdict this is the agreed referent. On
+            # disagreement, debate_runtime has already replaced the verdict with
+            # the deterministic seeded coin flip requested by the experiment.
+            winner_agent = debate.get_winner_trajectory().agent
+            r1_a = task_a + modulation if winner_agent == traj_a.agent else task_a - modulation
+            r1_b = task_b + modulation if winner_agent == traj_b.agent else task_b - modulation
         elif r1_reward_mode == "judge_pointwise":
             if pointwise_reward_map is None:
                 raise ValueError("judge_pointwise requires pointwise_reward_map")
@@ -1068,6 +1090,24 @@ def assemble_split_train_examples(
                         "r1_compare": r1_reward_mode == "judge",
                         "r1_centered_reward": None if r1_reward_mode == "judge" else r1_value,
                     }
+                    if r1_reward_mode == "judge_delta_task":
+                        judge_audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
+                        task_a = float(task_reward_fn(debate.trajectory_a, debate))
+                        task_b = float(task_reward_fn(debate.trajectory_b, debate))
+                        r1_metadata.update({
+                            "reason": "split_layout_judge_delta_task_projection",
+                            "r1_reward_mode": "judge_delta_task",
+                            "judge_order_invariant": judge_audit.get("order_invariant") is True,
+                            "r1_winner_source": (
+                                "order_invariant_judge"
+                                if judge_audit.get("order_invariant") is True
+                                else "seeded_coin_flip"
+                            ),
+                            "r1_task_reward": float(task_reward_fn(traj, debate)),
+                            "r1_task_reward_delta": abs(task_a - task_b),
+                            "r1_judge_delta_q": r1_judge_delta_q,
+                            "r1_modulated_reward": r1_reward,
+                        })
                 _append_turn(
                     adapter_name=round_adapter_names[0],
                     prompt_tokens=t1.prompt_tokens,
@@ -1078,7 +1118,11 @@ def assemble_split_train_examples(
                 )
             if num_rounds >= 2:
                 t2 = traj.transitions[1]
-                signed = winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
+                judge_audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
+                coherent = judge_audit.get("order_invariant") is True
+                signed = (
+                    winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
+                ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
                 if len(t2.completion_tokens) == 0:
                     raise ValueError("R2 completion tokens empty.")
                 if num_rounds >= 3 and round_adapter_names[1] == round_adapter_names[2]:
@@ -1111,6 +1155,8 @@ def assemble_split_train_examples(
                             "r23_advantage_scope": r23_advantage_scope,
                             "r23_first_adv_value": first_adv_value,
                             "r23_second_adv_value": second_adv_value,
+                            "judge_order_invariant": coherent,
+                            "r23_incoherent_reward_applied": not coherent and judge_audit.get("bidirectional_judge") is True,
                         },
                     )
                     grouped.setdefault(round_adapter_names[1], []).append(
@@ -1132,11 +1178,17 @@ def assemble_split_train_examples(
                         "round_num": 2,
                         "r23_reward": signed,
                         "r23_advantage_scope": r23_advantage_scope,
+                        "judge_order_invariant": coherent,
+                        "r23_incoherent_reward_applied": not coherent and judge_audit.get("bidirectional_judge") is True,
                     },
                 )
             if num_rounds >= 3:
                 t3 = traj.transitions[2]
-                signed = winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
+                judge_audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
+                coherent = judge_audit.get("order_invariant") is True
+                signed = (
+                    winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
+                ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
                 if len(t3.completion_tokens) == 0:
                     raise ValueError("R3 completion tokens empty.")
                 _append_turn(
@@ -1154,9 +1206,90 @@ def assemble_split_train_examples(
                         "round_num": 3,
                         "r23_reward": signed,
                         "r23_advantage_scope": r23_advantage_scope,
+                        "judge_order_invariant": coherent,
+                        "r23_incoherent_reward_applied": not coherent and judge_audit.get("bidirectional_judge") is True,
                     },
                 )
     return grouped
+
+
+def assemble_judge_coherence_grpo_examples(
+    debates: list[DebateResult],
+    *,
+    adapter_name: str = "judge",
+) -> tuple[list[TrainExample], dict[str, float | int]]:
+    """Build one global GRPO group from both judge orderings of every debate.
+
+    Each ordering receives the pair-level raw reward: +1 for referent-coherent
+    forward/reverse verdicts and -1 otherwise. Population z-scoring is performed
+    once across all judgments, deliberately not within each equal-reward pair.
+    """
+    turns: list[tuple[DebateResult, dict[str, Any], float]] = []
+    coherent_debates = 0
+    for debate in debates:
+        audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
+        if audit.get("bidirectional_judge") is not True:
+            raise ValueError("judge coherence GRPO requires bidirectional judge audit data")
+        training_turns = audit.get("_training_judge_turns")
+        if not isinstance(training_turns, list) or len(training_turns) != 2:
+            raise ValueError("judge coherence GRPO requires exactly two sampled judgment turns per debate")
+        coherent = audit.get("order_invariant") is True
+        coherent_debates += int(coherent)
+        reward = 1.0 if coherent else -1.0
+        for turn in training_turns:
+            if not isinstance(turn, dict):
+                raise ValueError("judge training turn must be a mapping")
+            turns.append((debate, turn, reward))
+
+    rewards = [reward for _debate, _turn, reward in turns]
+    if not rewards:
+        return [], {
+            "judge_grpo_group_size": 0,
+            "judge_grpo_reward_mean": 0.0,
+            "judge_grpo_reward_std": 0.0,
+            "judge_grpo_coherent_debates": 0,
+        }
+    reward_mean = sum(rewards) / len(rewards)
+    reward_var = sum((reward - reward_mean) ** 2 for reward in rewards) / len(rewards)
+    reward_std = math.sqrt(reward_var)
+    examples: list[TrainExample] = []
+    for judgment_index, (debate, turn, reward) in enumerate(turns):
+        prompt_tokens = list(turn.get("prompt_tokens", []))
+        completion_tokens = list(turn.get("completion_tokens", []))
+        completion_logprobs = [float(value) for value in turn.get("completion_logprobs", [])]
+        if not completion_tokens:
+            raise ValueError("judge coherence GRPO completion tokens empty")
+        if len(completion_tokens) != len(completion_logprobs):
+            raise ValueError("judge coherence GRPO completion/logprob lengths differ")
+        zscore = (reward - reward_mean) / reward_std if reward_std > 0.0 else 0.0
+        datum = TrainingDatum(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            completion_logprobs=completion_logprobs,
+            completion_logprob_mask=[1] * len(completion_tokens),
+            completion_advantages=[zscore / len(completion_tokens)] * len(completion_tokens),
+            metadata={
+                "reason": "judge_bidirectional_coherence_grpo",
+                "question": debate.question[:100],
+                "judge_order": turn.get("order"),
+                "judge_coherent": reward > 0.0,
+                "judge_coherence_reward": reward,
+                "judge_grpo_group_index": 0,
+                "judge_grpo_group_size": len(turns),
+                "judge_grpo_reward_mean": reward_mean,
+                "judge_grpo_reward_std": reward_std,
+                "judge_grpo_zscore": zscore,
+                "judgment_index": judgment_index,
+            },
+        )
+        examples.append(training_datum_to_train_example(datum=datum, adapter_name=adapter_name))
+    return examples, {
+        "judge_grpo_group_size": len(turns),
+        "judge_grpo_reward_mean": reward_mean,
+        "judge_grpo_reward_std": reward_std,
+        "judge_grpo_coherent_debates": coherent_debates,
+        "judge_grpo_incoherent_debates": len(debates) - coherent_debates,
+    }
 
 
 def summarize_judge_rejection_r1_projection(
