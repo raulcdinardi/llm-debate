@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-len", type=int, default=8)
     parser.add_argument("--reward-mode", choices=["num_h", "num_transitions"], default="num_h")
     parser.add_argument("--max-tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()

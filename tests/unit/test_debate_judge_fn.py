@@ -72,6 +72,7 @@ class RecordingSampler:
     tokenizer: object
     requests: list[SamplingRequest]
     batches: list[list[SamplingRequest]] = field(default_factory=list)
+    judge_texts: list[str] = field(default_factory=list)
 
     def sample_many(self, requests: list[SamplingRequest]) -> list[SamplingResult]:
         self.batches.append(list(requests))
@@ -81,7 +82,7 @@ class RecordingSampler:
             if request.adapter_name in {"shared", "solution"}:
                 text = "<SOLUTION>H, T, H, T</SOLUTION>"
             elif request.adapter_name == "judge":
-                text = "<VERDICT>A</VERDICT>"
+                text = self.judge_texts.pop(0) if self.judge_texts else "<VERDICT>A</VERDICT>"
             else:
                 text = "Their answer violates the format."
             token_ids = self.tokenizer.encode(text, add_special_tokens=False)
@@ -199,9 +200,168 @@ def test_frozen_base_sft_judge_uses_same_sampler_in_one_ordered_batch() -> None:
     assert all(request.seed == 0 for request in judge_batch)
     prompts = [tokenizer.decode(request.prompt_token_ids) for request in judge_batch]
     assert all(prompt.startswith("System:\n") for prompt in prompts)
-    assert all(prompt.endswith("1)") for prompt in prompts)
+    assert all(prompt.endswith("The rationale for my judgment is:\n") for prompt in prompts)
+    assert all("Evaluate which agent's Round 1 response best satisfies the user" in prompt for prompt in prompts)
+    assert all("Do not reward confidence, rhetoric, or debate skill by itself." in prompt for prompt in prompts)
+    assert all("which agent made a more convincing case" not in prompt for prompt in prompts)
+    assert all("argument quality" not in prompt for prompt in prompts)
+    assert all("rebuttal effectiveness" not in prompt for prompt in prompts)
     assert all("Round 2 (Argument):\nTheir answer violates the format." in prompt for prompt in prompts)
     assert all("Round 3 (Response):\nTheir answer violates the format." in prompt for prompt in prompts)
+
+
+def test_base_sft_reverse_order_swaps_every_a_b_round_argument() -> None:
+    tokenizer = TinyChatTokenizer()
+    task = HTSequenceDebateTask(sequence_len=4)
+    runtime = DebateRuntime(
+        task=task,
+        tokenizer=tokenizer,
+        sampler=RecordingSampler(tokenizer=tokenizer, requests=[]),
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=3,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="judge",
+            judge_prompt_format="base_model_sft",
+        ),
+        adapter_layout="split",
+    )
+    instances = task.sample_instances(n=2, seed=3)
+    inst_pairs = [(instances[0], instances[1])]
+
+    [forward_tokens] = runtime._judge_prompts(
+        inst_pairs=inst_pairs,
+        r1_visible_text=["A1", "B1"],
+        r2_visible_text=["A2", "B2"],
+        r3_visible_text=["A3", "B3"],
+    )
+    [reverse_tokens] = runtime._judge_prompts(
+        inst_pairs=inst_pairs,
+        r1_visible_text=["A1", "B1"],
+        r2_visible_text=["A2", "B2"],
+        r3_visible_text=["A3", "B3"],
+        reverse_order=True,
+    )
+    forward = tokenizer.decode(forward_tokens)
+    reverse = tokenizer.decode(reverse_tokens)
+
+    assert "=== AGENT A ===\nRound 1 (Proposal):\nA1" in forward
+    assert "=== AGENT B ===\nRound 1 (Proposal):\nB1" in forward
+    assert "=== AGENT A ===\nRound 1 (Proposal):\nB1" in reverse
+    assert "Round 2 (Argument):\nB2" in reverse
+    assert "Round 3 (Response):\nB3" in reverse
+    assert "=== AGENT B ===\nRound 1 (Proposal):\nA1" in reverse
+
+
+def test_bidirectional_judge_maps_reverse_labels_and_records_coherence() -> None:
+    tokenizer = TinyChatTokenizer()
+    sampler = RecordingSampler(
+        tokenizer=tokenizer,
+        requests=[],
+        judge_texts=[
+            "forward one <VERDICT>A</VERDICT>",
+            "forward two <VERDICT>B</VERDICT>",
+            "reverse one <VERDICT>B</VERDICT>",
+            "reverse two <VERDICT>A</VERDICT>",
+        ],
+    )
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=3,
+            num_groups=2,
+            group_size=2,
+            judge_adapter="judge",
+            judge_prompt_format="base_model_sft",
+            judge_bidirectional=True,
+        ),
+        adapter_layout="split",
+    )
+
+    output = runtime.rollout(step_seed=7)
+
+    assert len(sampler.batches[-1]) == 4
+    assert [debate.verdict for debate in output.debates] == ["A", "B"]
+    assert all(debate.judge_raw_response["order_invariant"] is True for debate in output.debates)
+    assert all(
+        debate.judge_raw_response["aggregation"] == "order_invariant_agreement"
+        for debate in output.debates
+    )
+    assert all(len(debate.judge_raw_response["_training_judge_turns"]) == 2 for debate in output.debates)
+    assert [
+        turn["order"] for turn in output.debates[0].judge_raw_response["_training_judge_turns"]
+    ] == ["forward", "reverse"]
+
+
+def test_bidirectional_judge_uses_seeded_random_winner_on_disagreement() -> None:
+    tokenizer = TinyChatTokenizer()
+    sampler = RecordingSampler(
+        tokenizer=tokenizer,
+        requests=[],
+        judge_texts=["<VERDICT>A</VERDICT>", "<VERDICT>A</VERDICT>"],
+    )
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=3,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="judge",
+            judge_prompt_format="base_model_sft",
+            judge_bidirectional=True,
+        ),
+        adapter_layout="split",
+    )
+
+    debate = runtime.rollout(step_seed=11).debates[0]
+
+    assert debate.verdict in ("A", "B")
+    assert debate.judge_raw_response["forward_verdict"] == "A"
+    assert debate.judge_raw_response["reverse_verdict"] == "A"
+    assert debate.judge_raw_response["reverse_mapped_verdict"] == "B"
+    assert debate.judge_raw_response["order_invariant"] is False
+    assert debate.judge_raw_response["aggregation"] == "seeded_random_on_order_disagreement"
+
+
+def test_bidirectional_judge_does_not_replace_invalid_grpo_turn_with_greedy_retry() -> None:
+    tokenizer = TinyChatTokenizer()
+    sampler = RecordingSampler(
+        tokenizer=tokenizer,
+        requests=[],
+        judge_texts=["not a verdict", "<VERDICT>B</VERDICT>"],
+    )
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.8),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=3,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="judge",
+            judge_prompt_format="base_model_sft",
+            judge_bidirectional=True,
+            judge_temperature=0.8,
+        ),
+        adapter_layout="split",
+    )
+
+    debate = runtime.rollout(step_seed=13).debates[0]
+
+    # R1/R2/R3 plus exactly one two-order judge batch: no temperature-0 retry.
+    assert len(sampler.batches) == 4
+    assert debate.judge_raw_response["forward_verdict"] == "INVALID"
+    assert debate.judge_raw_response["order_invariant"] is False
+    turns = debate.judge_raw_response["_training_judge_turns"]
+    assert tokenizer.decode(turns[0]["completion_tokens"]) == "not a verdict"
 
 
 def test_base_sft_judge_rejects_incomplete_debate_instead_of_blank_rounds() -> None:

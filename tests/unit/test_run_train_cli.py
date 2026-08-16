@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+import shlex
+
 import pytest
 
 from scripts.run_train import _parse_csv_tuple, _parse_init_adapter_dirs, parse_args
+from llm_local_rl.config import RolloutConfig, TrainRunConfig
 
 
 def test_parse_named_init_adapter_dirs() -> None:
@@ -46,6 +50,59 @@ def test_cli_accepts_judge_rejection_task_and_independent_concluded_stop() -> No
     assert args.debate_r1_reward == "judge_rejection_task"
     assert args.debate_prompt_format == "qwen35_base_text_prefill"
     assert args.debate_stop_on_concluded is True
+
+
+def test_cli_defaults_all_sampling_temperatures_to_one() -> None:
+    args = parse_args(["--model-path", "/tmp/model", "--output-dir", "/tmp/out"])
+
+    assert args.adapter_layout == "shared"
+    assert args.temperature == 1.0
+    assert args.debate_judge_temperature == 1.0
+    assert args.debate_r1_reward == "task"
+    assert args.debate_r1_judge_delta_q == 1.0
+    assert args.debate_incoherent_r23_reward == -0.5
+    assert args.debate_judge_bidirectional is False
+
+
+def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:
+    docs = (
+        Path(__file__).parents[2] / "docs" / "debate_judge_grpo.md"
+    ).read_text(encoding="utf-8")
+    section = docs.split("## Judge coherence GRPO", 1)[1]
+    flags_block = section.split("```text", 1)[1].split("```", 1)[0]
+    documented_flags = shlex.split(flags_block)
+    args = parse_args(
+        ["--model-path", "/model", "--output-dir", "/out", *documented_flags]
+    )
+
+    config = TrainRunConfig(
+        model_path=args.model_path,
+        output_dir=args.output_dir,
+        rollout=RolloutConfig(
+            mode=args.mode,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            min_p=args.min_p,
+        ),
+        adapter_layout=args.adapter_layout,
+        debate_judge_adapter=args.debate_judge_adapter,
+        debate_judge_temperature=args.debate_judge_temperature,
+        debate_judge_top_p=args.debate_judge_top_p,
+        debate_judge_top_k=args.debate_judge_top_k,
+        debate_judge_min_p=args.debate_judge_min_p,
+        debate_judge_presence_penalty=args.debate_judge_presence_penalty,
+        debate_judge_repetition_penalty=args.debate_judge_repetition_penalty,
+        debate_judge_bidirectional=args.debate_judge_bidirectional,
+        train_judge_coherence_grpo=args.train_judge_coherence_grpo,
+        train_adapter_names=tuple(args.train_adapter_names),
+    )
+
+    assert config.adapter_layout == "split"
+    assert config.debate_judge_adapter == "judge"
+    assert config.debate_judge_bidirectional is True
+    assert config.train_judge_coherence_grpo is True
+    assert config.rollout.temperature == config.debate_judge_temperature == 1.0
+    assert config.train_adapter_names == ("solution", "debate", "judge")
 
 
 def test_rollout_assistant_prefill_default_distinguishes_omitted_from_empty(monkeypatch) -> None:

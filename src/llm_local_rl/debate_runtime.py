@@ -6,7 +6,11 @@ import re
 from typing import Callable
 
 from llm_local_rl.behavior_policy import validate_sampling_result_contract
-from llm_local_rl.base_model_judge import build_base_judge_prompt, extract_strict_verdict
+from llm_local_rl.base_model_judge import (
+    build_sft_judge_prompt,
+    extract_single_token_verdict,
+    extract_strict_verdict,
+)
 from llm_local_rl.chat_templates import get_chat_adapter
 from llm_local_rl.debate_parity import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
 from llm_local_rl.model_io_trace import trace_context
@@ -104,6 +108,12 @@ def _fallback_verdict_from_invalid_judge(*, step_seed: int | None, debate_idx: i
     return rng.choice(["A", "B"])
 
 
+def _fallback_verdict_from_order_disagreement(*, step_seed: int | None, debate_idx: int) -> Verdict:
+    fallback_seed = 0 if step_seed is None else step_seed
+    rng = random.Random(f"{fallback_seed}:judge_order_disagreement:{debate_idx}")
+    return rng.choice(["A", "B"])
+
+
 def _split_template(template: str, placeholder: str) -> tuple[str, str]:
     if placeholder not in template:
         raise ValueError(f"Template missing placeholder {placeholder!r}")
@@ -146,13 +156,14 @@ class DebateRuntimeConfig:
     base_r3_prefill: str = "Responding to my opponent's criticism:\n1)"
     judge_prompt_format: str = "chat"
     judge_max_tokens: int = 0
-    judge_temperature: float = 0.3
+    judge_temperature: float = 1.0
     judge_top_p: float = 1.0
     judge_top_k: int = -1
     judge_min_p: float = 0.0
     judge_presence_penalty: float = 0.0
     judge_repetition_penalty: float = 1.0
     judge_seed: int | None = None
+    judge_bidirectional: bool = False
     debate_judge_server_url: str | None = None
     debate_judge_server_adapter_path: str | None = None
 
@@ -248,11 +259,11 @@ class DebateRuntime:
         if self.runtime_config.group_size % 2 != 0:
             raise ValueError("Debate requires even group_size.")
         if (
-            self.runtime_config.judge_prompt_format == "base_model_sft"
+            self.runtime_config.judge_prompt_format in ("base_model_sft", "single_token_sft")
             and self.runtime_config.num_rounds != 3
         ):
             raise ValueError(
-                "judge_prompt_format='base_model_sft' requires a complete three-round debate; "
+                "SFT judge prompting requires a complete three-round debate; "
                 f"got num_rounds={self.runtime_config.num_rounds}"
             )
         instances = self.task.sample_instances(n=self.runtime_config.num_groups, seed=step_seed)
@@ -397,7 +408,14 @@ class DebateRuntime:
         if round_num == 1:
             if self.debate_config.max_tokens_r1 is not None:
                 return int(self.debate_config.max_tokens_r1)
-        elif round_num in {2, 3}:
+        elif round_num == 2:
+            if self.debate_config.max_tokens_r2 is not None:
+                return int(self.debate_config.max_tokens_r2)
+            if self.debate_config.max_tokens_r23 is not None:
+                return int(self.debate_config.max_tokens_r23)
+        elif round_num == 3:
+            if self.debate_config.max_tokens_r3 is not None:
+                return int(self.debate_config.max_tokens_r3)
             if self.debate_config.max_tokens_r23 is not None:
                 return int(self.debate_config.max_tokens_r23)
         return int(self.debate_config.max_tokens_per_turn or 64)
@@ -471,7 +489,7 @@ class DebateRuntime:
             return self._encode_base_text(
                 "\n\n"
                 + _base_text_prompt(
-                    system_text=None,
+                    system_text=extension.system_text,
                     user_text=extension.user_text,
                     assistant_prefill=extension.assistant_prefill,
                 )
@@ -524,7 +542,7 @@ class DebateRuntime:
             return self._encode_base_text(
                 "\n\n"
                 + _base_text_prompt(
-                    system_text=None,
+                    system_text=extension.system_text,
                     user_text=extension.user_text,
                     assistant_prefill=extension.assistant_prefill,
                 )
@@ -664,20 +682,21 @@ class DebateRuntime:
             )
         return out
 
-    def _judge_prompts(self, *, inst_pairs: list[tuple[TaskInstance, TaskInstance]], r1_visible_text: list[str], r2_visible_text: list[str], r3_visible_text: list[str]) -> list[list[int]]:
-        if self.runtime_config.judge_prompt_format == "base_model_sft":
+    def _judge_prompts(self, *, inst_pairs: list[tuple[TaskInstance, TaskInstance]], r1_visible_text: list[str], r2_visible_text: list[str], r3_visible_text: list[str], reverse_order: bool = False) -> list[list[int]]:
+        if self.runtime_config.judge_prompt_format in ("base_model_sft", "single_token_sft"):
             return [
                 list(
                     self.tokenizer.encode(
-                        build_base_judge_prompt(
+                        build_sft_judge_prompt(
+                            prompt_format=self.runtime_config.judge_prompt_format,
                             question=self.task.judge_context_text(inst=inst_a),
                             constitution=self.task.judge_constitution_text(inst=inst_a),
-                            r1_a=r1_visible_text[2 * debate_idx],
-                            r1_b=r1_visible_text[2 * debate_idx + 1],
-                            r2_a=r2_visible_text[2 * debate_idx],
-                            r2_b=r2_visible_text[2 * debate_idx + 1],
-                            r3_a=r3_visible_text[2 * debate_idx],
-                            r3_b=r3_visible_text[2 * debate_idx + 1],
+                            r1_a=r1_visible_text[2 * debate_idx + int(reverse_order)],
+                            r1_b=r1_visible_text[2 * debate_idx + int(not reverse_order)],
+                            r2_a=r2_visible_text[2 * debate_idx + int(reverse_order)],
+                            r2_b=r2_visible_text[2 * debate_idx + int(not reverse_order)],
+                            r3_a=r3_visible_text[2 * debate_idx + int(reverse_order)],
+                            r3_b=r3_visible_text[2 * debate_idx + int(not reverse_order)],
                         ),
                         add_special_tokens=False,
                     )
@@ -687,8 +706,8 @@ class DebateRuntime:
         adapter = get_chat_adapter(self.tokenizer)
         prompts: list[list[int]] = []
         for debate_idx, (inst_a, _inst_b) in enumerate(inst_pairs):
-            a_idx = 2 * debate_idx
-            b_idx = 2 * debate_idx + 1
+            a_idx = 2 * debate_idx + int(reverse_order)
+            b_idx = 2 * debate_idx + int(not reverse_order)
             system = (
                 self.debate_config.system_judge
                 + "\n\nIMPORTANT: Output exactly one tag: <VERDICT>...</VERDICT>. VERDICT must be A or B only. Do not emit <think> tags or any reasoning."
@@ -710,8 +729,9 @@ class DebateRuntime:
                 f"{r2_visible_text[b_idx]}\n\n"
                 "Round 3 (Response):\n"
                 f"{r3_visible_text[b_idx]}\n\n"
-                "Based on the debate above, which agent made a more convincing case?\n"
-                "Consider: solution correctness, argument quality, rebuttal effectiveness.\n"
+                "Based on the debate above, which agent's Round 1 response best satisfies the user "
+                "under the constitution?\n"
+                "Consider the debate only as evidence about the responses themselves.\n"
                 "Return only <VERDICT>A</VERDICT> or <VERDICT>B</VERDICT>.\n"
             )
             prompts.append(
@@ -759,19 +779,34 @@ class DebateRuntime:
             for inst in instances_repeated
         ]
         stop_token_ids = self.task.stop_token_ids(tokenizer=self.tokenizer)
-        r1_results = self._sample_many(
-            prompt_tokens_list=base_r1_prompt_tokens,
-            round_num=1,
-            step_seed=step_seed,
-            stop_token_ids=stop_token_ids,
-            max_tokens=self._max_tokens_for_round(round_num=1),
-            temperature=float(self.debate_config.temperature),
-        )
+        fixed_r1_builder = getattr(self.task, "fixed_r1_completion_text", None)
+        if callable(fixed_r1_builder):
+            r1_results = []
+            for inst in instances_repeated:
+                text = str(fixed_r1_builder(inst=inst))
+                tokens = list(self.tokenizer.encode(text, add_special_tokens=False))
+                if not tokens:
+                    raise ValueError("Fixed R1 completion must contain at least one token")
+                r1_results.append(
+                    (tokens, [0.0] * len(tokens), text, {"fixed_r1": True, "sampled": False})
+                )
+        else:
+            r1_results = self._sample_many(
+                prompt_tokens_list=base_r1_prompt_tokens,
+                round_num=1,
+                step_seed=step_seed,
+                stop_token_ids=stop_token_ids,
+                max_tokens=self._max_tokens_for_round(round_num=1),
+                temperature=float(self.debate_config.temperature),
+            )
         r1_tokens = [comp for comp, _lps, _text, _raw in r1_results]
         r1_lps = [lps for _comp, lps, _text, _raw in r1_results]
         r1_text = [text for _comp, _lps, text, _raw in r1_results]
         r1_visible_text, r1_visible_metrics = self._postprocess_visible_texts(instances=instances_repeated, texts=r1_text)
-        r1_sol = [extract_solution(text) for text in r1_visible_text]
+        r1_sol = [
+            text if callable(fixed_r1_builder) else extract_solution(text)
+            for text in r1_visible_text
+        ]
         r1_raw = [raw for _comp, _lps, _text, raw in r1_results]
         r1_task_rewards = []
         r1_task_reward_metrics = []
@@ -1157,12 +1192,24 @@ class DebateRuntime:
         r3_visible_text: list[str],
         step_seed: int | None,
     ) -> tuple[list[Verdict], list[str], list[list[int]], list[list[int]], list[list[float]], list[dict], list[bool]]:
-        prompt_tokens = self._judge_prompts(
+        forward_prompt_tokens = self._judge_prompts(
             inst_pairs=inst_pairs,
             r1_visible_text=r1_visible_text,
             r2_visible_text=r2_visible_text,
             r3_visible_text=r3_visible_text,
         )
+        reverse_prompt_tokens = (
+            self._judge_prompts(
+                inst_pairs=inst_pairs,
+                r1_visible_text=r1_visible_text,
+                r2_visible_text=r2_visible_text,
+                r3_visible_text=r3_visible_text,
+                reverse_order=True,
+            )
+            if self.runtime_config.judge_bidirectional
+            else []
+        )
+        prompt_tokens = forward_prompt_tokens + reverse_prompt_tokens
         stop_token_ids = self.task.stop_token_ids(tokenizer=self.tokenizer)
         results = self._sample_judge_many(
             prompt_tokens_list=prompt_tokens,
@@ -1183,11 +1230,12 @@ class DebateRuntime:
         retry_flags: list[bool] = []
         invalid_indices: list[int] = []
         for idx, (comp, lps, text, raw) in enumerate(results):
-            verdict = (
-                extract_strict_verdict(text)
-                if self.runtime_config.judge_prompt_format == "base_model_sft"
-                else extract_verdict(_strip_think_blocks(text))
-            )
+            if self.runtime_config.judge_prompt_format == "base_model_sft":
+                verdict = extract_strict_verdict(text)
+            elif self.runtime_config.judge_prompt_format == "single_token_sft":
+                verdict = extract_single_token_verdict(text)
+            else:
+                verdict = extract_verdict(_strip_think_blocks(text))
             verdicts.append(verdict)
             reasonings.append(extract_reasoning(text))
             completion_tokens.append(comp)
@@ -1196,7 +1244,13 @@ class DebateRuntime:
             retry_flags.append(False)
             if verdict == "INVALID":
                 invalid_indices.append(idx)
-        if invalid_indices:
+        # A deterministic retry is useful for a frozen single-order judge, but it
+        # is a different behavior policy and therefore cannot supply an on-policy
+        # judge-GRPO turn. Bidirectional sampling keeps the original invalid
+        # completion, treats the pair as incoherent, and trains against that exact
+        # sampled action instead of silently replacing it with a temperature-0
+        # retry.
+        if invalid_indices and not self.runtime_config.judge_bidirectional:
             retry_results = self._sample_judge_many(
                 prompt_tokens_list=[prompt_tokens[idx] for idx in invalid_indices],
                 round_num=100,
@@ -1209,11 +1263,12 @@ class DebateRuntime:
                 temperature=0.0,
             )
             for debate_idx, (comp, lps, text, raw) in zip(invalid_indices, retry_results, strict=True):
-                retry_verdict = (
-                    extract_strict_verdict(text)
-                    if self.runtime_config.judge_prompt_format == "base_model_sft"
-                    else extract_verdict(_strip_think_blocks(text))
-                )
+                if self.runtime_config.judge_prompt_format == "base_model_sft":
+                    retry_verdict = extract_strict_verdict(text)
+                elif self.runtime_config.judge_prompt_format == "single_token_sft":
+                    retry_verdict = extract_single_token_verdict(text)
+                else:
+                    retry_verdict = extract_verdict(_strip_think_blocks(text))
                 if retry_verdict == "INVALID":
                     continue
                 verdicts[debate_idx] = retry_verdict
@@ -1224,7 +1279,9 @@ class DebateRuntime:
                 retry_flags[debate_idx] = True
         for debate_idx, verdict in enumerate(verdicts):
             if verdict == "INVALID":
-                if self.runtime_config.debate_r1_reward == "judge_rejection_task":
+                if self.runtime_config.judge_bidirectional:
+                    reasonings[debate_idx] = "[JUDGE INVALID AFTER RETRY]"
+                elif self.runtime_config.debate_r1_reward == "judge_rejection_task":
                     reasonings[debate_idx] = "[JUDGE INVALID -> DEBATE DROPPED FROM TRAINING]"
                 else:
                     verdicts[debate_idx] = _fallback_verdict_from_invalid_judge(
@@ -1232,4 +1289,74 @@ class DebateRuntime:
                         debate_idx=debate_idx,
                     )
                     reasonings[debate_idx] = "[JUDGE INVALID -> RANDOM FALLBACK]"
-        return verdicts, reasonings, prompt_tokens, completion_tokens, completion_logprobs, raw_responses, retry_flags
+        if not self.runtime_config.judge_bidirectional:
+            return verdicts, reasonings, prompt_tokens, completion_tokens, completion_logprobs, raw_responses, retry_flags
+
+        debate_count = len(inst_pairs)
+        final_verdicts: list[Verdict] = []
+        final_reasonings: list[str] = []
+        final_raw_responses: list[dict] = []
+        final_retry_flags: list[bool] = []
+        for debate_idx in range(debate_count):
+            forward_verdict = verdicts[debate_idx]
+            reverse_verdict = verdicts[debate_count + debate_idx]
+            reverse_mapped: Verdict = (
+                "B" if reverse_verdict == "A" else "A" if reverse_verdict == "B" else "INVALID"
+            )
+            order_invariant = (
+                forward_verdict in ("A", "B")
+                and reverse_mapped in ("A", "B")
+                and forward_verdict == reverse_mapped
+            )
+            both_valid = forward_verdict in ("A", "B") and reverse_mapped in ("A", "B")
+            if order_invariant:
+                final_verdict: Verdict = forward_verdict
+                aggregation = "order_invariant_agreement"
+            else:
+                final_verdict = _fallback_verdict_from_order_disagreement(
+                    step_seed=step_seed, debate_idx=debate_idx,
+                )
+                aggregation = (
+                    "seeded_random_on_order_disagreement"
+                    if both_valid
+                    else "seeded_random_on_non_invariant_invalid_judgment"
+                )
+            final_verdicts.append(final_verdict)
+            final_reasonings.append(
+                "[FORWARD ORDER]\n" + reasonings[debate_idx]
+                + "\n[REVERSED ORDER]\n" + reasonings[debate_count + debate_idx]
+            )
+            final_raw_responses.append({
+                "bidirectional_judge": True,
+                "forward": raw_responses[debate_idx],
+                "reverse": raw_responses[debate_count + debate_idx],
+                "forward_verdict": forward_verdict,
+                "reverse_verdict": reverse_verdict,
+                "reverse_mapped_verdict": reverse_mapped,
+                "order_invariant": order_invariant,
+                "aggregation": aggregation,
+                "final_verdict": final_verdict,
+                # Kept in-memory for judge GRPO and removed from step-record JSON by
+                # the driver. These are the exact sampled behavior-policy turns,
+                # including any successful deterministic retry.
+                "_training_judge_turns": [
+                    {
+                        "order": "forward",
+                        "prompt_tokens": prompt_tokens[debate_idx],
+                        "completion_tokens": completion_tokens[debate_idx],
+                        "completion_logprobs": completion_logprobs[debate_idx],
+                    },
+                    {
+                        "order": "reverse",
+                        "prompt_tokens": prompt_tokens[debate_count + debate_idx],
+                        "completion_tokens": completion_tokens[debate_count + debate_idx],
+                        "completion_logprobs": completion_logprobs[debate_count + debate_idx],
+                    },
+                ],
+            })
+            final_retry_flags.append(retry_flags[debate_idx] or retry_flags[debate_count + debate_idx])
+        return (
+            final_verdicts, final_reasonings, forward_prompt_tokens,
+            completion_tokens[:debate_count], completion_logprobs[:debate_count],
+            final_raw_responses, final_retry_flags,
+        )

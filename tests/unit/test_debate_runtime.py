@@ -20,6 +20,12 @@ from llm_local_rl.debate_parity import DebateConfig
 from llm_local_rl.task_types import TaskInstance
 
 
+def test_debate_runtime_sampling_temperature_defaults_are_one() -> None:
+    assert DebateConfig().temperature == 1.0
+    assert DebateConfig.cheap().temperature == 1.0
+    assert DebateRuntimeConfig().judge_temperature == 1.0
+
+
 def _real_tokenizer():
     if AutoTokenizer is None:
         pytest.skip("transformers is required for real-tokenizer debate runtime tests.")
@@ -144,7 +150,8 @@ def test_constrained_writing_base_prompts_are_strict_prefix_extensions() -> None
     )
     inst = task.sample_instances(n=1, seed=2026071401)[0]
     r1_prefill = "Ok, I will produce a 3-sentence story adhering to the rules:\n"
-    debate_prefill = "The reasons that my solution is better than my opponent's are:\n1)"
+    r2_prefill = "The reasons that my solution is better than my opponent's are:\n1)"
+    r3_prefill = "Responding to my opponent's criticism:\n1)"
     runtime = object.__new__(DebateRuntime)
     runtime.task = task
     runtime.tokenizer = tokenizer
@@ -166,16 +173,22 @@ def test_constrained_writing_base_prompts_are_strict_prefix_extensions() -> None
 
     constitution = task.judge_constitution_text(inst=inst)
     expected_r2_continuation = (
-        "\n\nUser:\n"
-        f"Constitution: {constitution}\n"
+        "\n\nSystem:\n"
+        "You are participating in Round 2 of a debate about which story best satisfies the user.\n"
+        "Your Round 1 story is fixed and cannot change.\n"
+        "Argue only about why your fixed story best satisfies the user under the constitution.\n"
+        "Use concrete evidence from the user request, your story, and your opponent's story.\n"
+        "Do not emit <think> tags.\n\n"
+        "User:\n"
+        f"Constitution:\n{constitution}\n\n"
         "Opponent Round 1 answer:\n"
-        "Opponent fixed story.\n"
-        "Continue arguing that your fixed answer should win under the constitution. "
-        "Address the opponent directly and use concrete evidence from the task and answers.\n\n"
+        "Opponent fixed story.\n\n"
+        "Continue arguing that your fixed story best satisfies the user under the constitution. "
+        "Address the opponent directly and use concrete evidence from the user request and stories.\n\n"
         "Write exactly 3 short numbered points. After point 3, immediately output "
         "CONCLUDED and nothing else.\n"
         "\nAssistant:\n"
-        f"{debate_prefill}"
+        f"{r2_prefill}"
     )
     assert bytes(r2_continuation).decode("utf-8") == expected_r2_continuation
     assert r2_prompt[: len(r1_prompt) + len(own_r1_tokens)] == r1_prompt + own_r1_tokens
@@ -185,19 +198,33 @@ def test_constrained_writing_base_prompts_are_strict_prefix_extensions() -> None
         inst=inst,
         own_r1="Own fixed story.",
         opponent_r1="Opponent fixed story.",
-        own_r2=debate_prefill + "Second point.",
-        opponent_r2=debate_prefill + "Opponent point.",
+        own_r2=r2_prefill + "Second point.",
+        opponent_r2=r2_prefill + "Opponent point.",
     )
     r3_prompt = r2_prompt + own_r2_tokens + r3_continuation
-    expected_r3_continuation = expected_r2_continuation.replace(
-        "Opponent Round 1 answer:\nOpponent fixed story.",
-        f"Opponent Round 2 answer:\n{debate_prefill}Opponent point.",
+    expected_r3_continuation = (
+        "\n\nSystem:\n"
+        "You are participating in Round 3 of a debate about which story best satisfies the user.\n"
+        "Your Round 1 story is fixed and cannot change.\n"
+        "Respond to the opponent's Round 2 argument and make your final case.\n"
+        "Use concrete evidence from the user request, your story, and the transcript.\n"
+        "Do not emit <think> tags.\n\n"
+        "User:\n"
+        f"Constitution:\n{constitution}\n\n"
+        "Opponent Round 2 answer:\n"
+        f"{r2_prefill}Opponent point.\n\n"
+        "Make your final case that your fixed story best satisfies the user under the constitution. "
+        "Focus on the strongest evidence and the opponent's weakest point.\n\n"
+        "Write exactly 3 short numbered points. After point 3, immediately output "
+        "CONCLUDED and nothing else.\n"
+        "\nAssistant:\n"
+        f"{r3_prefill}"
     )
     assert bytes(r3_continuation).decode("utf-8") == expected_r3_continuation
     assert r3_prompt[: len(r2_prompt) + len(own_r2_tokens)] == r2_prompt + own_r2_tokens
 
     rendered = bytes(r3_continuation).decode("utf-8")
-    assert "System:" not in rendered
+    assert "System:" in rendered
     assert "Original task prompt:" not in rendered
     assert "Your fixed Round 1 answer:" not in rendered
     assert "Your Round 2 argument:" not in rendered
@@ -206,7 +233,7 @@ def test_constrained_writing_base_prompts_are_strict_prefix_extensions() -> None
         opponent_round=2,
         opponent_answer="Opponent point.",
         fallback="wrong fallback",
-    ) == debate_prefill
+    ) == r3_prefill
     assert tokenizer.add_special_tokens_values
     assert all(value is False for value in tokenizer.add_special_tokens_values)
 
@@ -250,6 +277,29 @@ def test_concluded_stop_is_requested_only_for_debate_turns() -> None:
     assert sampler.requests[1].include_stop_str_in_output is True
     assert sampler.requests[1].top_p == 0.95
     assert sampler.requests[1].min_p == 0.02
+
+
+def test_round_specific_token_caps_override_shared_r23_cap() -> None:
+    runtime = object.__new__(DebateRuntime)
+    runtime.debate_config = DebateConfig(
+        max_tokens_per_turn=1024,
+        max_tokens_r1=250,
+        max_tokens_r23=1536,
+        max_tokens_r2=250,
+        max_tokens_r3=1536,
+    )
+
+    assert runtime._max_tokens_for_round(round_num=1) == 250
+    assert runtime._max_tokens_for_round(round_num=2) == 250
+    assert runtime._max_tokens_for_round(round_num=3) == 1536
+
+
+def test_shared_r23_cap_remains_backward_compatible() -> None:
+    runtime = object.__new__(DebateRuntime)
+    runtime.debate_config = DebateConfig(max_tokens_per_turn=1024, max_tokens_r23=384)
+
+    assert runtime._max_tokens_for_round(round_num=2) == 384
+    assert runtime._max_tokens_for_round(round_num=3) == 384
 
 
 def test_debate_runtime_split_routes_solution_debate_and_policy_judge_with_real_tokenizer() -> None:

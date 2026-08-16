@@ -12,6 +12,7 @@ from llm_local_rl.config import CheckpointManifest, TrainRunConfig
 from llm_local_rl.debate_parity import (
     DebateConfig,
     DebateResult,
+    assemble_judge_coherence_grpo_examples,
     assemble_split_train_examples,
     assemble_training_data_by_mode,
     summarize_judge_rejection_r1_projection,
@@ -157,12 +158,16 @@ class TrainingDriver:
     def _debate_config(self) -> DebateConfig:
         r1_max_tokens = self.config.debate_r1_max_tokens or self.config.rollout.max_tokens
         r23_max_tokens = self.config.debate_r23_max_tokens or self.config.rollout.max_tokens
+        r2_max_tokens = self.config.debate_r2_max_tokens or r23_max_tokens
+        r3_max_tokens = self.config.debate_r3_max_tokens or r23_max_tokens
         return DebateConfig(
             num_rounds=self.config.debate_rounds,
             enable_thinking=self._enable_thinking(),
             max_tokens_per_turn=self.config.rollout.max_tokens,
             max_tokens_r1=r1_max_tokens,
             max_tokens_r23=r23_max_tokens,
+            max_tokens_r2=r2_max_tokens,
+            max_tokens_r3=r3_max_tokens,
             temperature=self.config.rollout.temperature,
             chat_preamble=infer_chat_preamble(self.tokenizer),
         )
@@ -549,6 +554,7 @@ class TrainingDriver:
                 judge_presence_penalty=self.config.debate_judge_presence_penalty,
                 judge_repetition_penalty=self.config.debate_judge_repetition_penalty,
                 judge_seed=self.config.debate_judge_seed,
+                judge_bidirectional=self.config.debate_judge_bidirectional,
                 debate_judge_server_url=self.config.debate_judge_server_url,
                 debate_judge_server_adapter_path=self.config.debate_judge_server_adapter_path,
             ),
@@ -661,6 +667,12 @@ class TrainingDriver:
             if judge_completion_tokens
             else ""
         )
+        raw_judge_response = debate.judge_raw_response
+        if isinstance(raw_judge_response, dict):
+            raw_judge_response = {
+                key: value for key, value in raw_judge_response.items()
+                if key != "_training_judge_turns"
+            }
         return {
             "question": debate.question,
             "verdict": debate.verdict,
@@ -669,7 +681,7 @@ class TrainingDriver:
                 "text": judge_text,
                 "prompt_tokens": len(debate.judge_prompt_tokens or []),
                 "completion_tokens": len(judge_completion_tokens),
-                "raw_response": debate.judge_raw_response,
+                "raw_response": raw_judge_response,
             },
             "trajectory_a": trajectory_record(debate.trajectory_a),
             "trajectory_b": trajectory_record(debate.trajectory_b),
@@ -683,6 +695,8 @@ class TrainingDriver:
                 "train_judge_valid_rate": 0.0,
                 "train_judge_win_rate": 0.0,
                 "train_judge_invalid_rate": 0.0,
+                "train_judge_order_invariant_rate": 0.0,
+                "train_judge_order_disagreement_rate": 0.0,
                 "mean_r2_length": 0.0,
                 "mean_r3_length": 0.0,
                 "mean_r23_length": 0.0,
@@ -726,12 +740,23 @@ class TrainingDriver:
             return sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys, strict=True)) / math.sqrt(x_var * y_var)
 
         valid_rate = len(valid_verdicts) / len(debates)
+        bidirectional_audits = [
+            debate.judge_raw_response for debate in debates
+            if isinstance(debate.judge_raw_response, dict)
+            and debate.judge_raw_response.get("bidirectional_judge") is True
+        ]
+        order_invariant_rate = (
+            sum(bool(audit.get("order_invariant")) for audit in bidirectional_audits)
+            / len(bidirectional_audits) if bidirectional_audits else 0.0
+        )
         return {
             "train_judge_a_win_rate": sum(1 for verdict in verdicts if verdict == "A") / len(debates),
             "train_judge_b_win_rate": sum(1 for verdict in verdicts if verdict == "B") / len(debates),
             "train_judge_valid_rate": valid_rate,
             "train_judge_win_rate": valid_rate,
             "train_judge_invalid_rate": sum(1 for verdict in verdicts if verdict == "INVALID") / len(debates),
+            "train_judge_order_invariant_rate": order_invariant_rate,
+            "train_judge_order_disagreement_rate": 1.0 - order_invariant_rate if bidirectional_audits else 0.0,
             "mean_r2_length": mean(r2_lengths) if r2_lengths else 0.0,
             "mean_r3_length": mean(r3_lengths) if r3_lengths else 0.0,
             "mean_r23_length": mean([*r2_lengths, *r3_lengths]) if r2_lengths or r3_lengths else 0.0,
@@ -782,7 +807,13 @@ class TrainingDriver:
             r23_advantage_scope=self.config.debate_r23_advantage_scope,
             task_reward_fn=task_reward_fn,
             pointwise_reward_map=pointwise_reward_map,
+            r1_judge_delta_q=self.config.debate_r1_judge_delta_q,
+            incoherent_r23_reward=self.config.debate_incoherent_r23_reward,
         )
+        judge_grpo_record: dict[str, float | int] | None = None
+        if self.config.train_judge_coherence_grpo:
+            judge_examples, judge_grpo_record = assemble_judge_coherence_grpo_examples(debates)
+            grouped.setdefault("judge", []).extend(judge_examples)
         projection_record: dict[str, object] = {
             "source_exact_shared_equivalent": False,
             "reason": "split_layout_per_round_projection",
@@ -790,6 +821,8 @@ class TrainingDriver:
             "r23_advantage_scope": self.config.debate_r23_advantage_scope,
             "num_debates": len(debates),
         }
+        if judge_grpo_record is not None:
+            projection_record["judge_coherence_grpo"] = judge_grpo_record
         if self.config.debate_r1_reward == "judge_rejection_task":
             r1_adapter_name = self.config.debate_round_adapter_names[0]
             projection_record["r1_projection"] = {
@@ -802,6 +835,14 @@ class TrainingDriver:
                     debates=debates,
                 ),
                 "r23_mode": self.config.debate_r23_mode,
+            }
+        elif self.config.debate_r1_reward == "judge_delta_task":
+            projection_record["r1_projection"] = {
+                "mode": "judge_delta_task",
+                "formula": "task_reward +/- q * abs(task_reward_a - task_reward_b)",
+                "q": self.config.debate_r1_judge_delta_q,
+                "incoherent_r1": "seeded_coin_flip_winner_task_reward_plus_minus_q_delta",
+                "incoherent_r23_reward_per_trajectory": self.config.debate_incoherent_r23_reward,
             }
         return grouped, projection_record
 
