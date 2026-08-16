@@ -35,25 +35,33 @@ def _write_corpus(tmp_path):
     return path
 
 
-def test_mmlu_pair_expansion_fixes_one_correct_and_one_wrong_r1(tmp_path) -> None:
+def test_mmlu_pair_expansion_creates_both_answer_orderings(tmp_path) -> None:
     task = MMLUProPairwiseDebateTask(data_path=str(_write_corpus(tmp_path)))
     base = task.sample_instances(n=1, seed=7)[0]
-    expanded = task.expand_group_instances(inst=base, group_size=2, seed=11)
+    expanded = task.expand_group_instances(inst=base, group_size=4, seed=11)
 
-    assert [inst.payload["agent"] for inst in expanded] == ["A", "B"]
-    assert sum(bool(inst.payload["is_correct"]) for inst in expanded) == 1
-    assert len({inst.payload["gold_agent"] for inst in expanded}) == 1
+    assert [inst.payload["agent"] for inst in expanded] == ["A", "B", "A", "B"]
+    assert [inst.payload["ordering_index"] for inst in expanded] == [0, 0, 1, 1]
+    assert sum(bool(inst.payload["is_correct"]) for inst in expanded) == 2
+    assert {inst.payload["gold_agent"] for inst in expanded} == {"A", "B"}
+    first, mirrored = expanded[:2], expanded[2:]
+    assert [inst.payload["fixed_answer"] for inst in first] == list(
+        reversed([inst.payload["fixed_answer"] for inst in mirrored])
+    )
+    assert [inst.payload["is_correct"] for inst in first] == list(
+        reversed([inst.payload["is_correct"] for inst in mirrored])
+    )
     for inst in expanded:
         assert task.fixed_r1_completion_text(inst=inst) == inst.payload["fixed_answer"]
         reward = task.compute_reward(inst=inst, completion_tokens=[], tokenizer=None)
         assert reward.reward == float(inst.payload["is_correct"])
 
 
-def test_mmlu_pair_task_requires_exactly_one_debate_per_question(tmp_path) -> None:
+def test_mmlu_pair_task_requires_two_mirrored_debates_per_question(tmp_path) -> None:
     task = MMLUProPairwiseDebateTask(data_path=str(_write_corpus(tmp_path)))
     base = task.sample_instances(n=1, seed=1)[0]
-    with pytest.raises(ValueError, match="group_size=2"):
-        task.expand_group_instances(inst=base, group_size=4, seed=1)
+    with pytest.raises(ValueError, match="group_size=4"):
+        task.expand_group_instances(inst=base, group_size=2, seed=1)
 
 
 def test_single_token_judge_prompt_matches_training_harness() -> None:
