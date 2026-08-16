@@ -38,11 +38,15 @@ different behavior distribution.
 
 ## Judge coherence GRPO
 
-Enable judge optimization with:
+Enable judge optimization with this complete prerequisite set:
 
 ```text
+--adapter-layout split
+--debate-judge-adapter judge
 --debate-judge-bidirectional
 --train-judge-coherence-grpo
+--temperature 1.0
+--debate-judge-temperature 1.0
 --train-adapter-names solution debate judge
 ```
 
@@ -54,7 +58,11 @@ deviation is zero and judge advantages are intentionally zero.
 
 Judge GRPO requires the judge sampler and trainer reconstruction to use the same
 behavior-policy settings. Configuration validation rejects mismatched sampling
-distributions.
+distributions. If sampling controls are overridden, set their rollout and judge
+counterparts to the same values (for example, `--temperature` together with
+`--debate-judge-temperature`, and `--top-p` together with
+`--debate-judge-top-p`). Both temperatures default to `1.0`, but they are shown
+explicitly above so the documented contract stays self-contained.
 
 ## Related reward controls
 
@@ -66,5 +74,6 @@ distributions.
 - `--debate-r2-max-tokens` and `--debate-r3-max-tokens` override the shared R2/R3
   cap independently.
 
-All new behaviors are opt in; existing single-order and legacy reward defaults
-are unchanged.
+The GRPO and reward behaviors above are opt in. New policy and judge sampling
+both default to temperature `1.0`; explicit values in existing run
+configurations are preserved.
