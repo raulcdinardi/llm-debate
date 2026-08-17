@@ -314,6 +314,7 @@ class TrainingDriver:
             compile_train_logprob_helper=self.config.compile_train_logprob_helper,
             gradient_checkpointing=self.config.gradient_checkpointing,
             on_policy_logprob_check=self.config.on_policy_logprob_check,
+            on_policy_logprob_warn_only=self.config.on_policy_logprob_warn_only,
             on_policy_logprob_abs_tol=self.config.on_policy_logprob_abs_tol,
             on_policy_logprob_warning_path=on_policy_warning_path,
             on_policy_logprob_max_records_per_batch=self.config.on_policy_logprob_max_records_per_batch,

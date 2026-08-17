@@ -58,6 +58,7 @@ class TrainerConfig:
     compile_train_logprob_helper: bool = False
     gradient_checkpointing: bool = True
     on_policy_logprob_check: bool = True
+    on_policy_logprob_warn_only: bool = False
     on_policy_logprob_abs_tol: float = 1e-3
     on_policy_logprob_warning_path: str | None = None
     on_policy_logprob_max_records_per_batch: int = 8
@@ -1015,17 +1016,21 @@ class MultiAdapterTrainer:
                         "first_offending_trained_token": check_result.first_offending_trained_token,
                         "report_path": self.config.on_policy_logprob_warning_path,
                         "behavior_policy": self.config.behavior_policy.to_dict(),
+                        "gate_mode": (
+                            "warn_only" if self.config.on_policy_logprob_warn_only else "fail_closed"
+                        ),
                     }
                     print(json.dumps(event, sort_keys=True), flush=True)
-                    self.optimizer.zero_grad(set_to_none=True)
-                    raise BehaviorPolicyLogprobMismatchError(
-                        "Behavior-policy logprob parity failed before PPO ratio/backward: "
-                        f"adapter={adapter_name!r}, minibatch_start={start_idx}, "
-                        f"violations={check_result.num_violations}/"
-                        f"{check_result.num_checked_tokens}, "
-                        f"max_abs_diff={check_result.max_abs_logprob_diff:.9g}, "
-                        f"abs_tol={self.config.on_policy_logprob_abs_tol:.9g}."
-                    )
+                    if not self.config.on_policy_logprob_warn_only:
+                        self.optimizer.zero_grad(set_to_none=True)
+                        raise BehaviorPolicyLogprobMismatchError(
+                            "Behavior-policy logprob parity failed before PPO ratio/backward: "
+                            f"adapter={adapter_name!r}, minibatch_start={start_idx}, "
+                            f"violations={check_result.num_violations}/"
+                            f"{check_result.num_checked_tokens}, "
+                            f"max_abs_diff={check_result.max_abs_logprob_diff:.9g}, "
+                            f"abs_tol={self.config.on_policy_logprob_abs_tol:.9g}."
+                        )
             if trained_tokens == 0:
                 continue
 

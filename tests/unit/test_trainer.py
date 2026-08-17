@@ -472,6 +472,35 @@ def test_train_batch_fails_before_backward_or_optimizer_on_contract_violation() 
     assert torch.equal(trainer.model.bias.detach(), before)
 
 
+def test_train_batch_warn_only_records_violation_and_updates() -> None:
+    trainer = _fake_trainer()
+    trainer.config = TrainerConfig(
+        base_model_path="/tmp/nonexistent_model_for_shape_only",
+        device="cpu",
+        torch_dtype="float32",
+        learning_rate=0.1,
+        behavior_policy=BehaviorPolicySpec(temperature=0.8),
+        on_policy_logprob_abs_tol=1e-6,
+        on_policy_logprob_warn_only=True,
+    )
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    before = trainer.model.bias.detach().clone()
+    example = TrainExample(
+        adapter_name="shared",
+        input_ids=[0],
+        target_ids=[1],
+        loss_mask=[1],
+        behavior_logprob_mask=[1],
+        old_logprobs=[-0.1],
+        advantages=[1.0],
+    )
+
+    metrics = trainer.train_batch(adapter_name="shared", batch=[example])
+
+    assert metrics["on_policy_logprob_violations"] == 1.0
+    assert not torch.equal(trainer.model.bias.detach(), before)
+
+
 @pytest.mark.parametrize("backend", ["full_logits", "selective_lm_head"])
 def test_real_merged_debate_example_checks_only_sampled_tokens(backend: str) -> None:
     trainer = _tiny_causal_trainer(backend=backend)

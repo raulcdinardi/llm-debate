@@ -117,6 +117,7 @@ class TrainRunConfig:
     stop_parsed_reward_hacking_max: float | None = None
     gradient_checkpointing: bool = True
     on_policy_logprob_check: bool = True
+    on_policy_logprob_warn_only: bool = False
     on_policy_logprob_abs_tol: float = 1e-3
     on_policy_logprob_warning_path: str | None = None
     on_policy_logprob_max_records_per_batch: int = 8
@@ -384,6 +385,7 @@ class TrainRunConfig:
             stop_parsed_reward_hacking_max=data.get("stop_parsed_reward_hacking_max"),
             gradient_checkpointing=data.get("gradient_checkpointing", True),
             on_policy_logprob_check=data.get("on_policy_logprob_check", True),
+            on_policy_logprob_warn_only=data.get("on_policy_logprob_warn_only", False),
             on_policy_logprob_abs_tol=data.get("on_policy_logprob_abs_tol", 1e-3),
             on_policy_logprob_warning_path=data.get("on_policy_logprob_warning_path"),
             on_policy_logprob_max_records_per_batch=data.get("on_policy_logprob_max_records_per_batch", 8),
