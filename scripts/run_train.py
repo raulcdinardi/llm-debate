@@ -189,6 +189,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "behavior-policy logprobs differ. This safety gate cannot be disabled."
         ),
     )
+    parser.add_argument(
+        "--on-policy-logprob-warn-only",
+        action="store_true",
+        help=(
+            "Measure and record strict logprob-parity violations but continue through "
+            "PPO/backward. Use only after an explicit warning-band gate override."
+        ),
+    )
     parser.add_argument("--on-policy-logprob-abs-tol", type=float, default=1e-3)
     parser.add_argument("--on-policy-logprob-warning-path", default=None)
     parser.add_argument("--on-policy-logprob-max-records-per-batch", type=int, default=8)
@@ -357,6 +365,7 @@ def main() -> int:
                 stop_parsed_reward_hacking_max=args.stop_parsed_reward_hacking_max,
                 gradient_checkpointing=args.gradient_checkpointing,
                 on_policy_logprob_check=args.on_policy_logprob_check,
+                on_policy_logprob_warn_only=args.on_policy_logprob_warn_only,
                 on_policy_logprob_abs_tol=args.on_policy_logprob_abs_tol,
                 on_policy_logprob_warning_path=args.on_policy_logprob_warning_path,
                 on_policy_logprob_max_records_per_batch=args.on_policy_logprob_max_records_per_batch,

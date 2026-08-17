@@ -13,6 +13,7 @@ from llm_local_rl.behavior_policy import (
     BehaviorPolicySpec,
 )
 from llm_local_rl import vllm_sampling
+from llm_local_rl.types import SamplingRequest
 
 
 class SamplingParamsWithLogprobsMode:
@@ -209,6 +210,56 @@ def test_vllm_engine_level_mode_still_fails_closed_when_unverified(monkeypatch, 
             trace_top_logprobs=0,
             engine_logprobs_mode=mode,
         )
+
+
+def test_sample_many_batches_distinct_per_request_seeds(monkeypatch) -> None:
+    class FakeLLM:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
+            self.calls.append((prompts, sampling_params, lora_request, use_tqdm))
+            return [
+                SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            token_ids=[100 + idx],
+                            logprobs=[{100 + idx: -0.1}],
+                            text=str(100 + idx),
+                            finish_reason="stop",
+                        )
+                    ]
+                )
+                for idx in range(len(prompts))
+            ]
+
+    monkeypatch.setattr(
+        vllm_sampling,
+        "_import_vllm_symbols",
+        lambda: (None, SamplingParamsWithLogprobsMode, None),
+    )
+    sampler = object.__new__(vllm_sampling.VllmSampler)
+    sampler._llm = FakeLLM()
+    sampler._engine_logprobs_mode = "processed_logprobs"
+    sampler.adapter_paths = {}
+
+    requests = [
+        SamplingRequest(
+            adapter_name="debate",
+            prompt_token_ids=[idx],
+            stop_token_ids=[2],
+            max_tokens=8,
+            temperature=1.0,
+            seed=seed,
+        )
+        for idx, seed in enumerate((11, 22, 33))
+    ]
+    results = sampler.sample_many(requests)
+
+    assert len(sampler._llm.calls) == 1
+    _prompts, params, _lora, _tqdm = sampler._llm.calls[0]
+    assert [item.kwargs["seed"] for item in params] == [11, 22, 33]
+    assert [result.prompt_token_ids for result in results] == [[0], [1], [2]]
 
 
 def test_unload_adapters_evicts_only_trainable_loras_and_preserves_frozen_judge() -> None:

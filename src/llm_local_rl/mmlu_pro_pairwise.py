@@ -63,30 +63,38 @@ class MMLUProPairwiseDebateTask:
         group_size: int,
         seed: int | None,
     ) -> list[TaskInstance]:
-        if group_size != 2:
-            raise ValueError("mmlu_pro_pairwise requires group_size=2 (one fixed pair per question)")
-        rng = random.Random(seed)
-        correct_is_a = bool(rng.getrandbits(1))
-        answers = [
-            (str(inst.payload["correct_answer"]), True),
-            (str(inst.payload["wrong_answer"]), False),
-        ]
-        if not correct_is_a:
-            answers.reverse()
-        gold_agent = "A" if correct_is_a else "B"
-        return [
-            TaskInstance(
-                instance_id=inst.instance_id,
-                payload={
-                    **inst.payload,
-                    "fixed_answer": answer,
-                    "is_correct": is_correct,
-                    "agent": agent,
-                    "gold_agent": gold_agent,
-                },
+        if group_size < 4 or group_size % 4 != 0:
+            raise ValueError(
+                "mmlu_pro_pairwise requires group_size to be a positive multiple of 4 "
+                "(balanced independently generated debates with mirrored answer orderings)"
             )
-            for agent, (answer, is_correct) in zip(("A", "B"), answers, strict=True)
-        ]
+        rng = random.Random(seed)
+        first_correct_is_a = bool(rng.getrandbits(1))
+        expanded: list[TaskInstance] = []
+        orderings = (first_correct_is_a, not first_correct_is_a) * (group_size // 4)
+        for ordering_index, correct_is_a in enumerate(orderings):
+            answers = [
+                (str(inst.payload["correct_answer"]), True),
+                (str(inst.payload["wrong_answer"]), False),
+            ]
+            if not correct_is_a:
+                answers.reverse()
+            gold_agent = "A" if correct_is_a else "B"
+            expanded.extend(
+                TaskInstance(
+                    instance_id=inst.instance_id,
+                    payload={
+                        **inst.payload,
+                        "fixed_answer": answer,
+                        "is_correct": is_correct,
+                        "agent": agent,
+                        "gold_agent": gold_agent,
+                        "ordering_index": ordering_index,
+                    },
+                )
+                for agent, (answer, is_correct) in zip(("A", "B"), answers, strict=True)
+            )
+        return expanded
 
     def r1_context_text(self, *, inst: TaskInstance) -> str:
         return str(inst.payload["question"])
