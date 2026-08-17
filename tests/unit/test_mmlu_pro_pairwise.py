@@ -60,8 +60,21 @@ def test_mmlu_pair_expansion_creates_both_answer_orderings(tmp_path) -> None:
 def test_mmlu_pair_task_requires_two_mirrored_debates_per_question(tmp_path) -> None:
     task = MMLUProPairwiseDebateTask(data_path=str(_write_corpus(tmp_path)))
     base = task.sample_instances(n=1, seed=1)[0]
-    with pytest.raises(ValueError, match="group_size=4"):
+    with pytest.raises(ValueError, match="multiple of 4"):
         task.expand_group_instances(inst=base, group_size=2, seed=1)
+
+
+def test_mmlu_pair_expansion_balances_four_debates_in_group_of_eight(tmp_path) -> None:
+    task = MMLUProPairwiseDebateTask(data_path=str(_write_corpus(tmp_path)))
+    base = task.sample_instances(n=1, seed=7)[0]
+    expanded = task.expand_group_instances(inst=base, group_size=8, seed=11)
+
+    assert len(expanded) == 8
+    assert [inst.payload["agent"] for inst in expanded] == ["A", "B"] * 4
+    assert [inst.payload["ordering_index"] for inst in expanded] == [0, 0, 1, 1, 2, 2, 3, 3]
+    assert sum(bool(inst.payload["is_correct"]) for inst in expanded) == 4
+    assert [inst.payload["gold_agent"] for inst in expanded].count("A") == 4
+    assert [inst.payload["gold_agent"] for inst in expanded].count("B") == 4
 
 
 def test_single_token_judge_prompt_matches_training_harness() -> None:
