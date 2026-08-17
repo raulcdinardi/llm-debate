@@ -125,6 +125,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "once across the complete judgment batch."
         ),
     )
+    parser.add_argument(
+        "--judge-grpo-reward-mode",
+        choices=["coherence", "label"],
+        default="coherence",
+        help=(
+            "Judge GRPO raw reward source: 'coherence' scores referent agreement of the "
+            "two orderings; 'label' scores each sampled verdict against the ground-truth "
+            "trajectory reward (+1 gold referent, -1 otherwise, 0 on reward ties)."
+        ),
+    )
     parser.add_argument("--debate-round-adapter-names", nargs="*", default=["solution", "debate", "debate"])
     parser.add_argument(
         "--debate-prompt-format",
@@ -344,6 +354,7 @@ def main() -> int:
                 debate_judge_seed=args.debate_judge_seed,
                 debate_judge_bidirectional=args.debate_judge_bidirectional,
                 train_judge_coherence_grpo=args.train_judge_coherence_grpo,
+                judge_grpo_reward_mode=args.judge_grpo_reward_mode,
                 debate_round_adapter_names=tuple(args.debate_round_adapter_names),
                 debate_prompt_format=args.debate_prompt_format,
                 debate_stop_on_concluded=args.debate_stop_on_concluded,

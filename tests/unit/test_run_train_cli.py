@@ -63,6 +63,21 @@ def test_cli_defaults_all_sampling_temperatures_to_one() -> None:
     assert args.debate_r1_judge_delta_q == 1.0
     assert args.debate_incoherent_r23_reward == -0.5
     assert args.debate_judge_bidirectional is False
+    assert args.judge_grpo_reward_mode == "coherence"
+
+
+def test_cli_accepts_label_judge_grpo_reward_mode() -> None:
+    args = parse_args(
+        [
+            "--model-path",
+            "/tmp/model",
+            "--output-dir",
+            "/tmp/out",
+            "--judge-grpo-reward-mode",
+            "label",
+        ]
+    )
+    assert args.judge_grpo_reward_mode == "label"
 
 
 def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:
@@ -96,6 +111,7 @@ def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:
         debate_judge_repetition_penalty=args.debate_judge_repetition_penalty,
         debate_judge_bidirectional=args.debate_judge_bidirectional,
         train_judge_coherence_grpo=args.train_judge_coherence_grpo,
+        judge_grpo_reward_mode=args.judge_grpo_reward_mode,
         train_adapter_names=tuple(args.train_adapter_names),
     )
 
@@ -104,6 +120,7 @@ def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:
     assert config.debate_judge_harness == SOLUTION_R1_RATIONALE_V1
     assert config.debate_judge_bidirectional is True
     assert config.train_judge_coherence_grpo is True
+    assert config.judge_grpo_reward_mode == "coherence"
     assert config.rollout.temperature == config.debate_judge_temperature == 1.0
     assert config.train_adapter_names == ("solution", "debate", "judge")
 

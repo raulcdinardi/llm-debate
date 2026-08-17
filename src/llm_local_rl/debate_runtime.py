@@ -1308,12 +1308,14 @@ class DebateRuntime:
                 "_training_judge_turns": [
                     {
                         "order": "forward",
+                        "verdict": forward_verdict,
                         "prompt_tokens": prompt_tokens[debate_idx],
                         "completion_tokens": completion_tokens[debate_idx],
                         "completion_logprobs": completion_logprobs[debate_idx],
                     },
                     {
                         "order": "reverse",
+                        "verdict": reverse_verdict,
                         "prompt_tokens": prompt_tokens[debate_count + debate_idx],
                         "completion_tokens": completion_tokens[debate_count + debate_idx],
                         "completion_logprobs": completion_logprobs[debate_count + debate_idx],

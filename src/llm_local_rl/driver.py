@@ -849,7 +849,9 @@ class TrainingDriver:
         )
         judge_grpo_record: dict[str, float | int] | None = None
         if self.config.train_judge_coherence_grpo:
-            judge_examples, judge_grpo_record = assemble_judge_coherence_grpo_examples(debates)
+            judge_examples, judge_grpo_record = assemble_judge_coherence_grpo_examples(
+                debates, reward_mode=self.config.judge_grpo_reward_mode
+            )
             grouped.setdefault("judge", []).extend(judge_examples)
         projection_record: dict[str, object] = {
             "source_exact_shared_equivalent": False,
@@ -859,7 +861,12 @@ class TrainingDriver:
             "num_debates": len(debates),
         }
         if judge_grpo_record is not None:
-            projection_record["judge_coherence_grpo"] = judge_grpo_record
+            projection_record["judge_grpo"] = judge_grpo_record
+            projection_record[
+                "judge_label_grpo"
+                if self.config.judge_grpo_reward_mode == "label"
+                else "judge_coherence_grpo"
+            ] = judge_grpo_record
         if self.config.debate_r1_reward == "judge_rejection_task":
             r1_adapter_name = self.config.debate_round_adapter_names[0]
             projection_record["r1_projection"] = {

@@ -1217,15 +1217,26 @@ def assemble_judge_coherence_grpo_examples(
     debates: list[DebateResult],
     *,
     adapter_name: str = "judge",
+    reward_mode: str = "coherence",
 ) -> tuple[list[TrainExample], dict[str, float | int]]:
     """Build one global GRPO group from both judge orderings of every debate.
 
-    Each ordering receives the pair-level raw reward: +1 for referent-coherent
-    forward/reverse verdicts and -1 otherwise. Population z-scoring is performed
-    once across all judgments, deliberately not within each equal-reward pair.
+    coherence mode: each ordering receives the pair-level raw reward, +1 for
+    referent-coherent forward/reverse verdicts and -1 otherwise.
+
+    label mode: each ordering receives a per-judgment raw reward from the
+    ground-truth trajectory rewards, +1 when that ordering's sampled verdict
+    selects the gold referent and -1 otherwise (INVALID verdicts score -1;
+    reward ties score 0 for both orderings).
+
+    Population z-scoring is performed once across all judgments, deliberately
+    not within each equal-reward pair.
     """
-    turns: list[tuple[DebateResult, dict[str, Any], float]] = []
+    if reward_mode not in ("coherence", "label"):
+        raise ValueError(f"unsupported judge GRPO reward mode: {reward_mode!r}")
+    turns: list[tuple[DebateResult, dict[str, Any], float, str | None, str]] = []
     coherent_debates = 0
+    label_correct_judgments = 0
     for debate in debates:
         audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
         if audit.get("bidirectional_judge") is not True:
@@ -1235,25 +1246,53 @@ def assemble_judge_coherence_grpo_examples(
             raise ValueError("judge coherence GRPO requires exactly two sampled judgment turns per debate")
         coherent = audit.get("order_invariant") is True
         coherent_debates += int(coherent)
-        reward = 1.0 if coherent else -1.0
-        for turn in training_turns:
-            if not isinstance(turn, dict):
-                raise ValueError("judge training turn must be a mapping")
-            turns.append((debate, turn, reward))
+        if reward_mode == "coherence":
+            pair_reward = 1.0 if coherent else -1.0
+            for turn in training_turns:
+                if not isinstance(turn, dict):
+                    raise ValueError("judge training turn must be a mapping")
+                turns.append((debate, turn, pair_reward, None, "INVALID"))
+        else:
+            reward_a = float(debate.trajectory_a.metrics["task_reward"])
+            reward_b = float(debate.trajectory_b.metrics["task_reward"])
+            gold_agent = "A" if reward_a > reward_b else "B" if reward_b > reward_a else None
+            for turn in training_turns:
+                if not isinstance(turn, dict):
+                    raise ValueError("judge training turn must be a mapping")
+                verdict = turn.get("verdict")
+                if turn.get("order") == "reverse":
+                    verdict = "B" if verdict == "A" else "A" if verdict == "B" else "INVALID"
+                if gold_agent is None:
+                    reward = 0.0
+                else:
+                    reward = 1.0 if verdict == gold_agent else -1.0
+                label_correct_judgments += int(reward > 0.0)
+                turns.append((debate, turn, reward, gold_agent, str(verdict)))
 
-    rewards = [reward for _debate, _turn, reward in turns]
+    rewards = [reward for _debate, _turn, reward, _gold_agent, _verdict in turns]
     if not rewards:
         return [], {
             "judge_grpo_group_size": 0,
             "judge_grpo_reward_mean": 0.0,
             "judge_grpo_reward_std": 0.0,
             "judge_grpo_coherent_debates": 0,
+            "judge_grpo_incoherent_debates": 0,
+            "judge_grpo_reward_mode": reward_mode,
+            **(
+                {
+                    "judge_grpo_label_correct_judgments": 0,
+                    "judge_grpo_label_total_judgments": 0,
+                    "judge_grpo_label_accuracy": 0.0,
+                }
+                if reward_mode == "label"
+                else {}
+            ),
         }
     reward_mean = sum(rewards) / len(rewards)
     reward_var = sum((reward - reward_mean) ** 2 for reward in rewards) / len(rewards)
     reward_std = math.sqrt(reward_var)
     examples: list[TrainExample] = []
-    for judgment_index, (debate, turn, reward) in enumerate(turns):
+    for judgment_index, (debate, turn, reward, gold_agent, referent_verdict) in enumerate(turns):
         prompt_tokens = list(turn.get("prompt_tokens", []))
         completion_tokens = list(turn.get("completion_tokens", []))
         completion_logprobs = [float(value) for value in turn.get("completion_logprobs", [])]
@@ -1269,11 +1308,31 @@ def assemble_judge_coherence_grpo_examples(
             completion_logprob_mask=[1] * len(completion_tokens),
             completion_advantages=[zscore / len(completion_tokens)] * len(completion_tokens),
             metadata={
-                "reason": "judge_bidirectional_coherence_grpo",
+                "reason": (
+                    "judge_bidirectional_label_grpo"
+                    if reward_mode == "label"
+                    else "judge_bidirectional_coherence_grpo"
+                ),
+                "judge_grpo_reward_mode": reward_mode,
                 "question": debate.question[:100],
                 "judge_order": turn.get("order"),
-                "judge_coherent": reward > 0.0,
-                "judge_coherence_reward": reward,
+                "judge_order_invariant": (
+                    debate.judge_raw_response.get("order_invariant") is True
+                    if isinstance(debate.judge_raw_response, dict)
+                    else False
+                ),
+                **(
+                    {
+                        "judge_coherence_reward": reward,
+                    }
+                    if reward_mode == "coherence"
+                    else {
+                        "judge_label_gold_agent": gold_agent,
+                        "judge_label_referent_verdict": referent_verdict,
+                        "judge_label_correct": reward > 0.0,
+                        "judge_label_reward": reward,
+                    }
+                ),
                 "judge_grpo_group_index": 0,
                 "judge_grpo_group_size": len(turns),
                 "judge_grpo_reward_mean": reward_mean,
@@ -1289,6 +1348,16 @@ def assemble_judge_coherence_grpo_examples(
         "judge_grpo_reward_std": reward_std,
         "judge_grpo_coherent_debates": coherent_debates,
         "judge_grpo_incoherent_debates": len(debates) - coherent_debates,
+        "judge_grpo_reward_mode": reward_mode,
+        **(
+            {
+                "judge_grpo_label_correct_judgments": label_correct_judgments,
+                "judge_grpo_label_total_judgments": len(turns),
+                "judge_grpo_label_accuracy": label_correct_judgments / len(turns),
+            }
+            if reward_mode == "label"
+            else {}
+        ),
     }
 
 

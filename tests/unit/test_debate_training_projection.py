@@ -20,12 +20,14 @@ def _judge_turns(offset: int = 0) -> list[dict[str, object]]:
     return [
         {
             "order": "forward",
+            "verdict": "A",
             "prompt_tokens": [101 + offset, 102 + offset],
             "completion_tokens": [103 + offset, 104 + offset],
             "completion_logprobs": [-0.1, -0.2],
         },
         {
             "order": "reverse",
+            "verdict": "B",
             "prompt_tokens": [201 + offset, 202 + offset],
             "completion_tokens": [203 + offset, 204 + offset],
             "completion_logprobs": [-0.3, -0.4],
@@ -61,6 +63,7 @@ def test_judge_coherence_grpo_normalizes_across_all_judgments() -> None:
         "judge_grpo_reward_std": 1.0,
         "judge_grpo_coherent_debates": 1,
         "judge_grpo_incoherent_debates": 1,
+        "judge_grpo_reward_mode": "coherence",
     }
     assert [example.metadata["judge_coherence_reward"] for example in examples] == [1.0, 1.0, -1.0, -1.0]
     assert [example.metadata["judge_grpo_zscore"] for example in examples] == [1.0, 1.0, -1.0, -1.0]
@@ -82,6 +85,93 @@ def test_judge_coherence_grpo_pairwise_normalization_would_not_be_used() -> None
     examples, metrics = assemble_judge_coherence_grpo_examples(debates)
     assert metrics["judge_grpo_reward_std"] == 0.0
     assert all(not any(example.advantages) for example in examples)
+
+
+def test_judge_label_grpo_scores_each_display_order_against_gold_referent() -> None:
+    correct_b = _make_debate(
+        reward_a=0.0,
+        reward_b=1.0,
+        judge_raw_response={
+            "bidirectional_judge": True,
+            "order_invariant": False,
+            "_training_judge_turns": [
+                {
+                    **_judge_turns()[0],
+                    "verdict": "B",  # forward display selects original B: correct
+                },
+                {
+                    **_judge_turns()[1],
+                    "verdict": "B",  # reverse display selects original A: wrong
+                },
+            ],
+        },
+    )
+
+    examples, metrics = assemble_judge_coherence_grpo_examples(
+        [correct_b], reward_mode="label"
+    )
+
+    assert len(examples) == 2
+    assert metrics == {
+        "judge_grpo_group_size": 2,
+        "judge_grpo_reward_mean": 0.0,
+        "judge_grpo_reward_std": 1.0,
+        "judge_grpo_coherent_debates": 0,
+        "judge_grpo_incoherent_debates": 1,
+        "judge_grpo_reward_mode": "label",
+        "judge_grpo_label_correct_judgments": 1,
+        "judge_grpo_label_total_judgments": 2,
+        "judge_grpo_label_accuracy": 0.5,
+    }
+    assert [example.metadata["judge_label_reward"] for example in examples] == [1.0, -1.0]
+    assert [example.metadata["judge_label_referent_verdict"] for example in examples] == ["B", "A"]
+    assert [example.metadata["judge_label_correct"] for example in examples] == [True, False]
+    assert all(example.metadata["judge_order_invariant"] is False for example in examples)
+    assert all("judge_coherence_reward" not in example.metadata for example in examples)
+    assert [example.advantages[-2:] for example in examples] == [[0.5, 0.5], [-0.5, -0.5]]
+
+
+def test_judge_label_grpo_invalid_verdict_scores_negative() -> None:
+    invalid = _make_debate(
+        reward_a=1.0,
+        reward_b=0.0,
+        judge_raw_response={
+            "bidirectional_judge": True,
+            "order_invariant": False,
+            "_training_judge_turns": [
+                {**_judge_turns()[0], "verdict": "INVALID"},
+                {**_judge_turns()[1], "verdict": "B"},  # reverse maps to original A
+            ],
+        },
+    )
+    examples, metrics = assemble_judge_coherence_grpo_examples([invalid], reward_mode="label")
+    assert metrics["judge_grpo_label_correct_judgments"] == 1
+    assert [example.metadata["judge_label_reward"] for example in examples] == [-1.0, 1.0]
+
+
+def test_judge_label_grpo_reward_ties_score_zero() -> None:
+    tied = _make_debate(
+        reward_a=1.0,
+        reward_b=1.0,
+        judge_raw_response={
+            "bidirectional_judge": True,
+            "order_invariant": False,
+            "_training_judge_turns": [
+                {**_judge_turns()[0], "verdict": "INVALID"},
+                {**_judge_turns()[1], "verdict": "A"},
+            ],
+        },
+    )
+    examples, metrics = assemble_judge_coherence_grpo_examples([tied], reward_mode="label")
+    assert metrics["judge_grpo_reward_std"] == 0.0
+    assert metrics["judge_grpo_label_correct_judgments"] == 0
+    assert [example.metadata["judge_label_reward"] for example in examples] == [0.0, 0.0]
+    assert all(not any(example.advantages) for example in examples)
+
+
+def test_judge_label_grpo_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="unsupported judge GRPO reward mode"):
+        assemble_judge_coherence_grpo_examples([], reward_mode="unknown")
 
 
 def _make_debate(

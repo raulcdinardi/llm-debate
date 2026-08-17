@@ -96,6 +96,7 @@ class TrainRunConfig:
     debate_judge_seed: int | None = None
     debate_judge_bidirectional: bool = False
     train_judge_coherence_grpo: bool = False
+    judge_grpo_reward_mode: str = "coherence"
     debate_round_adapter_names: tuple[str, ...] = ("solution", "debate", "debate")
     debate_prompt_format: str = "chat"
     debate_stop_on_concluded: bool = False
@@ -262,6 +263,8 @@ class TrainRunConfig:
             if self.rollout.mode != "debate" or self.debate_rounds != 3:
                 raise ValueError("bidirectional judge sampling requires a complete three-round debate")
         if self.train_judge_coherence_grpo:
+            if self.judge_grpo_reward_mode not in ("coherence", "label"):
+                raise ValueError("judge_grpo_reward_mode must be 'coherence' or 'label'")
             if not self.debate_judge_bidirectional:
                 raise ValueError("judge coherence GRPO requires bidirectional judge sampling")
             if self.debate_judge_adapter != "judge":
@@ -362,6 +365,7 @@ class TrainRunConfig:
             debate_judge_seed=data.get("debate_judge_seed"),
             debate_judge_bidirectional=bool(data.get("debate_judge_bidirectional", False)),
             train_judge_coherence_grpo=bool(data.get("train_judge_coherence_grpo", False)),
+            judge_grpo_reward_mode=str(data.get("judge_grpo_reward_mode", "coherence")),
             debate_round_adapter_names=tuple(data.get("debate_round_adapter_names", ("solution", "debate", "debate"))),
             debate_prompt_format=data.get("debate_prompt_format", "chat"),
             debate_stop_on_concluded=data.get("debate_stop_on_concluded", False),
