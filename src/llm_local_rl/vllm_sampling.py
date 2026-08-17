@@ -415,7 +415,6 @@ class VllmSampler:
                 float(request.repetition_penalty),
                 int(request.max_tokens),
                 tuple(int(tok) for tok in request.stop_token_ids),
-                request.seed,
             )
             grouped.setdefault(key, []).append((idx, request))
 
@@ -430,7 +429,6 @@ class VllmSampler:
             repetition_penalty,
             max_tokens,
             stop_token_ids,
-            seed,
         ), grouped_requests in grouped.items():
             behavior_policy = BehaviorPolicySpec(
                 temperature=temperature,
@@ -449,20 +447,26 @@ class VllmSampler:
                 policy=behavior_policy,
                 backend_mode=backend_mode,
             )
-            sampling_params = _build_sampling_params(
-                SamplingParams,
-                temperature=temperature,
-                top_p=top_p,
-                min_p=min_p,
-                top_k=top_k,
-                presence_penalty=presence_penalty,
-                repetition_penalty=repetition_penalty,
-                engine_logprobs_mode=self._engine_logprobs_mode,
-                max_tokens=max_tokens,
-                stop_token_ids=stop_token_ids,
-                seed=seed,
-                trace_top_logprobs=trace_top_logprobs,
-            )
+            # vLLM accepts one SamplingParams per prompt. Keep independently
+            # seeded requests in a single engine call instead of accidentally
+            # serializing the batch by including seed in the grouping key.
+            sampling_params = [
+                _build_sampling_params(
+                    SamplingParams,
+                    temperature=temperature,
+                    top_p=top_p,
+                    min_p=min_p,
+                    top_k=top_k,
+                    presence_penalty=presence_penalty,
+                    repetition_penalty=repetition_penalty,
+                    engine_logprobs_mode=self._engine_logprobs_mode,
+                    max_tokens=max_tokens,
+                    stop_token_ids=stop_token_ids,
+                    seed=request.seed,
+                    trace_top_logprobs=trace_top_logprobs,
+                )
+                for _, request in grouped_requests
+            ]
             outputs = self._llm.generate(
                 [{"prompt_token_ids": req.prompt_token_ids} for _, req in grouped_requests],
                 sampling_params=sampling_params,
