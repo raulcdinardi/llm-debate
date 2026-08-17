@@ -57,11 +57,39 @@ def test_mmlu_pair_expansion_creates_both_answer_orderings(tmp_path) -> None:
         assert reward.reward == float(inst.payload["is_correct"])
 
 
-def test_mmlu_pair_task_requires_two_mirrored_debates_per_question(tmp_path) -> None:
+def test_mmlu_pair_expansion_allows_one_debate_per_question(tmp_path) -> None:
     task = MMLUProPairwiseDebateTask(data_path=str(_write_corpus(tmp_path)))
     base = task.sample_instances(n=1, seed=1)[0]
-    with pytest.raises(ValueError, match="multiple of 4"):
-        task.expand_group_instances(inst=base, group_size=2, seed=1)
+    expanded = task.expand_group_instances(inst=base, group_size=2, seed=5)
+
+    assert len(expanded) == 2
+    assert [inst.payload["agent"] for inst in expanded] == ["A", "B"]
+    assert [inst.payload["ordering_index"] for inst in expanded] == [0, 0]
+    assert sum(bool(inst.payload["is_correct"]) for inst in expanded) == 1
+    gold = {inst.payload["gold_agent"] for inst in expanded}
+    assert gold == {"A"} or gold == {"B"}
+    correct = [inst for inst in expanded if inst.payload["is_correct"]][0]
+    assert correct.payload["agent"] == correct.payload["gold_agent"]
+    for inst in expanded:
+        assert task.fixed_r1_completion_text(inst=inst) == inst.payload["fixed_answer"]
+
+
+def test_mmlu_pair_expansion_single_debate_position_is_seed_balanced(tmp_path) -> None:
+    task = MMLUProPairwiseDebateTask(data_path=str(_write_corpus(tmp_path)))
+    base = task.sample_instances(n=1, seed=1)[0]
+    golds = {
+        task.expand_group_instances(inst=base, group_size=2, seed=step)[0].payload["gold_agent"]
+        for step in range(12)
+    }
+    assert golds == {"A", "B"}
+
+
+def test_mmlu_pair_task_rejects_unsupported_group_sizes(tmp_path) -> None:
+    task = MMLUProPairwiseDebateTask(data_path=str(_write_corpus(tmp_path)))
+    base = task.sample_instances(n=1, seed=1)[0]
+    for group_size in (1, 3, 6):
+        with pytest.raises(ValueError, match="group_size=2"):
+            task.expand_group_instances(inst=base, group_size=group_size, seed=1)
 
 
 def test_mmlu_pair_expansion_balances_four_debates_in_group_of_eight(tmp_path) -> None:

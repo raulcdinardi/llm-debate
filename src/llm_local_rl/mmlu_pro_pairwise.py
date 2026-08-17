@@ -63,15 +63,19 @@ class MMLUProPairwiseDebateTask:
         group_size: int,
         seed: int | None,
     ) -> list[TaskInstance]:
-        if group_size < 4 or group_size % 4 != 0:
-            raise ValueError(
-                "mmlu_pro_pairwise requires group_size to be a positive multiple of 4 "
-                "(balanced independently generated debates with mirrored answer orderings)"
-            )
         rng = random.Random(seed)
         first_correct_is_a = bool(rng.getrandbits(1))
         expanded: list[TaskInstance] = []
-        orderings = (first_correct_is_a, not first_correct_is_a) * (group_size // 4)
+        if group_size == 2:
+            orderings = (first_correct_is_a,)
+        elif group_size >= 4 and group_size % 4 == 0:
+            orderings = (first_correct_is_a, not first_correct_is_a) * (group_size // 4)
+        else:
+            raise ValueError(
+                "mmlu_pro_pairwise requires group_size=2 (one independently generated "
+                "debate with a seeded answer ordering) or a positive multiple of 4 "
+                "(balanced independently generated debates with mirrored answer orderings)"
+            )
         for ordering_index, correct_is_a in enumerate(orderings):
             answers = [
                 (str(inst.payload["correct_answer"]), True),
