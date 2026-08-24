@@ -19,7 +19,8 @@ RUN python3 -m pip install --upgrade pip && \
       "pytest==9.1.1" \
       "safetensors==0.8.0" \
       "tokenizers==0.22.2" \
-      "transformers==5.14.1"
+      "transformers==5.14.1" \
+      "wandb>=0.19.10,<0.24"
 
 COPY pyproject.toml README.md ./
 COPY src ./src

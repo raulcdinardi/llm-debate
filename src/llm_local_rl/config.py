@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import json
 import math
+import os
 from pathlib import Path
 
 from llm_local_rl.behavior_policy import BehaviorPolicySpec
@@ -145,6 +146,18 @@ class TrainRunConfig:
     trace_top_logprobs: int = 5
     resource_logging: bool = True
     resource_log_interval_s: float = 5.0
+    wandb_enabled: bool = True
+    wandb_project: str = "llm-local-rl"
+    wandb_entity: str | None = None
+    wandb_group: str | None = None
+    wandb_run_name: str | None = None
+    wandb_mode: str = "online"
+    wandb_upload_artifacts: bool = True
+    adapter_checkpoint_every: int = 10
+    optimizer_checkpoint_every: int = 50
+    rollout_shard_every: int = 10
+    wandb_table_samples_per_shard: int = 32
+    reference_kl_every: int = 10
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -159,6 +172,20 @@ class TrainRunConfig:
         return get_judge_harness(self.debate_judge_harness)
 
     def __post_init__(self) -> None:
+        for name, value in (
+            ("adapter_checkpoint_every", self.adapter_checkpoint_every),
+            ("rollout_shard_every", self.rollout_shard_every),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.optimizer_checkpoint_every < 0:
+            raise ValueError("optimizer_checkpoint_every must be non-negative")
+        if self.wandb_table_samples_per_shard < 0:
+            raise ValueError("wandb_table_samples_per_shard must be non-negative")
+        if self.reference_kl_every < 0:
+            raise ValueError("reference_kl_every must be non-negative")
+        if self.wandb_mode not in ("online", "offline", "disabled"):
+            raise ValueError("wandb_mode must be online, offline, or disabled")
         if self.sampler_teardown_before_training and self.sampler_sleep_before_training:
             raise ValueError(
                 "sampler_teardown_before_training and sampler_sleep_before_training "
@@ -416,10 +443,25 @@ class TrainRunConfig:
             trace_top_logprobs=data.get("trace_top_logprobs", 5),
             resource_logging=data.get("resource_logging", True),
             resource_log_interval_s=data.get("resource_log_interval_s", 5.0),
+            wandb_enabled=data.get("wandb_enabled", True),
+            wandb_project=data.get("wandb_project", "llm-local-rl"),
+            wandb_entity=data.get("wandb_entity"),
+            wandb_group=data.get("wandb_group"),
+            wandb_run_name=data.get("wandb_run_name"),
+            wandb_mode=data.get("wandb_mode", "online"),
+            wandb_upload_artifacts=data.get("wandb_upload_artifacts", True),
+            adapter_checkpoint_every=data.get("adapter_checkpoint_every", 10),
+            optimizer_checkpoint_every=data.get("optimizer_checkpoint_every", 50),
+            rollout_shard_every=data.get("rollout_shard_every", 10),
+            wandb_table_samples_per_shard=data.get("wandb_table_samples_per_shard", 32),
+            reference_kl_every=data.get("reference_kl_every", 10),
         )
 
     def write_json(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(self.to_dict(), indent=2))
+        path = Path(path)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(self.to_dict(), indent=2))
+        os.replace(temporary, path)
 
 
 @dataclass(frozen=True)
@@ -428,9 +470,14 @@ class CheckpointManifest:
     current_step: int
     adapter_dirs: dict[str, str]
     step_records_path: str
+    exact_resume_checkpoint: str | None = None
+    reference_adapter_dirs: dict[str, str] | None = None
 
     def write_json(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(asdict(self), indent=2))
+        path = Path(path)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(asdict(self), indent=2))
+        os.replace(temporary, path)
 
     @classmethod
     def read_json(cls, path: str | Path) -> "CheckpointManifest":

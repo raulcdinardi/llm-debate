@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import math
 from pathlib import Path
+import re
+from statistics import mean, pstdev
 
 import torch
 import torch.nn.functional as F
@@ -458,6 +460,7 @@ class MultiAdapterTrainer:
         self.saved_adapter_dirs: dict[AdapterName, str] = {}
         self.single_target_parameter_adapter_mode = False
         self.loaded_adapter_name: AdapterName | None = None
+        self.reference_adapter_names: dict[str, str] = {}
         _patch_weight_converter_compat()
         self.model = self._build_new_model()
         self.optimizer = self._build_optimizer()
@@ -540,6 +543,7 @@ class MultiAdapterTrainer:
         trainer.saved_adapter_dirs = dict(adapter_dirs)
         trainer.single_target_parameter_adapter_mode = _uses_target_parameter_adapters(adapter_dirs=adapter_dirs)
         trainer.loaded_adapter_name = None
+        trainer.reference_adapter_names = {}
         _patch_weight_converter_compat()
         first_name = config.adapter_names[0]
         first_dir = adapter_dirs[first_name]
@@ -623,6 +627,64 @@ class MultiAdapterTrainer:
                 if torch.is_tensor(value):
                     state[key] = value.to(torch.device(device))
 
+    def _selected_layer_optimizer_metrics(self) -> dict[str, float]:
+        """Cheap scalar diagnostics for representative trainable LoRA layers."""
+        named = [(name, param) for name, param in self.model.named_parameters() if param.requires_grad]
+        layer_ids = sorted(
+            {
+                int(match.group(1))
+                for name, _ in named
+                if (match := re.search(r"(?:layers|blocks)\.(\d+)\.", name)) is not None
+            }
+        )
+        selected: dict[int, str] = {}
+        if layer_ids:
+            last = layer_ids[-1]
+            targets = ((0.0, "first"), (0.25, "depth25"), (0.50, "depth50"), (0.75, "depth75"), (1.0, "final"))
+            for fraction, label in targets:
+                selected[min(layer_ids, key=lambda value: abs(value - fraction * last))] = label
+
+        accum: dict[str, dict[str, float]] = {}
+        for name, param in named:
+            lower = name.lower()
+            group = None
+            if "embed" in lower:
+                group = "embedding"
+            elif "lm_head" in lower:
+                group = "lm_head"
+            else:
+                match = re.search(r"(?:layers|blocks)\.(\d+)\.", name)
+                if match is not None:
+                    group = selected.get(int(match.group(1)))
+            if group is None:
+                continue
+            bucket = accum.setdefault(
+                group,
+                {"grad_sq": 0.0, "grad_max": 0.0, "param_sq": 0.0, "m1_sq": 0.0, "m2_sq": 0.0},
+            )
+            bucket["param_sq"] += float(param.detach().float().square().sum().cpu().item())
+            if param.grad is not None:
+                grad = param.grad.detach().float()
+                bucket["grad_sq"] += float(grad.square().sum().cpu().item())
+                bucket["grad_max"] = max(bucket["grad_max"], float(grad.abs().max().cpu().item()))
+            state = self.optimizer.state.get(param, {})
+            if torch.is_tensor(state.get("exp_avg")):
+                bucket["m1_sq"] += float(state["exp_avg"].detach().float().square().sum().cpu().item())
+            if torch.is_tensor(state.get("exp_avg_sq")):
+                bucket["m2_sq"] += float(state["exp_avg_sq"].detach().float().square().sum().cpu().item())
+        out: dict[str, float] = {}
+        lr = float(self.optimizer.param_groups[0]["lr"])
+        for group, values in accum.items():
+            prefix = f"selected_layer/{group}"
+            param_norm = math.sqrt(values["param_sq"])
+            m1_norm = math.sqrt(values["m1_sq"])
+            out[f"{prefix}/grad_norm_after_global_clip"] = math.sqrt(values["grad_sq"])
+            out[f"{prefix}/grad_max_abs_after_global_clip"] = values["grad_max"]
+            out[f"{prefix}/adam_first_moment_norm"] = m1_norm
+            out[f"{prefix}/adam_second_moment_norm"] = math.sqrt(values["m2_sq"])
+            out[f"{prefix}/relative_update_proxy"] = lr * m1_norm / max(param_norm, 1e-30)
+        return out
+
     def wake_up(self) -> None:
         if self.current_device == self.compute_device:
             return
@@ -653,6 +715,17 @@ class MultiAdapterTrainer:
         self.model.set_adapter(adapter_name)
         self.loaded_adapter_name = adapter_name
         self.optimizer = self._build_optimizer()
+
+    def load_reference_adapters(self, *, adapter_dirs: dict[str, str]) -> None:
+        """Load frozen initialization adapters for periodic sampled-token KL."""
+        if self.single_target_parameter_adapter_mode:
+            self.reference_adapter_names = {}
+            return
+        for logical_name, adapter_dir in sorted(adapter_dirs.items()):
+            reference_name = f"reference__{logical_name}"
+            if reference_name not in self.model.peft_config:
+                self.model.load_adapter(adapter_dir, adapter_name=reference_name, is_trainable=False)
+            self.reference_adapter_names[logical_name] = reference_name
 
     def compute_logprobs(self, *, adapter_name: AdapterName, batch: list[TrainExample]) -> list[list[float]]:
         self.wake_up()
@@ -734,7 +807,13 @@ class MultiAdapterTrainer:
         self.model.train()
         return out
 
-    def train_batch(self, *, adapter_name: AdapterName, batch: list[TrainExample]) -> dict[str, object]:
+    def train_batch(
+        self,
+        *,
+        adapter_name: AdapterName,
+        batch: list[TrainExample],
+        measure_reference_kl: bool = False,
+    ) -> dict[str, object]:
         if len(batch) == 0:
             return {
                 "loss": 0.0,
@@ -769,6 +848,13 @@ class MultiAdapterTrainer:
             )
 
         self.wake_up()
+        reference_rows_by_example: dict[int, list[float]] = {}
+        reference_name = self.reference_adapter_names.get(adapter_name)
+        if measure_reference_kl and reference_name is not None:
+            reference_rows = self.compute_logprobs(adapter_name=reference_name, batch=trainable_batch)
+            reference_rows_by_example = {
+                id(example): row for example, row in zip(trainable_batch, reference_rows, strict=True)
+            }
         self.set_adapter(adapter_name)
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
@@ -799,7 +885,12 @@ class MultiAdapterTrainer:
         on_policy_trained_sum_abs_diff = 0.0
         on_policy_trained_max_abs_diff = 0.0
         ratio_values: list[float] = []
+        delta_logp_values: list[float] = []
+        advantage_values: list[float] = []
+        reference_delta_logp_values: list[float] = []
         clip_count = 0
+        clip_high_count = 0
+        clip_low_count = 0
         positive_adv_clip_count = 0
         negative_adv_clip_count = 0
         positive_adv_count = 0
@@ -1035,6 +1126,29 @@ class MultiAdapterTrainer:
                 continue
 
             old_logprobs = tensors["old_logprobs"][trained_positions]
+            if reference_rows_by_example:
+                reference_examples = [
+                    replace(example, old_logprobs=reference_rows_by_example[id(example)])
+                    for example in minibatch
+                ]
+                reference_tensors = _pad_batch(
+                    batch=reference_examples,
+                    pad_token_id=int(self.tokenizer.pad_token_id),
+                    device=self.current_device,
+                    max_tokens=self.config.train_max_tokens,
+                )
+                reference_selected = reference_tensors["old_logprobs"][trained_positions]
+                reference_delta_logp_values.extend(
+                    (selected_logprobs.detach().float() - reference_selected.detach().float()).cpu().tolist()
+                )
+            nonfinite_logprobs = int((~torch.isfinite(selected_logprobs)).sum().detach().cpu().item())
+            nonfinite_old_logprobs = int((~torch.isfinite(old_logprobs)).sum().detach().cpu().item())
+            if nonfinite_logprobs or nonfinite_old_logprobs:
+                self.optimizer.zero_grad(set_to_none=True)
+                raise FloatingPointError(
+                    "Non-finite policy logprobs before PPO backward: "
+                    f"current={nonfinite_logprobs}, old={nonfinite_old_logprobs}."
+                )
             ratio = torch.exp(selected_logprobs - old_logprobs)
             clipped_ratio = torch.clamp(
                 ratio,
@@ -1045,9 +1159,17 @@ class MultiAdapterTrainer:
             with torch.no_grad():
                 ratio_detached = ratio.detach().float()
                 ratio_values.extend(ratio_detached.cpu().tolist())
+                delta_logp_values.extend((selected_logprobs.detach().float() - old_logprobs.detach().float()).cpu().tolist())
+                advantage_values.extend(advantages.detach().float().cpu().tolist())
                 clipped_positions = (
                     (ratio_detached < (1.0 - self.config.ppo_clip_epsilon))
                     | (ratio_detached > (1.0 + self.config.ppo_clip_epsilon))
+                )
+                clip_high_count += int(
+                    (ratio_detached > (1.0 + self.config.ppo_clip_epsilon)).sum().detach().cpu().item()
+                )
+                clip_low_count += int(
+                    (ratio_detached < (1.0 - self.config.ppo_clip_epsilon)).sum().detach().cpu().item()
                 )
                 positive_adv_positions = advantages.detach() > 0.0
                 negative_adv_positions = advantages.detach() < 0.0
@@ -1063,6 +1185,9 @@ class MultiAdapterTrainer:
                 entropy_sum += selected_entropy_sum
             objective = torch.minimum(ratio * advantages, clipped_ratio * advantages)
             loss = torch.sum(-objective) / normalization_sample_count
+            if not bool(torch.isfinite(loss).detach().cpu().item()):
+                self.optimizer.zero_grad(set_to_none=True)
+                raise FloatingPointError("Non-finite PPO loss before backward.")
             if self._mem_trace_active():
                 reset_peak(self.compute_device)
                 _mem_t_backward = now_seconds()
@@ -1185,6 +1310,18 @@ class MultiAdapterTrainer:
             }
 
         grad_params = [param for param in self.model.parameters() if param.requires_grad and param.grad is not None]
+        nonfinite_gradient_count = sum(
+            int((~torch.isfinite(param.grad)).sum().detach().cpu().item()) for param in grad_params
+        )
+        if nonfinite_gradient_count:
+            self.optimizer.zero_grad(set_to_none=True)
+            raise FloatingPointError(
+                f"Non-finite gradients before optimizer step: {nonfinite_gradient_count}."
+            )
+        grad_max_abs = max(
+            (float(param.grad.detach().abs().max().cpu().item()) for param in grad_params),
+            default=0.0,
+        )
         if grad_params:
             clip_limit = self.config.max_grad_norm if self.config.max_grad_norm > 0.0 else math.inf
             grad_norm = float(
@@ -1195,6 +1332,7 @@ class MultiAdapterTrainer:
         if self._mem_trace_active():
             reset_peak(self.compute_device)
         self.optimizer.step()
+        selected_layer_metrics = self._selected_layer_optimizer_metrics()
         if self._mem_trace_active():
             alloc_after_optim = current_alloc_bytes(self.compute_device)
             peak_after_optim = peak_alloc_bytes(self.compute_device)
@@ -1220,6 +1358,10 @@ class MultiAdapterTrainer:
             )
 
         sorted_ratios = sorted(ratio_values)
+        sorted_delta_logp_abs = sorted(abs(value) for value in delta_logp_values)
+        sorted_sampled_old_kl = sorted(-value for value in delta_logp_values)
+        sorted_advantages = sorted(advantage_values)
+        sorted_reference_delta = sorted(reference_delta_logp_values)
 
         def _percentile(sorted_values: list[float], q: float) -> float:
             if not sorted_values:
@@ -1235,10 +1377,21 @@ class MultiAdapterTrainer:
             "num_dropped_overlength": float(num_dropped_overlength),
             "num_trained_tokens": float(total_trained_tokens),
             "approx_kl": approx_kl_numerator / total_trained_tokens,
+            "ppo_sampled_approx_kl": (
+                sum((ratio - 1.0) - math.log(max(ratio, 1e-30)) for ratio in ratio_values)
+                / len(ratio_values)
+                if ratio_values else 0.0
+            ),
             "ratio_mean": float(sum(ratio_values) / len(ratio_values)) if ratio_values else 0.0,
+            "ratio_p01": _percentile(sorted_ratios, 0.01),
+            "ratio_p05": _percentile(sorted_ratios, 0.05),
             "ratio_p95": _percentile(sorted_ratios, 0.95),
             "ratio_p99": _percentile(sorted_ratios, 0.99),
+            "ratio_p999": _percentile(sorted_ratios, 0.999),
+            "ratio_max": max(ratio_values) if ratio_values else 0.0,
             "clipfrac": clip_count / total_trained_tokens,
+            "clipfrac_high": clip_high_count / total_trained_tokens,
+            "clipfrac_low": clip_low_count / total_trained_tokens,
             "clipfrac_positive_advantage": (
                 positive_adv_clip_count / positive_adv_count if positive_adv_count > 0 else 0.0
             ),
@@ -1247,6 +1400,50 @@ class MultiAdapterTrainer:
             ),
             "entropy": entropy_sum / total_trained_tokens,
             "grad_norm": grad_norm,
+            "grad_was_clipped": float(self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm),
+            "grad_max_abs": grad_max_abs,
+            "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
+            "nonfinite_loss_count": 0.0,
+            "nonfinite_logprob_count": 0.0,
+            "nonfinite_gradient_count": 0.0,
+            "delta_logp_mean_abs": (
+                sum(abs(value) for value in delta_logp_values) / len(delta_logp_values)
+                if delta_logp_values else 0.0
+            ),
+            "delta_logp_abs_p95": _percentile(sorted_delta_logp_abs, 0.95),
+            "delta_logp_abs_p99": _percentile(sorted_delta_logp_abs, 0.99),
+            "delta_logp_abs_p999": _percentile(sorted_delta_logp_abs, 0.999),
+            "delta_logp_max_abs": max((abs(value) for value in delta_logp_values), default=0.0),
+            "sampled_old_policy_kl_p50": _percentile(sorted_sampled_old_kl, 0.50),
+            "sampled_old_policy_kl_p95": _percentile(sorted_sampled_old_kl, 0.95),
+            "sampled_old_policy_kl_p99": _percentile(sorted_sampled_old_kl, 0.99),
+            "sampled_old_policy_kl_p999": _percentile(sorted_sampled_old_kl, 0.999),
+            "sampled_old_policy_kl_max": max(sorted_sampled_old_kl, default=0.0),
+            "reference_sampled_kl_mean": (
+                mean(reference_delta_logp_values) if reference_delta_logp_values else 0.0
+            ),
+            "reference_sampled_delta_logp_max_abs": max(
+                (abs(value) for value in reference_delta_logp_values), default=0.0
+            ),
+            "reference_sampled_kl_max": max(reference_delta_logp_values, default=0.0),
+            "reference_sampled_delta_logp_p95": _percentile(sorted_reference_delta, 0.95),
+            "reference_kl_measured": float(bool(reference_delta_logp_values)),
+            "advantage_mean": mean(advantage_values) if advantage_values else 0.0,
+            "advantage_std": pstdev(advantage_values) if len(advantage_values) > 1 else 0.0,
+            "advantage_max_abs": max((abs(value) for value in advantage_values), default=0.0),
+            "advantage_fraction_positive": (
+                sum(value > 0.0 for value in advantage_values) / len(advantage_values)
+                if advantage_values else 0.0
+            ),
+            "advantage_fraction_negative": (
+                sum(value < 0.0 for value in advantage_values) / len(advantage_values)
+                if advantage_values else 0.0
+            ),
+            "advantage_p01": _percentile(sorted_advantages, 0.01),
+            "advantage_p05": _percentile(sorted_advantages, 0.05),
+            "advantage_p95": _percentile(sorted_advantages, 0.95),
+            "advantage_p99": _percentile(sorted_advantages, 0.99),
+            "advantage_p999": _percentile(sorted_advantages, 0.999),
             "weight_decay": float(self.config.weight_decay),
             "max_grad_norm": float(self.config.max_grad_norm),
             "num_forward_input_tokens": float(total_forward_input_tokens),
@@ -1306,6 +1503,7 @@ class MultiAdapterTrainer:
                 else 0.0
             ),
             "on_policy_logprob_max_abs_diff": float(on_policy_max_abs_diff),
+            **selected_layer_metrics,
         }
 
     def save_adapter(self, *, adapter_name: AdapterName, output_dir: str) -> str:
@@ -1318,6 +1516,33 @@ class MultiAdapterTrainer:
         saved_path = str(output_path / adapter_name)
         self.saved_adapter_dirs[adapter_name] = saved_path
         return saved_path
+
+    def training_state_dict(self) -> dict[str, object]:
+        """Return the non-PEFT state required for an exact optimizer resume."""
+        if self.single_target_parameter_adapter_mode:
+            raise NotImplementedError(
+                "Exact optimizer resume is not yet supported for target-parameter adapters "
+                "because switching logical adapters rebuilds the optimizer."
+            )
+        return {
+            "schema": "multi_adapter_trainer_state_v1",
+            "optimizer": self.optimizer.state_dict(),
+            "adapter_names": list(self.config.adapter_names),
+            "learning_rate": float(self.config.learning_rate),
+            "weight_decay": float(self.config.weight_decay),
+        }
+
+    def load_training_state_dict(self, state: dict[str, object]) -> None:
+        if state.get("schema") != "multi_adapter_trainer_state_v1":
+            raise ValueError(f"Unsupported trainer-state schema: {state.get('schema')!r}")
+        if tuple(state.get("adapter_names", ())) != tuple(self.config.adapter_names):
+            raise ValueError("Trainer-state adapter names do not match the configured adapters.")
+        if float(state.get("learning_rate", float("nan"))) != float(self.config.learning_rate):
+            raise ValueError("Trainer-state learning rate does not match the run configuration.")
+        if float(state.get("weight_decay", float("nan"))) != float(self.config.weight_decay):
+            raise ValueError("Trainer-state weight decay does not match the run configuration.")
+        self.optimizer.load_state_dict(state["optimizer"])
+        self._move_optimizer_state(device=self.current_device)
 
     def load_adapter(self, *, adapter_name: AdapterName, adapter_dir: str) -> None:
         if self.single_target_parameter_adapter_mode:

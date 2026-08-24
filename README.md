@@ -29,6 +29,36 @@ This avoids the previous shape where debate mechanics and task/environment logic
 
 Heavy integration tests are opt-in and require a local model path.
 
+## Default observability and recovery
+
+Training enables W&B by default (`--no-wandb` disables it) and reads
+authentication only from the environment. Local files remain canonical: every
+committed optimizer step is appended to `step_records.jsonl`, while W&B gets a
+single scalar commit at the same global step. Complete rollout records are
+published as immutable, compressed 10-step artifacts plus a small deterministic
+Table preview. A transient W&B failure is recorded under `observability/` and
+does not stop training.
+
+Trainable LoRAs are retained under `checkpoints/lora/` every 10 steps and at the
+configured final step. Intervening exports live under `.live_adapters/` only as
+rollout-engine handoff files and are removed after replacement. Every 50 steps
+and at the final step, `checkpoints/exact_resume/` receives an atomically
+published bundle containing all active adapters, AdamW state, Python/NumPy/Torch
+CPU/CUDA RNG state, configuration fingerprint, per-file hashes, and a `READY`
+marker. Resume rolls back any uncheckpointed tail and refuses to silently call
+an adapter-only state an exact resume.
+PEFT `target_parameters` adapters cannot currently be reconstructed with the
+same multi-adapter optimizer topology; such runs must explicitly use
+`--optimizer-checkpoint-every 0` until that PEFT limitation is removed.
+
+The trainer logs reward/component distributions, completion and group
+statistics, entropy and rolling changes, PPO ratios and tails, clip-high/low,
+advantages, sampled old-policy KL/logprob deltas, gradient clipping, LR,
+nonfinite counters, and representative LoRA-layer gradient/Adam diagnostics.
+Sampled-token KL to the frozen initialization is measured every 10 steps by
+default (`--reference-kl-every`; `0` disables it), since measuring it every
+step requires an additional policy forward.
+
 ## Tested vLLM lifecycle
 
 Install the pinned GPU integration stack with `pip install -e '.[integration]'`.

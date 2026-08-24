@@ -257,6 +257,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trace-top-logprobs", type=int, default=5)
     parser.add_argument("--no-resource-logging", action="store_true")
     parser.add_argument("--resource-log-interval-s", type=float, default=5.0)
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--wandb-project", default="llm-local-rl")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-group", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default="online")
+    parser.add_argument("--wandb-upload-artifacts", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--adapter-checkpoint-every", type=int, default=10)
+    parser.add_argument("--optimizer-checkpoint-every", type=int, default=50)
+    parser.add_argument("--rollout-shard-every", type=int, default=10)
+    parser.add_argument("--wandb-table-samples-per-shard", type=int, default=32)
+    parser.add_argument("--reference-kl-every", type=int, default=10, help="0 disables sampled KL to initialization.")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
 
@@ -401,6 +413,18 @@ def main() -> int:
                 trace_top_logprobs=args.trace_top_logprobs,
                 resource_logging=not args.no_resource_logging,
                 resource_log_interval_s=args.resource_log_interval_s,
+                wandb_enabled=args.wandb,
+                wandb_project=args.wandb_project,
+                wandb_entity=args.wandb_entity,
+                wandb_group=args.wandb_group,
+                wandb_run_name=args.wandb_run_name,
+                wandb_mode=args.wandb_mode,
+                wandb_upload_artifacts=args.wandb_upload_artifacts,
+                adapter_checkpoint_every=args.adapter_checkpoint_every,
+                optimizer_checkpoint_every=args.optimizer_checkpoint_every,
+                rollout_shard_every=args.rollout_shard_every,
+                wandb_table_samples_per_shard=args.wandb_table_samples_per_shard,
+                reference_kl_every=args.reference_kl_every,
             )
         )
     driver.run()

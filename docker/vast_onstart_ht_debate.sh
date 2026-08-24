@@ -209,7 +209,8 @@ install_python_deps() {
       "pytest==9.1.1" \
       "safetensors==0.8.0" \
       "tokenizers==0.22.2" \
-      "transformers==5.14.1"
+      "transformers==5.14.1" \
+      "wandb>=0.19.10,<0.24"
     if [[ "${INSTALL_VLLM:-0}" == "1" ]]; then
       python3 -m pip install --no-cache-dir "vllm==0.26.0"
     fi

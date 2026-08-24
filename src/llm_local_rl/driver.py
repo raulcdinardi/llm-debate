@@ -3,12 +3,19 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import shutil
 from statistics import mean, pstdev
 from contextlib import nullcontext
 
 from llm_local_rl.base_model_judge import RemoteBaseJudgeConfig, build_remote_base_judge
 from llm_local_rl.behavior_policy import validate_sampling_result_contract
 from llm_local_rl.config import CheckpointManifest, TrainRunConfig
+from llm_local_rl.checkpointing import (
+    checkpoint_adapter_dirs,
+    load_exact_resume_checkpoint,
+    save_exact_resume_checkpoint,
+    validate_exact_resume_checkpoint,
+)
 from llm_local_rl.debate_parity import (
     DebateConfig,
     DebateResult,
@@ -32,6 +39,7 @@ from llm_local_rl.model_io_trace import configure_model_io_tracing, trace_contex
 from llm_local_rl.qwen35_base_format import resolve_countdown_assistant_prefill
 from llm_local_rl.registry import build_debate_task, build_environment, build_episode_builder
 from llm_local_rl.resource_monitor import ResourceMonitor
+from llm_local_rl.observability import RunObservability, WandbSettings, rollback_rollout_shards
 from llm_local_rl.sglang_sampling import SglangRuntimeConfig, SglangSampler
 from llm_local_rl.types import EpisodeSample, EpisodeTurn, SamplingRequest
 from llm_local_rl.vllm_sampling import VllmRuntimeConfig, VllmSampler
@@ -40,6 +48,11 @@ from llm_local_rl.vllm_sampling import VllmRuntimeConfig, VllmSampler
 class TrainingDriver:
     def __init__(self, *, config: TrainRunConfig) -> None:
         self.config = config
+        if config.target_parameters and config.optimizer_checkpoint_every > 0:
+            raise ValueError(
+                "Exact optimizer checkpointing is not supported for PEFT target_parameters; "
+                "use target_modules or explicitly set optimizer_checkpoint_every=0."
+            )
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.resource_monitor = ResourceMonitor(
@@ -66,6 +79,8 @@ class TrainingDriver:
         self.start_step = 0
         self.step_records_path = self.output_dir / "step_records.jsonl"
         self.summary_path = self.output_dir / "summary.json"
+        self.latest_exact_resume_checkpoint: str | None = None
+        self._metric_history: dict[str, list[float]] = {}
         self.current_adapter_dirs = {
             name: str(self.output_dir / f"adapter_init_{name}")
             for name in self._adapter_names()
@@ -87,10 +102,38 @@ class TrainingDriver:
                 adapter_name=adapter_name,
                 adapter_dir=self.current_adapter_dirs[adapter_name],
             )
+        self.reference_adapter_dirs = dict(self.current_adapter_dirs)
+        if self.config.reference_kl_every > 0:
+            self.trainer.load_reference_adapters(adapter_dirs=self.reference_adapter_dirs)
         with self._stage("trainer_sleep", step=0):
             self.trainer.sleep()
+        if self.config.optimizer_checkpoint_every > 0:
+            self.latest_exact_resume_checkpoint = str(
+                save_exact_resume_checkpoint(
+                    root=self.output_dir / "checkpoints" / "exact_resume",
+                    step=0,
+                    run_config=self.config.to_dict(),
+                    adapter_dirs=self.current_adapter_dirs,
+                    trainer=self.trainer,
+                )
+            )
         with self._stage("init_sampler", step=0):
             self.sampler = self._make_sampler()
+        self.observability = self._make_observability()
+        self.observability.log_step(
+            {
+                "step": 0,
+                "mean_reward": 0.0,
+                "mean_parse_success": 0.0,
+                "rollout_metrics": {"phase0_observability_probe": 1.0},
+            }
+        )
+        if self.latest_exact_resume_checkpoint is not None:
+            self.observability.log_artifact(
+                kind="exact-resume-checkpoint",
+                path=self.latest_exact_resume_checkpoint,
+                metadata={"step": 0, "phase0_probe": True},
+            )
         self._write_manifest(current_step=0)
         self._progress("driver_init_done", output_dir=str(self.output_dir))
 
@@ -125,14 +168,41 @@ class TrainingDriver:
         driver._configure_tracing()
         driver.step_records_path = driver.output_dir / "step_records.jsonl"
         driver.summary_path = driver.output_dir / "summary.json"
-        driver.current_adapter_dirs = dict(manifest.adapter_dirs)
+        driver.latest_exact_resume_checkpoint = manifest.exact_resume_checkpoint
+        driver._metric_history = {}
+        driver.reference_adapter_dirs = dict(manifest.reference_adapter_dirs or {})
+        if manifest.exact_resume_checkpoint is not None:
+            exact_path = Path(manifest.exact_resume_checkpoint)
+            exact_manifest = validate_exact_resume_checkpoint(
+                exact_path, run_config=config.to_dict()
+            )
+            driver.start_step = int(exact_manifest["completed_step"])
+            driver.current_adapter_dirs = checkpoint_adapter_dirs(exact_path)
+            driver._rollback_step_records_to(step=driver.start_step)
+        else:
+            if manifest.current_step > 0:
+                raise RuntimeError(
+                    "This run has no exact-resume checkpoint. Refusing an adapter-only resume "
+                    "that would silently reset Adam and RNG state."
+                )
+            driver.current_adapter_dirs = dict(manifest.adapter_dirs)
         driver._validate_judge_adapter_harness(driver.current_adapter_dirs)
         with driver._stage("init_trainer_resume", step=driver.start_step):
             driver.trainer = driver._make_trainer_from_current_adapters()
+            if manifest.exact_resume_checkpoint is not None:
+                load_exact_resume_checkpoint(
+                    path=manifest.exact_resume_checkpoint,
+                    trainer=driver.trainer,
+                    run_config=config.to_dict(),
+                )
+            if config.reference_kl_every > 0 and driver.reference_adapter_dirs:
+                driver.trainer.load_reference_adapters(adapter_dirs=driver.reference_adapter_dirs)
         with driver._stage("trainer_sleep", step=driver.start_step):
             driver.trainer.sleep()
         with driver._stage("init_sampler", step=driver.start_step):
             driver.sampler = driver._make_sampler()
+        driver.observability = driver._make_observability()
+        driver._rebuild_metric_history()
         driver._progress("driver_resume_done", output_dir=str(driver.output_dir), start_step=driver.start_step)
         return driver
 
@@ -144,6 +214,90 @@ class TrainingDriver:
 
     def _progress(self, event: str, **fields: object) -> None:
         print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
+
+    def _make_observability(self) -> RunObservability:
+        return RunObservability(
+            output_dir=self.output_dir,
+            config=self.config.to_dict(),
+            settings=WandbSettings(
+                enabled=self.config.wandb_enabled,
+                project=self.config.wandb_project,
+                entity=self.config.wandb_entity,
+                group=self.config.wandb_group,
+                name=self.config.wandb_run_name,
+                mode=self.config.wandb_mode,
+                upload_artifacts=self.config.wandb_upload_artifacts,
+                rollout_shard_steps=self.config.rollout_shard_every,
+                table_samples_per_shard=self.config.wandb_table_samples_per_shard,
+            ),
+        )
+
+    def _rollback_step_records_to(self, *, step: int) -> None:
+        if not self.step_records_path.exists():
+            return
+        lines = self.step_records_path.read_text().splitlines()
+        kept = [line for line in lines if line.strip() and int(json.loads(line)["step"]) <= step]
+        dropped = [line for line in lines if line.strip() and int(json.loads(line)["step"]) > step]
+        if dropped:
+            base = self.output_dir / f"step_records_after_exact_step_{step:06d}.superseded"
+            index = 1
+            suffix = Path(f"{base}.{index:03d}.jsonl")
+            while suffix.exists():
+                index += 1
+                suffix = Path(f"{base}.{index:03d}.jsonl")
+            suffix.write_text("\n".join(dropped) + "\n")
+            self.step_records_path.write_text("\n".join(kept) + ("\n" if kept else ""))
+            rollback_rollout_shards(output_dir=self.output_dir, completed_step=step)
+
+    @staticmethod
+    def _correlation(xs: list[float], ys: list[float]) -> float:
+        if len(xs) < 2 or len(xs) != len(ys):
+            return 0.0
+        x_mean, y_mean = mean(xs), mean(ys)
+        x_var = sum((x - x_mean) ** 2 for x in xs)
+        y_var = sum((y - y_mean) ** 2 for y in ys)
+        if x_var == 0.0 or y_var == 0.0:
+            return 0.0
+        return sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys, strict=True)) / math.sqrt(x_var * y_var)
+
+    def _add_temporal_metrics(self, record: dict[str, object]) -> None:
+        train_metrics = record.get("train_metrics", {})
+        entropy_values = [float(item["entropy"]) for item in train_metrics.values() if "entropy" in item]
+        kl_values = [float(item["ppo_sampled_approx_kl"]) for item in train_metrics.values() if "ppo_sampled_approx_kl" in item]
+        rollout_metrics = record.setdefault("rollout_metrics", {})
+        values = {
+            "reward": float(record.get("mean_reward", 0.0)),
+            "entropy": mean(entropy_values) if entropy_values else 0.0,
+            "kl": mean(kl_values) if kl_values else 0.0,
+            "length": float(rollout_metrics.get("completion_length_mean", 0.0)),
+        }
+        for key, value in values.items():
+            self._metric_history.setdefault(key, []).append(value)
+        entropy_history = self._metric_history["entropy"]
+        rollout_metrics["policy_entropy_mean"] = values["entropy"]
+        rollout_metrics["policy_entropy_change"] = (
+            entropy_history[-1] - entropy_history[-2] if len(entropy_history) >= 2 else 0.0
+        )
+        window = entropy_history[-10:]
+        if len(window) >= 2:
+            xs = list(range(len(window)))
+            rollout_metrics["policy_entropy_rolling_slope_10"] = self._correlation(xs, window) * (
+                pstdev(window) / pstdev(xs) if pstdev(xs) > 0 else 0.0
+            )
+        else:
+            rollout_metrics["policy_entropy_rolling_slope_10"] = 0.0
+        tail = slice(max(0, len(self._metric_history["reward"]) - 20), None)
+        rewards = self._metric_history["reward"][tail]
+        rollout_metrics["reward_vs_kl_correlation_20"] = self._correlation(rewards, self._metric_history["kl"][tail])
+        rollout_metrics["reward_vs_entropy_correlation_20"] = self._correlation(rewards, self._metric_history["entropy"][tail])
+        rollout_metrics["reward_vs_completion_length_correlation_20"] = self._correlation(rewards, self._metric_history["length"][tail])
+
+    def _rebuild_metric_history(self) -> None:
+        if not self.step_records_path.exists():
+            return
+        for line in self.step_records_path.read_text().splitlines():
+            if line.strip():
+                self._add_temporal_metrics(json.loads(line))
 
     def _adapter_names(self) -> tuple[str, ...]:
         if self.config.adapter_layout == "shared":
@@ -377,6 +531,8 @@ class TrainingDriver:
             current_step=current_step,
             adapter_dirs=dict(self.current_adapter_dirs),
             step_records_path=str(self.step_records_path),
+            exact_resume_checkpoint=self.latest_exact_resume_checkpoint,
+            reference_adapter_dirs=dict(self.reference_adapter_dirs),
         )
         manifest.write_json(self.output_dir / "manifest.json")
 
@@ -753,6 +909,24 @@ class TrainingDriver:
             for traj in (debate.trajectory_a, debate.trajectory_b)
             if len(traj.transitions) >= 3
         ]
+        r1_turns = [
+            traj.transitions[0]
+            for debate in debates
+            for traj in (debate.trajectory_a, debate.trajectory_b)
+            if traj.transitions
+        ]
+        r2_turns = [
+            traj.transitions[1]
+            for debate in debates
+            for traj in (debate.trajectory_a, debate.trajectory_b)
+            if len(traj.transitions) >= 2
+        ]
+        r3_turns = [
+            traj.transitions[2]
+            for debate in debates
+            for traj in (debate.trajectory_a, debate.trajectory_b)
+            if len(traj.transitions) >= 3
+        ]
         length_deltas = []
         win_signs = []
         for debate in debates:
@@ -797,6 +971,25 @@ class TrainingDriver:
             "mean_r2_length": mean(r2_lengths) if r2_lengths else 0.0,
             "mean_r3_length": mean(r3_lengths) if r3_lengths else 0.0,
             "mean_r23_length": mean([*r2_lengths, *r3_lengths]) if r2_lengths or r3_lengths else 0.0,
+            "mean_r1_length": mean(len(turn.completion_tokens) for turn in r1_turns) if r1_turns else 0.0,
+            "max_r1_length": max((len(turn.completion_tokens) for turn in r1_turns), default=0),
+            "max_r2_length": max(r2_lengths, default=0),
+            "max_r3_length": max(r3_lengths, default=0),
+            "r1_max_token_rate": (
+                mean(len(turn.completion_tokens) >= (self.config.debate_r1_max_tokens or self.config.rollout.max_tokens) for turn in r1_turns)
+                if r1_turns else 0.0
+            ),
+            "r2_max_token_rate": (
+                mean(len(turn.completion_tokens) >= (self.config.debate_r2_max_tokens or self.config.debate_r23_max_tokens or self.config.rollout.max_tokens) for turn in r2_turns)
+                if r2_turns else 0.0
+            ),
+            "r3_max_token_rate": (
+                mean(len(turn.completion_tokens) >= (self.config.debate_r3_max_tokens or self.config.debate_r23_max_tokens or self.config.rollout.max_tokens) for turn in r3_turns)
+                if r3_turns else 0.0
+            ),
+            "r1_eos_rate": mean(bool(turn.completion_tokens) and turn.completion_tokens[-1] == self.tokenizer.eos_token_id for turn in r1_turns) if r1_turns else 0.0,
+            "r2_eos_rate": mean(bool(turn.completion_tokens) and turn.completion_tokens[-1] == self.tokenizer.eos_token_id for turn in r2_turns) if r2_turns else 0.0,
+            "r3_eos_rate": mean(bool(turn.completion_tokens) and turn.completion_tokens[-1] == self.tokenizer.eos_token_id for turn in r3_turns) if r3_turns else 0.0,
             "length_win_correlation": _corr(length_deltas, win_signs),
         }
 
@@ -890,6 +1083,105 @@ class TrainingDriver:
             }
         return grouped, projection_record
 
+    def _adapter_output_dir(self, *, step: int, adapter_name: str, durable: bool) -> Path:
+        if durable:
+            return self.output_dir / "checkpoints" / "lora" / f"step_{step:06d}"
+        return self.output_dir / ".live_adapters" / f"step_{step:06d}"
+
+    def _discard_superseded_live_adapters(self, previous_dirs: dict[str, str]) -> None:
+        live_root = (self.output_dir / ".live_adapters").resolve()
+        for path_text in previous_dirs.values():
+            path = Path(path_text).resolve()
+            if live_root not in path.parents:
+                continue
+            step_root = next((parent for parent in path.parents if parent.parent == live_root), None)
+            if step_root is not None and step_root.exists():
+                shutil.rmtree(step_root)
+
+    @staticmethod
+    def _step_distribution_metrics(*, rewards: list[float], grouped_examples: dict[str, list]) -> dict[str, float]:
+        out: dict[str, float] = {}
+        if rewards:
+            ordered = sorted(float(value) for value in rewards)
+            out.update(
+                reward_std=pstdev(ordered),
+                reward_min=min(ordered),
+                reward_max=max(ordered),
+                reward_p10=ordered[max(0, math.ceil(0.10 * len(ordered)) - 1)],
+                reward_p50=ordered[max(0, math.ceil(0.50 * len(ordered)) - 1)],
+                reward_p90=ordered[max(0, math.ceil(0.90 * len(ordered)) - 1)],
+                reward_p99=ordered[max(0, math.ceil(0.99 * len(ordered)) - 1)],
+            )
+        advantages = [
+            float(value)
+            for batch in grouped_examples.values()
+            for example in batch
+            for value, mask in zip(example.advantages, example.loss_mask, strict=True)
+            if mask
+        ]
+        if advantages:
+            ordered_adv = sorted(advantages)
+            positive = [value for value in advantages if value > 0]
+            negative = [value for value in advantages if value < 0]
+            out.update(
+                advantage_mean=mean(advantages),
+                advantage_std=pstdev(advantages),
+                advantage_max_abs=max(abs(value) for value in advantages),
+                advantage_fraction_positive=len(positive) / len(advantages),
+                advantage_fraction_negative=len(negative) / len(advantages),
+                advantage_total_positive_abs=sum(positive),
+                advantage_total_negative_abs=sum(abs(value) for value in negative),
+                advantage_positive_negative_magnitude_ratio=(
+                    sum(positive) / sum(abs(value) for value in negative) if negative else 0.0
+                ),
+                advantage_p01=ordered_adv[max(0, math.ceil(0.01 * len(ordered_adv)) - 1)],
+                advantage_p05=ordered_adv[max(0, math.ceil(0.05 * len(ordered_adv)) - 1)],
+                advantage_p95=ordered_adv[max(0, math.ceil(0.95 * len(ordered_adv)) - 1)],
+                advantage_p99=ordered_adv[max(0, math.ceil(0.99 * len(ordered_adv)) - 1)],
+                advantage_p999=ordered_adv[max(0, math.ceil(0.999 * len(ordered_adv)) - 1)],
+            )
+        group_std_values: list[float] = []
+        rewards_by_group: dict[tuple[str, str], list[float]] = {}
+        completion_lengths: list[int] = []
+        seen_groups: set[tuple[str, str]] = set()
+        for adapter, batch in grouped_examples.items():
+            for example in batch:
+                completion_lengths.append(sum(int(value) for value in example.loss_mask))
+                metadata = example.metadata
+                question = str(metadata.get("question", ""))
+                key = (adapter, question)
+                raw_reward = metadata.get("reward", metadata.get("r1_reward"))
+                if isinstance(raw_reward, (int, float)) and math.isfinite(float(raw_reward)):
+                    rewards_by_group.setdefault(key, []).append(float(raw_reward))
+                if key in seen_groups:
+                    continue
+                std = metadata.get("group_std_reward", metadata.get("r1_group_std_reward"))
+                if isinstance(std, (int, float)) and math.isfinite(float(std)):
+                    seen_groups.add(key)
+                    group_std_values.append(float(std))
+        if group_std_values:
+            ordered_std = sorted(group_std_values)
+            out["grpo_zero_variance_group_fraction"] = mean(value == 0.0 for value in group_std_values)
+            out["group_reward_std_mean"] = mean(group_std_values)
+            out["group_reward_std_p50"] = ordered_std[max(0, math.ceil(0.50 * len(ordered_std)) - 1)]
+            out["group_reward_std_p10"] = ordered_std[max(0, math.ceil(0.10 * len(ordered_std)) - 1)]
+            out["group_reward_std_p90"] = ordered_std[max(0, math.ceil(0.90 * len(ordered_std)) - 1)]
+            out["group_reward_std_p99"] = ordered_std[max(0, math.ceil(0.99 * len(ordered_std)) - 1)]
+        binary_groups = [values for values in rewards_by_group.values() if values and all(value in (0.0, 1.0) for value in values)]
+        if binary_groups and len(binary_groups) == len(rewards_by_group):
+            histogram: dict[int, int] = {}
+            for values in binary_groups:
+                correct = int(sum(values))
+                histogram[correct] = histogram.get(correct, 0) + 1
+            for correct, count in sorted(histogram.items()):
+                out[f"grpo_group_correct_count_histogram/{correct}"] = float(count)
+        if completion_lengths:
+            out["completion_length_mean"] = mean(completion_lengths)
+            out["completion_length_max"] = max(completion_lengths)
+        out["effective_rollout_batch_size"] = float(len(rewards))
+        out["effective_optimizer_batch_size"] = float(sum(len(batch) for batch in grouped_examples.values()))
+        return out
+
     def run(self, *, max_steps: int | None = None) -> dict:
         try:
             self.config.write_json(self.output_dir / "run_config.json")
@@ -936,6 +1228,7 @@ class TrainingDriver:
                             else 0.0
                         )
                         mean_reward_metrics = mean_numeric_metrics([sample.reward_metrics for sample in samples])
+                        step_rewards = [float(sample.reward) for sample in samples]
                     else:
                         step_seed = None if self.config.rollout.seed is None else self.config.rollout.seed + step_idx
                         debates = []
@@ -1007,6 +1300,7 @@ class TrainingDriver:
                         mean_parse_success = mean(parse_values) if parse_values else 0.0
                         mean_reward_metrics = mean_numeric_metrics(task_reward_metrics)
                         mean_reward_metrics.update(debate_metrics)
+                        step_rewards = rewards
                     if self._should_teardown_sampler_before_training():
                         self._teardown_sampler()
                     elif self._should_sleep_sampler_before_training():
@@ -1040,6 +1334,11 @@ class TrainingDriver:
                         self._progress("trainer_wake_done", step=step_num)
                     train_metrics = {}
                     train_adapter_names = self._train_adapter_names()
+                    previous_adapter_dirs = dict(self.current_adapter_dirs)
+                    durable_lora_step = (
+                        step_num % self.config.adapter_checkpoint_every == 0
+                        or step_num == self.config.steps
+                    )
                     for adapter_name, batch in grouped_examples.items():
                         if train_adapter_names is not None and adapter_name not in train_adapter_names:
                             self._progress(
@@ -1060,7 +1359,12 @@ class TrainingDriver:
                                 num_examples=len(batch),
                             )
                             train_metrics[adapter_name] = self.trainer.train_batch(
-                                adapter_name=adapter_name, batch=batch
+                                adapter_name=adapter_name,
+                                batch=batch,
+                                measure_reference_kl=(
+                                    self.config.reference_kl_every > 0
+                                    and step_num % self.config.reference_kl_every == 0
+                                ),
                             )
                             self._progress(
                                 "train_adapter_done",
@@ -1068,7 +1372,11 @@ class TrainingDriver:
                                 adapter_name=adapter_name,
                                 metrics=train_metrics[adapter_name],
                             )
-                        adapter_dir = self.output_dir / f"step_{step_num:03d}_{adapter_name}"
+                        adapter_dir = self._adapter_output_dir(
+                            step=step_num,
+                            adapter_name=adapter_name,
+                            durable=durable_lora_step,
+                        )
                         with self._stage("save_adapter", step=step_num, adapter_name=adapter_name):
                             self._progress("save_adapter_start", step=step_num, adapter_name=adapter_name)
                             self.current_adapter_dirs[adapter_name] = self.trainer.save_adapter(
@@ -1089,6 +1397,7 @@ class TrainingDriver:
                         self._progress("trainer_sleep_start", step=step_num)
                         self.trainer.sleep()
                         self._progress("trainer_sleep_done", step=step_num)
+                    self._discard_superseded_live_adapters(previous_adapter_dirs)
                     if self._should_teardown_sampler_before_training():
                         self._ensure_sampler()
 
@@ -1108,6 +1417,23 @@ class TrainingDriver:
                         },
                         **extra_record,
                     }
+                    distribution_metrics = self._step_distribution_metrics(
+                        rewards=step_rewards,
+                        grouped_examples=grouped_examples,
+                    )
+                    record.update(
+                        {
+                            key: value
+                            for key, value in distribution_metrics.items()
+                            if key in {"reward_std", "reward_min", "reward_max"}
+                        }
+                    )
+                    record["rollout_metrics"] = {
+                        key: value
+                        for key, value in distribution_metrics.items()
+                        if key not in {"reward_std", "reward_min", "reward_max"}
+                    }
+                    self._add_temporal_metrics(record)
                     parsed_reward_hacking = self._parsed_reward_hacking_rate(
                         mean_reward_metrics=mean_reward_metrics
                     )
@@ -1119,7 +1445,42 @@ class TrainingDriver:
                         record["mean_reward_hacking"] = mean_reward_metrics["mean_used_secret"]
                     with self.step_records_path.open("a") as f:
                         f.write(json.dumps(record) + "\n")
+                        f.flush()
+                    exact_step = (
+                        self.config.optimizer_checkpoint_every > 0
+                        and (
+                            step_num % self.config.optimizer_checkpoint_every == 0
+                            or step_num == self.config.steps
+                        )
+                    )
+                    if exact_step:
+                        exact_path = save_exact_resume_checkpoint(
+                            root=self.output_dir / "checkpoints" / "exact_resume",
+                            step=step_num,
+                            run_config=self.config.to_dict(),
+                            adapter_dirs=self.current_adapter_dirs,
+                            trainer=self.trainer,
+                        )
+                        self.latest_exact_resume_checkpoint = str(exact_path)
                     self._write_manifest(current_step=step_num)
+                    self.observability.log_step(record)
+                    shard = self.observability.record_rollouts(
+                        record,
+                        final_step=step_num == self.config.steps,
+                    )
+                    if durable_lora_step:
+                        lora_root = self.output_dir / "checkpoints" / "lora" / f"step_{step_num:06d}"
+                        self.observability.log_artifact(
+                            kind="lora-checkpoint",
+                            path=lora_root,
+                            metadata={"step": step_num, "adapter_names": sorted(train_metrics)},
+                        )
+                    if exact_step:
+                        self.observability.log_artifact(
+                            kind="exact-resume-checkpoint",
+                            path=self.latest_exact_resume_checkpoint,
+                            metadata={"step": step_num},
+                        )
                     self._progress(
                         "step_done",
                         step=step_num,
@@ -1147,3 +1508,6 @@ class TrainingDriver:
             return summary
         finally:
             self.resource_monitor.stop()
+            observability = getattr(self, "observability", None)
+            if observability is not None:
+                observability.finish()
