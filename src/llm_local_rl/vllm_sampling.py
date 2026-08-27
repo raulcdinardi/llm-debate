@@ -100,6 +100,35 @@ def _extract_top_token_logprobs(
     return out
 
 
+def _extract_candidate_logprobs(
+    *,
+    token_ids: list[int],
+    token_logprobs: object,
+    candidate_token_ids: tuple[int, ...] | list[int],
+) -> list[dict[int, float]]:
+    """Extract a fail-closed logprob row for every requested candidate token.
+
+    This is intentionally separate from model-I/O tracing.  Scientific reward
+    computation must not depend on the optional trace-top-logprobs setting.
+    """
+    candidates = tuple(int(token_id) for token_id in candidate_token_ids)
+    if not candidates:
+        return []
+    if token_logprobs is None or not isinstance(token_logprobs, list):
+        raise RuntimeError("vLLM did not return candidate logprobs.")
+    if len(token_logprobs) != len(token_ids):
+        raise ValueError("Token/candidate-logprob length mismatch.")
+    out: list[dict[int, float]] = []
+    for row in token_logprobs:
+        if not isinstance(row, dict):
+            raise TypeError("Expected vLLM per-token logprob rows to be dicts.")
+        missing = [token_id for token_id in candidates if int(token_id) not in row]
+        if missing:
+            raise RuntimeError(f"Missing requested candidate token ids in vLLM logprob row: {missing}")
+        out.append({token_id: _logprob_value(row[token_id]) for token_id in candidates})
+    return out
+
+
 @dataclass(frozen=True)
 class VllmRuntimeConfig:
     model_path: str
@@ -237,9 +266,22 @@ def _build_sampling_params(
     top_k: int = -1,
     presence_penalty: float = 0.0,
     repetition_penalty: float = 1.0,
+    allowed_token_ids: tuple[int, ...] | list[int] = (),
+    candidate_logprob_token_ids: tuple[int, ...] | list[int] = (),
     engine_logprobs_mode: str | None = None,
 ):
-    logprobs = max(1, trace_top_logprobs)
+    candidate_ids = tuple(int(token_id) for token_id in candidate_logprob_token_ids)
+    allowed_ids = tuple(int(token_id) for token_id in allowed_token_ids)
+    if candidate_ids:
+        if not allowed_ids:
+            raise ValueError("candidate_logprob_token_ids requires allowed_token_ids")
+        missing_allowed = sorted(set(candidate_ids) - set(allowed_ids))
+        if missing_allowed:
+            raise ValueError(
+                "candidate_logprob_token_ids must be a subset of allowed_token_ids; "
+                f"missing={missing_allowed}"
+            )
+    logprobs = max(1, trace_top_logprobs, len(candidate_ids))
     policy = BehaviorPolicySpec(
         temperature=float(temperature),
         top_p=float(top_p),
@@ -247,6 +289,7 @@ def _build_sampling_params(
         min_p=float(min_p),
         presence_penalty=float(presence_penalty),
         repetition_penalty=float(repetition_penalty),
+        allowed_token_ids=allowed_ids,
     )
     logprobs_mode_kwargs, _backend_mode = _behavior_logprobs_mode(
         SamplingParams,
@@ -266,6 +309,10 @@ def _build_sampling_params(
         "seed": seed,
     }
     kwargs.update(logprobs_mode_kwargs)
+    if allowed_token_ids:
+        if "allowed_token_ids" not in inspect.signature(SamplingParams).parameters:
+            raise RuntimeError("Pinned vLLM SamplingParams lacks allowed_token_ids support")
+        kwargs["allowed_token_ids"] = [int(token_id) for token_id in allowed_token_ids]
     return SamplingParams(**kwargs)
 
 
@@ -415,6 +462,8 @@ class VllmSampler:
                 float(request.repetition_penalty),
                 int(request.max_tokens),
                 tuple(int(tok) for tok in request.stop_token_ids),
+                tuple(int(tok) for tok in request.allowed_token_ids),
+                tuple(int(tok) for tok in request.candidate_logprob_token_ids),
             )
             grouped.setdefault(key, []).append((idx, request))
 
@@ -429,6 +478,8 @@ class VllmSampler:
             repetition_penalty,
             max_tokens,
             stop_token_ids,
+            allowed_token_ids,
+            candidate_logprob_token_ids,
         ), grouped_requests in grouped.items():
             behavior_policy = BehaviorPolicySpec(
                 temperature=temperature,
@@ -437,6 +488,7 @@ class VllmSampler:
                 min_p=min_p,
                 presence_penalty=presence_penalty,
                 repetition_penalty=repetition_penalty,
+                allowed_token_ids=allowed_token_ids,
             )
             _mode_kwargs, backend_mode = _behavior_logprobs_mode(
                 SamplingParams,
@@ -459,6 +511,8 @@ class VllmSampler:
                     top_k=top_k,
                     presence_penalty=presence_penalty,
                     repetition_penalty=repetition_penalty,
+                    allowed_token_ids=allowed_token_ids,
+                    candidate_logprob_token_ids=candidate_logprob_token_ids,
                     engine_logprobs_mode=self._engine_logprobs_mode,
                     max_tokens=max_tokens,
                     stop_token_ids=stop_token_ids,
@@ -489,6 +543,11 @@ class VllmSampler:
                     token_logprobs=seq.logprobs,
                     max_alternatives=trace_top_logprobs,
                 )
+                candidate_logprobs = _extract_candidate_logprobs(
+                    token_ids=completion_token_ids,
+                    token_logprobs=seq.logprobs,
+                    candidate_token_ids=request.candidate_logprob_token_ids,
+                )
                 text = getattr(seq, "text", None) or ""
                 raw = {
                     "finish_reason": getattr(seq, "finish_reason", None),
@@ -511,6 +570,7 @@ class VllmSampler:
                     text=text,
                     behavior_policy=behavior_policy,
                     completion_logprob_semantics=logprob_semantics,
+                    candidate_logprobs=candidate_logprobs,
                     raw=raw,
                 )
                 get_model_io_tracer().record_generation(
@@ -558,6 +618,8 @@ def direct_vllm_sample(
         top_k=int(request.top_k),
         presence_penalty=float(request.presence_penalty),
         repetition_penalty=float(request.repetition_penalty),
+        allowed_token_ids=request.allowed_token_ids,
+        candidate_logprob_token_ids=request.candidate_logprob_token_ids,
         engine_logprobs_mode=engine_logprobs_mode,
         max_tokens=int(request.max_tokens),
         stop_token_ids=request.stop_token_ids,
@@ -586,6 +648,11 @@ def direct_vllm_sample(
         token_logprobs=seq.logprobs,
         max_alternatives=trace_top_logprobs,
     )
+    candidate_logprobs = _extract_candidate_logprobs(
+        token_ids=completion_token_ids,
+        token_logprobs=seq.logprobs,
+        candidate_token_ids=request.candidate_logprob_token_ids,
+    )
     text = getattr(seq, "text", None)
     if text is None:
         text = ""
@@ -610,6 +677,7 @@ def direct_vllm_sample(
         text=text,
         behavior_policy=behavior_policy,
         completion_logprob_semantics=logprob_semantics,
+        candidate_logprobs=candidate_logprobs,
         raw=raw,
     )
     get_model_io_tracer().record_generation(

@@ -14,6 +14,11 @@ from llm_local_rl.judge_harness import (
     get_judge_harness,
     resolve_judge_harness_id,
 )
+from llm_local_rl.soft_judge import (
+    JUDGE_LABEL_TOKEN_CONTRACT_NONE,
+    JUDGE_LABEL_TOKEN_CONTRACTS,
+    LFM25_AB_WHITESPACE_COMPAT_V1,
+)
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,7 @@ class TrainRunConfig:
     debate_r23_constant: float = 1.0
     debate_r1_judge_delta_q: float = 1.0
     debate_incoherent_r23_reward: float = -0.5
+    debate_r23_format_failure_penalty: float = 0.0
     debate_r23_mode: str = "symmetric"
     debate_r23_advantage_scope: str = "per_round"
     debate_judge_adapter: str = "policy"
@@ -96,6 +102,9 @@ class TrainRunConfig:
     debate_judge_repetition_penalty: float = 1.0
     debate_judge_seed: int | None = None
     debate_judge_bidirectional: bool = False
+    debate_judge_constrain_single_token: bool = False
+    debate_judge_score_mode: str = "hard_verdict"
+    judge_label_token_contract: str = JUDGE_LABEL_TOKEN_CONTRACT_NONE
     train_judge_coherence_grpo: bool = False
     judge_grpo_reward_mode: str = "coherence"
     debate_round_adapter_names: tuple[str, ...] = ("solution", "debate", "debate")
@@ -162,6 +171,9 @@ class TrainRunConfig:
     def to_dict(self) -> dict:
         data = asdict(self)
         data["behavior_policy_contract"] = self.behavior_policy().to_dict()
+        data["judge_label_token_contract_temporary"] = (
+            self.judge_label_token_contract == LFM25_AB_WHITESPACE_COMPAT_V1
+        )
         return data
 
     def behavior_policy(self) -> BehaviorPolicySpec:
@@ -225,6 +237,65 @@ class TrainRunConfig:
             )
         if self.debate_judge_max_tokens < 0:
             raise ValueError("debate_judge_max_tokens must be non-negative")
+        if self.debate_judge_constrain_single_token:
+            if judge_harness.output_contract != "single_token_a_or_b":
+                raise ValueError(
+                    "debate_judge_constrain_single_token requires a single-token A/B harness"
+                )
+            if self.sampler_backend != "vllm" or self.debate_judge_server_url is not None:
+                raise ValueError(
+                    "debate_judge_constrain_single_token requires the in-process vLLM judge"
+                )
+            if self.train_judge_coherence_grpo:
+                raise ValueError(
+                    "constrained judge decoding is not supported with judge GRPO because the "
+                    "trainer does not reconstruct constrained normalization"
+                )
+        if self.debate_judge_score_mode not in ("hard_verdict", "order_sym_soft_logit"):
+            raise ValueError("debate_judge_score_mode must be hard_verdict or order_sym_soft_logit")
+        if self.judge_label_token_contract not in JUDGE_LABEL_TOKEN_CONTRACTS:
+            raise ValueError(
+                f"Unknown judge_label_token_contract={self.judge_label_token_contract!r}"
+            )
+        uses_soft_score = self.debate_judge_score_mode == "order_sym_soft_logit"
+        uses_soft_reward = (
+            self.debate_r1_reward == "judge_soft_task_gap"
+            or self.debate_r23_reward == "soft_judge"
+        )
+        if uses_soft_score:
+            if self.judge_label_token_contract != LFM25_AB_WHITESPACE_COMPAT_V1:
+                raise ValueError(
+                    "order_sym_soft_logit currently requires the explicit temporary "
+                    f"{LFM25_AB_WHITESPACE_COMPAT_V1!r} token contract"
+                )
+            if not self.debate_judge_bidirectional:
+                raise ValueError("order_sym_soft_logit requires bidirectional judge sampling")
+            if not self.debate_judge_constrain_single_token:
+                raise ValueError("order_sym_soft_logit requires constrained single-token judging")
+            if float(self.debate_judge_temperature) != 0.0:
+                raise ValueError("order_sym_soft_logit requires debate_judge_temperature=0")
+            if self.debate_judge_max_tokens not in (0, 1) or (
+                self.debate_judge_max_tokens == 0 and judge_harness.default_max_tokens != 1
+            ):
+                raise ValueError("order_sym_soft_logit requires exactly one judge output token")
+            if self.adapter_layout != "split":
+                raise ValueError("order_sym_soft_logit currently requires adapter_layout='split'")
+            if self.train_judge_coherence_grpo:
+                raise ValueError("order_sym_soft_logit is for a frozen judge and cannot train judge GRPO")
+        elif self.judge_label_token_contract != JUDGE_LABEL_TOKEN_CONTRACT_NONE:
+            raise ValueError(
+                "judge_label_token_contract is temporary and may only be enabled with "
+                "debate_judge_score_mode='order_sym_soft_logit'"
+            )
+        if uses_soft_reward and not uses_soft_score:
+            raise ValueError("soft judge rewards require debate_judge_score_mode='order_sym_soft_logit'")
+        if self.debate_r1_reward == "judge_soft_task_gap" and self.rollout.mode != "debate":
+            raise ValueError("judge_soft_task_gap is only valid for debate rollouts")
+        if self.debate_r23_reward == "soft_judge":
+            if self.debate_rounds < 2:
+                raise ValueError("soft_judge R2/R3 reward requires at least two debate rounds")
+            if self.debate_r23_mode != "symmetric":
+                raise ValueError("soft_judge is intrinsically symmetric/zero-sum")
         BehaviorPolicySpec(
             temperature=self.debate_judge_temperature,
             top_p=self.debate_judge_top_p,
@@ -282,13 +353,19 @@ class TrainRunConfig:
                 raise ValueError("debate_r1_judge_delta_q must be finite and non-negative")
             if not math.isfinite(self.debate_incoherent_r23_reward):
                 raise ValueError("debate_incoherent_r23_reward must be finite")
+            if not math.isfinite(self.debate_r23_format_failure_penalty):
+                raise ValueError("debate_r23_format_failure_penalty must be finite")
+            if self.debate_r23_format_failure_penalty > 0.0:
+                raise ValueError("debate_r23_format_failure_penalty must be non-positive")
             if not self.debate_judge_bidirectional:
                 raise ValueError("judge_delta_task requires bidirectional judge sampling")
         if self.debate_judge_bidirectional:
             if judge_modes != 0:
                 raise ValueError("bidirectional judge sampling requires the in-process judge sampler")
-            if self.rollout.mode != "debate" or self.debate_rounds != 3:
-                raise ValueError("bidirectional judge sampling requires a complete three-round debate")
+            if self.rollout.mode != "debate" or self.debate_rounds not in (1, 2, 3):
+                raise ValueError(
+                    "bidirectional judge sampling requires a one-, two-, or three-round transcript"
+                )
         if self.train_judge_coherence_grpo:
             if self.judge_grpo_reward_mode not in ("coherence", "label"):
                 raise ValueError("judge_grpo_reward_mode must be 'coherence' or 'label'")
@@ -369,6 +446,7 @@ class TrainRunConfig:
             debate_r23_constant=data.get("debate_r23_constant", 1.0),
             debate_r1_judge_delta_q=data.get("debate_r1_judge_delta_q", 1.0),
             debate_incoherent_r23_reward=data.get("debate_incoherent_r23_reward", -0.5),
+            debate_r23_format_failure_penalty=data.get("debate_r23_format_failure_penalty", 0.0),
             debate_r23_mode=data.get("debate_r23_mode", "symmetric"),
             debate_r23_advantage_scope=data.get("debate_r23_advantage_scope", "per_round"),
             debate_judge_adapter=data.get("debate_judge_adapter", "policy"),
@@ -391,6 +469,13 @@ class TrainRunConfig:
             debate_judge_repetition_penalty=data.get("debate_judge_repetition_penalty", 1.0),
             debate_judge_seed=data.get("debate_judge_seed"),
             debate_judge_bidirectional=bool(data.get("debate_judge_bidirectional", False)),
+            debate_judge_constrain_single_token=bool(
+                data.get("debate_judge_constrain_single_token", False)
+            ),
+            debate_judge_score_mode=str(data.get("debate_judge_score_mode", "hard_verdict")),
+            judge_label_token_contract=str(
+                data.get("judge_label_token_contract", JUDGE_LABEL_TOKEN_CONTRACT_NONE)
+            ),
             train_judge_coherence_grpo=bool(data.get("train_judge_coherence_grpo", False)),
             judge_grpo_reward_mode=str(data.get("judge_grpo_reward_mode", "coherence")),
             debate_round_adapter_names=tuple(data.get("debate_round_adapter_names", ("solution", "debate", "debate"))),

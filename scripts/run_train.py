@@ -75,12 +75,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--debate-r1-reward",
         default="task",
-        choices=["task", "judge_pointwise", "judge", "judge_rejection_task", "judge_delta_task", "none"],
+        choices=[
+            "task", "judge_pointwise", "judge", "judge_rejection_task",
+            "judge_delta_task", "judge_soft_task_gap", "none",
+        ],
     )
-    parser.add_argument("--debate-r23-reward", default="constant", choices=["constant", "none"])
+    parser.add_argument(
+        "--debate-r23-reward", default="constant", choices=["constant", "soft_judge", "none"]
+    )
     parser.add_argument("--debate-r23-constant", type=float, default=1.0)
     parser.add_argument("--debate-r1-judge-delta-q", type=float, default=1.0)
     parser.add_argument("--debate-incoherent-r23-reward", type=float, default=-0.5)
+    parser.add_argument("--debate-r23-format-failure-penalty", type=float, default=0.0)
     parser.add_argument("--debate-r23-mode", default="symmetric", choices=["symmetric", "winner_only"])
     parser.add_argument("--debate-r23-advantage-scope", default="per_round", choices=["per_round", "merged_r23"])
     parser.add_argument("--debate-judge-adapter", default="policy", choices=["policy", "base", "solution", "debate", "judge"])
@@ -114,6 +120,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Judge both A/B orders and require referent agreement for a coherent verdict.",
+    )
+    parser.add_argument(
+        "--debate-judge-constrain-single-token",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Restrict a frozen single-token judge to tokenizer-valid A/B token ids.",
+    )
+    parser.add_argument(
+        "--debate-judge-score-mode",
+        default="hard_verdict",
+        choices=["hard_verdict", "order_sym_soft_logit"],
+        help="Keep legacy hard verdicts or compute an order-symmetrized soft judge score.",
+    )
+    parser.add_argument(
+        "--judge-label-token-contract",
+        default="none",
+        choices=["none", "lfm25_ab_whitespace_compat_v1"],
+        help=(
+            "Temporary tokenizer compatibility contract for soft judge scoring. "
+            "Replace and Phase-0 validate when the judge tokenizer or answer stem changes."
+        ),
     )
     parser.add_argument(
         "--train-judge-coherence-grpo",
@@ -343,6 +370,7 @@ def main() -> int:
                 debate_r23_constant=args.debate_r23_constant,
                 debate_r1_judge_delta_q=args.debate_r1_judge_delta_q,
                 debate_incoherent_r23_reward=args.debate_incoherent_r23_reward,
+                debate_r23_format_failure_penalty=args.debate_r23_format_failure_penalty,
                 debate_r23_mode=args.debate_r23_mode,
                 debate_r23_advantage_scope=args.debate_r23_advantage_scope,
                 debate_judge_adapter=args.debate_judge_adapter,
@@ -365,6 +393,9 @@ def main() -> int:
                 debate_judge_repetition_penalty=args.debate_judge_repetition_penalty,
                 debate_judge_seed=args.debate_judge_seed,
                 debate_judge_bidirectional=args.debate_judge_bidirectional,
+                debate_judge_constrain_single_token=args.debate_judge_constrain_single_token,
+                debate_judge_score_mode=args.debate_judge_score_mode,
+                judge_label_token_contract=args.judge_label_token_contract,
                 train_judge_coherence_grpo=args.train_judge_coherence_grpo,
                 judge_grpo_reward_mode=args.judge_grpo_reward_mode,
                 debate_round_adapter_names=tuple(args.debate_round_adapter_names),

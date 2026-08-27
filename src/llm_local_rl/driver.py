@@ -19,6 +19,7 @@ from llm_local_rl.checkpointing import (
 from llm_local_rl.debate_parity import (
     DebateConfig,
     DebateResult,
+    audit_base_text_debate_format,
     assemble_judge_coherence_grpo_examples,
     assemble_split_train_examples,
     assemble_training_data_by_mode,
@@ -748,6 +749,9 @@ class TrainingDriver:
                 judge_repetition_penalty=self.config.debate_judge_repetition_penalty,
                 judge_seed=self.config.debate_judge_seed,
                 judge_bidirectional=self.config.debate_judge_bidirectional,
+                judge_constrain_single_token=self.config.debate_judge_constrain_single_token,
+                judge_score_mode=self.config.debate_judge_score_mode,
+                judge_label_token_contract=self.config.judge_label_token_contract,
                 debate_judge_server_url=self.config.debate_judge_server_url,
                 debate_judge_server_adapter_path=self.config.debate_judge_server_adapter_path,
             ),
@@ -960,7 +964,15 @@ class TrainingDriver:
             sum(bool(audit.get("order_invariant")) for audit in bidirectional_audits)
             / len(bidirectional_audits) if bidirectional_audits else 0.0
         )
-        return {
+        soft_records = [
+            audit.get("soft_score")
+            for audit in bidirectional_audits
+            if audit.get("soft_judge") is True and isinstance(audit.get("soft_score"), dict)
+        ]
+        soft_scores = [float(record["score"]) for record in soft_records]
+        soft_z_symmetric = [float(record["z_symmetric"]) for record in soft_records]
+        soft_order_bias = [float(record["order_bias_logit"]) for record in soft_records]
+        metrics = {
             "train_judge_a_win_rate": sum(1 for verdict in verdicts if verdict == "A") / len(debates),
             "train_judge_b_win_rate": sum(1 for verdict in verdicts if verdict == "B") / len(debates),
             "train_judge_valid_rate": valid_rate,
@@ -992,6 +1004,27 @@ class TrainingDriver:
             "r3_eos_rate": mean(bool(turn.completion_tokens) and turn.completion_tokens[-1] == self.tokenizer.eos_token_id for turn in r3_turns) if r3_turns else 0.0,
             "length_win_correlation": _corr(length_deltas, win_signs),
         }
+        if soft_scores:
+            metrics.update({
+                "train_judge_soft_score_mean": mean(soft_scores),
+                "train_judge_soft_score_std": pstdev(soft_scores),
+                "train_judge_soft_score_mean_abs": mean(abs(value) for value in soft_scores),
+                "train_judge_soft_score_near_zero_rate": mean(
+                    abs(value) <= 0.05 for value in soft_scores
+                ),
+                "train_judge_soft_z_symmetric_mean": mean(soft_z_symmetric),
+                "train_judge_soft_order_bias_logit_mean": mean(soft_order_bias),
+                "train_judge_soft_order_bias_logit_mean_abs": mean(
+                    abs(value) for value in soft_order_bias
+                ),
+                "train_judge_soft_score_valid_rate": len(soft_scores) / len(debates),
+                "train_judge_soft_zero_sum_residual_max_abs": max(
+                    abs(float(audit.get("zero_sum_residual", math.inf)))
+                    for audit in bidirectional_audits
+                    if audit.get("soft_judge") is True
+                ),
+            })
+        return metrics
 
     def _group_debate_examples(self, *, debates: list, step_seed: int | None) -> tuple[dict[str, list], dict[str, object]]:
         runtime = self._debate_runtime()
@@ -1039,6 +1072,7 @@ class TrainingDriver:
             pointwise_reward_map=pointwise_reward_map,
             r1_judge_delta_q=self.config.debate_r1_judge_delta_q,
             incoherent_r23_reward=self.config.debate_incoherent_r23_reward,
+            r23_format_failure_penalty=self.config.debate_r23_format_failure_penalty,
         )
         judge_grpo_record: dict[str, float | int] | None = None
         if self.config.train_judge_coherence_grpo:
@@ -1051,8 +1085,39 @@ class TrainingDriver:
             "reason": "split_layout_per_round_projection",
             "judge_adapter_policy": self.config.debate_judge_adapter,
             "r23_advantage_scope": self.config.debate_r23_advantage_scope,
+            "r23_format_failure_penalty": self.config.debate_r23_format_failure_penalty,
             "num_debates": len(debates),
         }
+        if self.config.debate_r23_format_failure_penalty != 0.0:
+            trajectories = [
+                trajectory
+                for debate in debates
+                for trajectory in (debate.trajectory_a, debate.trajectory_b)
+            ]
+            r2_audits = [
+                audit_base_text_debate_format(text=str(trajectory.metrics.get("r2", "")), round_num=2)
+                for trajectory in trajectories
+            ]
+            r3_audits = [
+                audit_base_text_debate_format(text=str(trajectory.metrics.get("r3", "")), round_num=3)
+                for trajectory in trajectories
+            ]
+            projection_record["debate_format"] = {
+                "schema": "base_text_raw_exact_three_points_terminal_concluded_v2",
+                "r2_strict_rate": mean(float(audit["strict_ok"]) for audit in r2_audits),
+                "r3_strict_rate": mean(float(audit["strict_ok"]) for audit in r3_audits),
+                "r2_legacy_truncation_trigger_rate": mean(
+                    float(audit["legacy_truncation_triggered"]) for audit in r2_audits
+                ),
+                "r3_legacy_truncation_trigger_rate": mean(
+                    float(audit["legacy_truncation_triggered"]) for audit in r3_audits
+                ),
+                "both_rounds_strict_rate": mean(
+                    float(r2["strict_ok"] and r3["strict_ok"])
+                    for r2, r3 in zip(r2_audits, r3_audits, strict=True)
+                ),
+                "round_outputs": len(r2_audits) + len(r3_audits),
+            }
         if judge_grpo_record is not None:
             projection_record["judge_grpo"] = judge_grpo_record
             projection_record[
@@ -1080,6 +1145,20 @@ class TrainingDriver:
                 "q": self.config.debate_r1_judge_delta_q,
                 "incoherent_r1": "seeded_coin_flip_winner_task_reward_plus_minus_q_delta",
                 "incoherent_r23_reward_per_trajectory": self.config.debate_incoherent_r23_reward,
+            }
+        elif self.config.debate_r1_reward == "judge_soft_task_gap":
+            projection_record["r1_projection"] = {
+                "mode": "judge_soft_task_gap",
+                "formula": "M +/- s * abs(task_reward_a - task_reward_b) / 2",
+                "judge_score": "tanh((z_forward-z_reverse)/4)",
+                "pair_sum_conserved_before_group_normalization": True,
+            }
+        if self.config.debate_r23_reward == "soft_judge":
+            projection_record["r23_projection"] = {
+                "mode": "soft_judge",
+                "formula": "reward_a=s; reward_b=-s",
+                "exact_zero_sum_per_debate": True,
+                "r23_constant_ignored": True,
             }
         return grouped, projection_record
 

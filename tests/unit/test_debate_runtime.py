@@ -284,6 +284,21 @@ def test_concluded_stop_is_requested_only_for_debate_turns() -> None:
     assert sampler.requests[1].min_p == 0.02
 
 
+def test_base_text_debate_postprocessing_preserves_exact_sampled_text() -> None:
+    runtime = object.__new__(DebateRuntime)
+    runtime.task = object()
+    sampled = " first. Unnumbered tail.\n2) second\n3) third\nCONCLUDED\nextra"
+
+    visible, metrics = runtime._postprocess_visible_texts(
+        instances=[TaskInstance(instance_id="raw-1", payload={})],
+        texts=[sampled],
+        preserve_sampled_text=True,
+    )
+
+    assert visible == [sampled]
+    assert metrics == [{"semantic_post_truncation_applied": False}]
+
+
 def test_round_specific_token_caps_override_shared_r23_cap() -> None:
     runtime = object.__new__(DebateRuntime)
     runtime.debate_config = DebateConfig(

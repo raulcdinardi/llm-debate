@@ -12,6 +12,11 @@ from llm_local_rl.judge_harness import (
     JudgeTranscript,
     get_judge_harness,
 )
+from llm_local_rl.soft_judge import (
+    JUDGE_LABEL_TOKEN_CONTRACT_NONE,
+    order_symmetric_soft_judge_score,
+    resolve_judge_label_token_contract,
+)
 from llm_local_rl.chat_templates import get_chat_adapter
 from llm_local_rl.debate_parity import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
 from llm_local_rl.model_io_trace import trace_context
@@ -29,9 +34,6 @@ _REASONING_RE = re.compile(r"<REASONING>(.*?)</REASONING>", re.IGNORECASE | re.D
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _THINK_TAIL_RE = re.compile(r"<think>.*$", re.IGNORECASE | re.DOTALL)
 _CLOSING_THINK_RE = re.compile(r"</think>", re.IGNORECASE)
-_EOS_LITERAL = "<|endoftext|>"
-_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
-_NUMBERED_SENTENCE_RE = re.compile(r"^\s*\d+\)")
 _BASE_STOP_SENTINEL = "CONCLUDED"
 
 
@@ -59,32 +61,6 @@ def _strip_think_blocks(text: str) -> str:
     text = _THINK_TAIL_RE.sub("", text)
     text = _CLOSING_THINK_RE.sub("", text)
     return text.strip()
-
-
-def _clean_visible_completion_text(text: str) -> str:
-    return _strip_think_blocks(text).replace(_EOS_LITERAL, "").split(_BASE_STOP_SENTINEL, 1)[0].strip()
-
-
-def truncate_seeded_numbered_completion_text(text: str) -> str:
-    clean_text = _clean_visible_completion_text(text)
-    if not clean_text:
-        return clean_text
-    kept_end = 0
-    raw_start = 0
-    boundaries = [match.end() for match in _SENTENCE_BOUNDARY_RE.finditer(clean_text)]
-    boundaries.append(len(clean_text))
-    for raw_end in boundaries:
-        raw_segment = clean_text[raw_start:raw_end]
-        if raw_segment.strip():
-            right_trimmed_segment = raw_segment.rstrip()
-            segment_text = right_trimmed_segment
-            is_numbered = kept_end == 0 or bool(_NUMBERED_SENTENCE_RE.match(segment_text))
-            if is_numbered:
-                kept_end = raw_start + len(right_trimmed_segment)
-            else:
-                break
-        raw_start = raw_end
-    return clean_text[:kept_end].strip()
 
 
 def _base_text_prompt(*, system_text: str | None, user_text: str, assistant_prefill: str = "") -> str:
@@ -165,6 +141,9 @@ class DebateRuntimeConfig:
     judge_repetition_penalty: float = 1.0
     judge_seed: int | None = None
     judge_bidirectional: bool = False
+    judge_constrain_single_token: bool = False
+    judge_score_mode: str = "hard_verdict"
+    judge_label_token_contract: str = JUDGE_LABEL_TOKEN_CONTRACT_NONE
     debate_judge_server_url: str | None = None
     debate_judge_server_adapter_path: str | None = None
 
@@ -293,15 +272,16 @@ class DebateRuntime:
         instances: list[TaskInstance],
         texts: list[str],
         strip_stop_sentinel: bool = False,
+        preserve_sampled_text: bool = False,
     ) -> tuple[list[str], list[dict]]:
         postprocess = getattr(self.task, "postprocess_visible_text", None)
         visible_texts: list[str] = []
         metrics: list[dict] = []
         for inst, text in zip(instances, texts, strict=True):
-            clean_text = _strip_think_blocks(text)
+            clean_text = text if preserve_sampled_text else _strip_think_blocks(text)
             if strip_stop_sentinel:
                 clean_text = clean_text.split(_BASE_STOP_SENTINEL, 1)[0].strip()
-            if callable(postprocess):
+            if callable(postprocess) and not preserve_sampled_text:
                 processed = postprocess(inst=inst, text=clean_text)
                 if isinstance(processed, tuple):
                     visible_text, visible_metrics = processed
@@ -311,7 +291,7 @@ class DebateRuntime:
                 metrics.append(dict(visible_metrics))
             else:
                 visible_texts.append(clean_text)
-                metrics.append({})
+                metrics.append({"semantic_post_truncation_applied": False} if preserve_sampled_text else {})
         return visible_texts, metrics
 
     def sample_pointwise_judge_rewards(self, *, debates: list[DebateResult], step_seed: int | None) -> dict[int, float]:
@@ -580,32 +560,6 @@ class DebateRuntime:
             )
         )
 
-    def _truncate_numbered_result(
-        self,
-        *,
-        completion_tokens: list[int],
-        completion_logprobs: list[float],
-        text: str,
-        raw: dict,
-    ) -> tuple[list[int], list[float], str, dict]:
-        truncated_text = truncate_seeded_numbered_completion_text(text)
-        clean_text = _clean_visible_completion_text(text)
-        if not truncated_text or truncated_text == clean_text:
-            return completion_tokens, completion_logprobs, text, raw
-        for end in range(1, len(completion_tokens) + 1):
-            prefix_text = _clean_visible_completion_text(
-                self.tokenizer.decode(completion_tokens[:end], skip_special_tokens=True)
-            )
-            if prefix_text == truncated_text:
-                updated_raw = dict(raw)
-                updated_raw["untruncated_completion_text"] = text
-                updated_raw["truncated_completion_text"] = truncated_text
-                return completion_tokens[:end], completion_logprobs[:end], truncated_text, updated_raw
-        updated_raw = dict(raw)
-        updated_raw["untruncated_completion_text"] = text
-        updated_raw["truncated_completion_text"] = truncated_text
-        return completion_tokens, completion_logprobs, truncated_text, updated_raw
-
     def _sample_many(self, *, prompt_tokens_list: list[list[int]], round_num: int, step_seed: int | None, stop_token_ids: list[int], max_tokens: int, temperature: float, adapter_name: str | None = None) -> list[tuple[list[int], list[float], str, dict]]:
         requests = []
         use_real_debate_stop = self.runtime_config.stop_on_concluded and round_num in {2, 3}
@@ -647,6 +601,12 @@ class DebateRuntime:
     def _sample_judge_many(self, *, prompt_tokens_list: list[list[int]], round_num: int, step_seed: int | None, stop_token_ids: list[int], max_tokens: int, temperature: float) -> list[tuple[list[int], list[float], str, dict]]:
         requests = []
         adapter_name = self._judge_adapter_name()
+        allowed_token_ids = self._judge_allowed_token_ids()
+        candidate_logprob_token_ids = (
+            allowed_token_ids
+            if self.runtime_config.judge_score_mode == "order_sym_soft_logit"
+            else ()
+        )
         for prompt_tokens in prompt_tokens_list:
             requests.append(
                 SamplingRequest(
@@ -661,6 +621,8 @@ class DebateRuntime:
                     top_k=int(self.runtime_config.judge_top_k),
                     presence_penalty=float(self.runtime_config.judge_presence_penalty),
                     repetition_penalty=float(self.runtime_config.judge_repetition_penalty),
+                    allowed_token_ids=allowed_token_ids,
+                    candidate_logprob_token_ids=candidate_logprob_token_ids,
                 )
             )
         batch_size = self.runtime_config.rollout_batch_size if self.runtime_config.rollout_batch_size > 0 else len(requests)
@@ -675,11 +637,39 @@ class DebateRuntime:
                 rollout_batch_size=len(chunk),
             ):
                 results = self.judge_sampler.sample_many(chunk)
-            out.extend(
-                (result.completion_token_ids, result.completion_logprobs, result.text, result.raw)
-                for result in results
-            )
+            for result in results:
+                raw = dict(result.raw)
+                if result.candidate_logprobs:
+                    raw["candidate_logprobs"] = result.candidate_logprobs
+                out.append(
+                    (result.completion_token_ids, result.completion_logprobs, result.text, raw)
+                )
         return out
+
+    def _judge_allowed_token_ids(self) -> tuple[int, ...]:
+        if not self.runtime_config.judge_constrain_single_token:
+            return ()
+        if self.runtime_config.judge_label_token_contract != JUDGE_LABEL_TOKEN_CONTRACT_NONE:
+            contract = resolve_judge_label_token_contract(
+                tokenizer=self.tokenizer,
+                contract_name=self.runtime_config.judge_label_token_contract,
+            )
+            return contract.allowed_token_ids
+        harness = get_judge_harness(self.runtime_config.judge_harness_id)
+        token_ids: list[int] = []
+        for candidate in ("A", " A", "B", " B"):
+            encoded = list(self.tokenizer.encode(candidate, add_special_tokens=False))
+            if len(encoded) != 1:
+                continue
+            if harness.parse_verdict(self.tokenizer.decode(encoded)) not in ("A", "B"):
+                continue
+            if encoded[0] not in token_ids:
+                token_ids.append(encoded[0])
+        if len(token_ids) < 2:
+            raise ValueError(
+                "Single-token judge constraint could not resolve valid A/B token ids"
+            )
+        return tuple(token_ids)
 
     def _judge_prompts(self, *, inst_pairs: list[tuple[TaskInstance, TaskInstance]], r1_visible_text: list[str], r2_visible_text: list[str], r3_visible_text: list[str], reverse_order: bool = False) -> list[list[int]]:
         prompts: list[list[int]] = []
@@ -854,11 +844,6 @@ class DebateRuntime:
             max_tokens=self._max_tokens_for_round(round_num=2),
             temperature=float(self.debate_config.temperature),
         )
-        if use_base_text_prefill and not self.runtime_config.stop_on_concluded:
-            r2_results = [
-                self._truncate_numbered_result(completion_tokens=comp, completion_logprobs=lps, text=text, raw=raw)
-                for comp, lps, text, raw in r2_results
-            ]
         r2_tokens = [comp for comp, _lps, _text, _raw in r2_results]
         r2_lps = [lps for _comp, lps, _text, _raw in r2_results]
         r2_text = [text for _comp, _lps, text, _raw in r2_results]
@@ -866,6 +851,7 @@ class DebateRuntime:
             instances=instances_repeated,
             texts=r2_text,
             strip_stop_sentinel=self.runtime_config.stop_on_concluded,
+            preserve_sampled_text=use_base_text_prefill and not self.runtime_config.stop_on_concluded,
         )
         r2_argument_text = (
             [
@@ -934,11 +920,6 @@ class DebateRuntime:
             max_tokens=self._max_tokens_for_round(round_num=3),
             temperature=float(self.debate_config.temperature),
         )
-        if use_base_text_prefill and not self.runtime_config.stop_on_concluded:
-            r3_results = [
-                self._truncate_numbered_result(completion_tokens=comp, completion_logprobs=lps, text=text, raw=raw)
-                for comp, lps, text, raw in r3_results
-            ]
         r3_tokens = [comp for comp, _lps, _text, _raw in r3_results]
         r3_lps = [lps for _comp, lps, _text, _raw in r3_results]
         r3_text = [text for _comp, _lps, text, _raw in r3_results]
@@ -946,6 +927,7 @@ class DebateRuntime:
             instances=instances_repeated,
             texts=r3_text,
             strip_stop_sentinel=self.runtime_config.stop_on_concluded,
+            preserve_sampled_text=use_base_text_prefill and not self.runtime_config.stop_on_concluded,
         )
         r3_argument_text = (
             [
@@ -1097,6 +1079,23 @@ class DebateRuntime:
                 judge_completion_tokens.append([])
                 judge_completion_logprobs.append([])
                 judge_raw_responses.append({"external_judge": True, "raw_text": reasoning})
+        elif self.runtime_config.judge_bidirectional:
+            empty_round_text = [""] * len(r1_visible_text)
+            (
+                verdicts,
+                judge_reasonings,
+                judge_prompt_tokens,
+                judge_completion_tokens,
+                judge_completion_logprobs,
+                judge_raw_responses,
+                _judge_retry_flags,
+            ) = self._run_llm_judge_three_rounds(
+                inst_pairs=inst_pairs,
+                r1_visible_text=r1_visible_text,
+                r2_visible_text=empty_round_text,
+                r3_visible_text=empty_round_text,
+                step_seed=step_seed,
+            )
         else:
             judge_prompt_tokens = []
             for idx, (inst_a, _inst_b) in enumerate(inst_pairs):
@@ -1216,6 +1215,75 @@ class DebateRuntime:
             retry_flags.append(False)
             if verdict == "INVALID":
                 invalid_indices.append(idx)
+        if self.runtime_config.judge_score_mode == "order_sym_soft_logit":
+            if not self.runtime_config.judge_bidirectional:
+                raise ValueError("order_sym_soft_logit requires bidirectional judge sampling")
+            contract = resolve_judge_label_token_contract(
+                tokenizer=self.tokenizer,
+                contract_name=self.runtime_config.judge_label_token_contract,
+            )
+            debate_count = len(inst_pairs)
+            final_verdicts: list[Verdict] = []
+            final_reasonings: list[str] = []
+            final_raw_responses: list[dict] = []
+            for debate_idx in range(debate_count):
+                forward_rows = raw_responses[debate_idx].get("candidate_logprobs")
+                reverse_rows = raw_responses[debate_count + debate_idx].get("candidate_logprobs")
+                if not isinstance(forward_rows, list) or len(forward_rows) != 1:
+                    raise ValueError("Soft judge requires exactly one forward candidate-logprob row")
+                if not isinstance(reverse_rows, list) or len(reverse_rows) != 1:
+                    raise ValueError("Soft judge requires exactly one reverse candidate-logprob row")
+                forward_row = {int(key): float(value) for key, value in forward_rows[0].items()}
+                reverse_row = {int(key): float(value) for key, value in reverse_rows[0].items()}
+                soft = order_symmetric_soft_judge_score(
+                    forward_candidate_logprobs=forward_row,
+                    reverse_candidate_logprobs=reverse_row,
+                    contract=contract,
+                )
+                final_verdict: Verdict = "A" if soft.score >= 0.0 else "B"
+                forward_verdict = verdicts[debate_idx]
+                reverse_verdict = verdicts[debate_count + debate_idx]
+                reverse_mapped: Verdict = (
+                    "B" if reverse_verdict == "A" else "A" if reverse_verdict == "B" else "INVALID"
+                )
+                hard_order_invariant = (
+                    forward_verdict in ("A", "B")
+                    and reverse_mapped in ("A", "B")
+                    and forward_verdict == reverse_mapped
+                )
+                final_verdicts.append(final_verdict)
+                final_reasonings.append(
+                    "[ORDER-SYMMETRIZED SOFT LOGIT SCORE]\n"
+                    f"s={soft.score:.9g}; z_sym={soft.z_symmetric:.9g}"
+                )
+                final_raw_responses.append({
+                    "bidirectional_judge": True,
+                    "soft_judge": True,
+                    "judge_score_mode": "order_sym_soft_logit",
+                    "judge_label_token_contract": contract.record(),
+                    "forward": raw_responses[debate_idx],
+                    "reverse": raw_responses[debate_count + debate_idx],
+                    "forward_verdict": forward_verdict,
+                    "reverse_verdict": reverse_verdict,
+                    "reverse_mapped_verdict": reverse_mapped,
+                    "order_invariant": hard_order_invariant,
+                    "aggregation": "order_sym_soft_logit_no_fallback",
+                    "soft_score": soft.record(),
+                    "debate_reward_a": soft.score,
+                    "debate_reward_b": -soft.score,
+                    "zero_sum_residual": soft.score + (-soft.score),
+                    "final_verdict": final_verdict,
+                    "final_verdict_is_diagnostic_only": True,
+                })
+            return (
+                final_verdicts,
+                final_reasonings,
+                forward_prompt_tokens,
+                completion_tokens[:debate_count],
+                completion_logprobs[:debate_count],
+                final_raw_responses,
+                [False] * debate_count,
+            )
         # A deterministic retry is useful for a frozen single-order judge, but it
         # is a different behavior policy and therefore cannot supply an on-policy
         # judge-GRPO turn. Bidirectional sampling keeps the original invalid

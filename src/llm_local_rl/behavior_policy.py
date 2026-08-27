@@ -38,6 +38,7 @@ class BehaviorPolicySpec:
     min_p: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    allowed_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         numeric_values = {
@@ -66,6 +67,10 @@ class BehaviorPolicySpec:
             raise ValueError(
                 f"repetition_penalty must be positive, got {self.repetition_penalty}."
             )
+        if any(int(token_id) < 0 for token_id in self.allowed_token_ids):
+            raise ValueError("allowed_token_ids must contain only non-negative token ids")
+        if len(set(self.allowed_token_ids)) != len(self.allowed_token_ids):
+            raise ValueError("allowed_token_ids must not contain duplicates")
 
     @classmethod
     def from_sampling_request(cls, request: SamplingRequest) -> BehaviorPolicySpec:
@@ -76,6 +81,7 @@ class BehaviorPolicySpec:
             min_p=float(request.min_p),
             presence_penalty=float(request.presence_penalty),
             repetition_penalty=float(request.repetition_penalty),
+            allowed_token_ids=tuple(int(token_id) for token_id in request.allowed_token_ids),
         )
 
     @classmethod
@@ -88,7 +94,7 @@ class BehaviorPolicySpec:
             repetition_penalty=1.0,
         )
 
-    def to_dict(self) -> dict[str, int | float]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def is_raw_model_distribution(self) -> bool:
@@ -99,6 +105,7 @@ class BehaviorPolicySpec:
             and float(self.min_p) == 0.0
             and float(self.presence_penalty) == 0.0
             and float(self.repetition_penalty) == 1.0
+            and not self.allowed_token_ids
         )
 
     def assert_exact_trainer_reconstruction_supported(self) -> None:
@@ -123,6 +130,10 @@ class BehaviorPolicySpec:
         if float(self.repetition_penalty) != 1.0:
             unsupported.append(
                 f"repetition_penalty={self.repetition_penalty} (only 1.0 is supported)"
+            )
+        if self.allowed_token_ids:
+            unsupported.append(
+                f"allowed_token_ids={self.allowed_token_ids} (constrained normalization is unsupported)"
             )
         if unsupported:
             raise ValueError(

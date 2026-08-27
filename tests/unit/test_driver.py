@@ -276,12 +276,10 @@ def test_judge_coherence_grpo_config_roundtrip_and_fail_closed() -> None:
         debate_judge_bidirectional=True,
         debate_judge_temperature=0.8,
         train_judge_coherence_grpo=True,
-        judge_grpo_reward_mode="label",
         train_adapter_names=("solution", "debate", "judge"),
     )
     restored = TrainRunConfig.from_dict(config.to_dict())
     assert restored.train_judge_coherence_grpo is True
-    assert restored.judge_grpo_reward_mode == "label"
 
     with pytest.raises(ValueError, match="behavior distributions to match"):
         TrainRunConfig(

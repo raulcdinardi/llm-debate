@@ -14,6 +14,8 @@ CHAT_SOLUTION_TAGGED_V1 = "chat_solution_tagged_v1"
 CHAT_POINTWISE_TAGGED_V1 = "chat_pointwise_tagged_v1"
 SOLUTION_R1_RATIONALE_V1 = "solution_r1_rationale_v1"
 CONSTITUTION_SINGLE_TOKEN_V1 = "constitution_single_token_v1"
+CONSULTANCY_SINGLE_TOKEN_V1 = "consultancy_single_token_v1"
+PAIRWISE_SINGLE_TOKEN_V1 = "pairwise_single_token_v1"
 JUDGE_HARNESS_MANIFEST = "judge_harness.json"
 JUDGE_HARNESS_MANIFEST_SCHEMA = "llm_local_rl_judge_harness_v1"
 
@@ -22,6 +24,8 @@ JudgeHarnessId = Literal[
     "chat_pointwise_tagged_v1",
     "solution_r1_rationale_v1",
     "constitution_single_token_v1",
+    "consultancy_single_token_v1",
+    "pairwise_single_token_v1",
 ]
 PromptSerialization = Literal["chat", "raw_base"]
 
@@ -202,6 +206,64 @@ def _render_constitution_single_token(
     )
 
 
+def _render_consultancy_single_token(
+    transcript: JudgeTranscript, _base_system_text: str
+) -> RenderedJudgePrompt:
+    def agent_block(name: str, agent: AgentDebateText) -> str:
+        return (
+            f"=== AGENT {name} ===\n"
+            f"Round 1 (Proposal):\n{agent.r1}\n\n"
+            f"Round 2 (Argument):\n{agent.r2}"
+        )
+
+    return RenderedJudgePrompt(
+        raw_text=(
+            "System:\n"
+            "You are a judge comparing two candidate responses and their supporting arguments.\n\n"
+            "Read the available transcript:\n"
+            "- Round 1: Both agents propose responses\n"
+            "- Round 2: Both agents present supporting arguments\n\n"
+            "Evaluate which agent better adheres to the task constitution and required answer format.\n"
+            "Consider each proposal and its supporting argument, then choose the response which most adheres to the constitution.\n\n"
+            "A means Agent A is better.\n"
+            "B means Agent B is better.\n\n"
+            "User:\nQuestion: " + transcript.question + "\n\n"
+            "Constitution:\n" + transcript.constitution + "\n\n"
+            + agent_block("A", transcript.agent_a) + "\n\n"
+            + agent_block("B", transcript.agent_b) + "\n\n"
+            "Considering each proposal and its supporting argument, which agent better adheres to the constitution?\n"
+            "Consider: task compliance, proposal quality, supporting-argument quality, and concrete evidence from the transcript.\n"
+            "Return only A or B after the fixed answer stem below. Do not provide a rationale, tags, punctuation, or any other text.\n\n"
+            "Assistant:\n"
+            "The response most adherent to the constitution was written by Agent"
+        )
+    )
+
+
+def _render_pairwise_single_token(
+    transcript: JudgeTranscript, _base_system_text: str
+) -> RenderedJudgePrompt:
+    return RenderedJudgePrompt(
+        raw_text=(
+            "System:\n"
+            "You are a judge comparing two candidate responses.\n\n"
+            "Read both responses and evaluate which agent better adheres to the task constitution and required answer format.\n"
+            "Choose the response which most adheres to the constitution.\n\n"
+            "A means Agent A is better.\n"
+            "B means Agent B is better.\n\n"
+            "User:\nQuestion: " + transcript.question + "\n\n"
+            "Constitution:\n" + transcript.constitution + "\n\n"
+            "=== AGENT A ===\nResponse:\n" + transcript.agent_a.r1 + "\n\n"
+            "=== AGENT B ===\nResponse:\n" + transcript.agent_b.r1 + "\n\n"
+            "Based only on the two responses above, which agent better adheres to the constitution?\n"
+            "Consider: task compliance, answer quality, and concrete details in each response.\n"
+            "Return only A or B after the fixed answer stem below. Do not provide a rationale, tags, punctuation, or any other text.\n\n"
+            "Assistant:\n"
+            "The response most adherent to the constitution was written by Agent"
+        )
+    )
+
+
 def _render_chat_solution(
     transcript: JudgeTranscript, base_system_text: str
 ) -> RenderedJudgePrompt:
@@ -306,6 +368,32 @@ _HARNESSES: dict[JudgeHarnessId, JudgeHarnessSpec] = {
         render=_render_constitution_single_token,
         parse_verdict=extract_single_token_verdict,
         required_phrases=("more convincing case", "rebuttal effectiveness"),
+    ),
+    CONSULTANCY_SINGLE_TOKEN_V1: JudgeHarnessSpec(
+        harness_id=CONSULTANCY_SINGLE_TOKEN_V1,
+        serialization="raw_base",
+        objective="select_best_r1_r2_consultancy_view",
+        output_contract="single_token_a_or_b",
+        assistant_prefill="The response most adherent to the constitution was written by Agent",
+        default_max_tokens=1,
+        required_rounds=2,
+        render=_render_consultancy_single_token,
+        parse_verdict=extract_single_token_verdict,
+        required_phrases=("supporting argument",),
+        forbidden_phrases=("Round 3", "rebuttal effectiveness"),
+    ),
+    PAIRWISE_SINGLE_TOKEN_V1: JudgeHarnessSpec(
+        harness_id=PAIRWISE_SINGLE_TOKEN_V1,
+        serialization="raw_base",
+        objective="select_best_r1_pairwise_view",
+        output_contract="single_token_a_or_b",
+        assistant_prefill="The response most adherent to the constitution was written by Agent",
+        default_max_tokens=1,
+        required_rounds=1,
+        render=_render_pairwise_single_token,
+        parse_verdict=extract_single_token_verdict,
+        required_phrases=("Based only on the two responses above",),
+        forbidden_phrases=("Round 2", "Round 3", "rebuttal effectiveness"),
     ),
 }
 

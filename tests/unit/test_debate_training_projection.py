@@ -8,6 +8,7 @@ from llm_local_rl.debate_parity import (
     DebateResult,
     DebateTrajectory,
     Transition,
+    audit_base_text_debate_format,
     assemble_judge_coherence_grpo_examples,
     assemble_split_train_examples,
     assemble_training_data_by_mode,
@@ -20,14 +21,12 @@ def _judge_turns(offset: int = 0) -> list[dict[str, object]]:
     return [
         {
             "order": "forward",
-            "verdict": "A",
             "prompt_tokens": [101 + offset, 102 + offset],
             "completion_tokens": [103 + offset, 104 + offset],
             "completion_logprobs": [-0.1, -0.2],
         },
         {
             "order": "reverse",
-            "verdict": "B",
             "prompt_tokens": [201 + offset, 202 + offset],
             "completion_tokens": [203 + offset, 204 + offset],
             "completion_logprobs": [-0.3, -0.4],
@@ -63,7 +62,6 @@ def test_judge_coherence_grpo_normalizes_across_all_judgments() -> None:
         "judge_grpo_reward_std": 1.0,
         "judge_grpo_coherent_debates": 1,
         "judge_grpo_incoherent_debates": 1,
-        "judge_grpo_reward_mode": "coherence",
     }
     assert [example.metadata["judge_coherence_reward"] for example in examples] == [1.0, 1.0, -1.0, -1.0]
     assert [example.metadata["judge_grpo_zscore"] for example in examples] == [1.0, 1.0, -1.0, -1.0]
@@ -85,93 +83,6 @@ def test_judge_coherence_grpo_pairwise_normalization_would_not_be_used() -> None
     examples, metrics = assemble_judge_coherence_grpo_examples(debates)
     assert metrics["judge_grpo_reward_std"] == 0.0
     assert all(not any(example.advantages) for example in examples)
-
-
-def test_judge_label_grpo_scores_each_display_order_against_gold_referent() -> None:
-    correct_b = _make_debate(
-        reward_a=0.0,
-        reward_b=1.0,
-        judge_raw_response={
-            "bidirectional_judge": True,
-            "order_invariant": False,
-            "_training_judge_turns": [
-                {
-                    **_judge_turns()[0],
-                    "verdict": "B",  # forward display selects original B: correct
-                },
-                {
-                    **_judge_turns()[1],
-                    "verdict": "B",  # reverse display selects original A: wrong
-                },
-            ],
-        },
-    )
-
-    examples, metrics = assemble_judge_coherence_grpo_examples(
-        [correct_b], reward_mode="label"
-    )
-
-    assert len(examples) == 2
-    assert metrics == {
-        "judge_grpo_group_size": 2,
-        "judge_grpo_reward_mean": 0.0,
-        "judge_grpo_reward_std": 1.0,
-        "judge_grpo_coherent_debates": 0,
-        "judge_grpo_incoherent_debates": 1,
-        "judge_grpo_reward_mode": "label",
-        "judge_grpo_label_correct_judgments": 1,
-        "judge_grpo_label_total_judgments": 2,
-        "judge_grpo_label_accuracy": 0.5,
-    }
-    assert [example.metadata["judge_label_reward"] for example in examples] == [1.0, -1.0]
-    assert [example.metadata["judge_label_referent_verdict"] for example in examples] == ["B", "A"]
-    assert [example.metadata["judge_label_correct"] for example in examples] == [True, False]
-    assert all(example.metadata["judge_order_invariant"] is False for example in examples)
-    assert all("judge_coherence_reward" not in example.metadata for example in examples)
-    assert [example.advantages[-2:] for example in examples] == [[0.5, 0.5], [-0.5, -0.5]]
-
-
-def test_judge_label_grpo_invalid_verdict_scores_negative() -> None:
-    invalid = _make_debate(
-        reward_a=1.0,
-        reward_b=0.0,
-        judge_raw_response={
-            "bidirectional_judge": True,
-            "order_invariant": False,
-            "_training_judge_turns": [
-                {**_judge_turns()[0], "verdict": "INVALID"},
-                {**_judge_turns()[1], "verdict": "B"},  # reverse maps to original A
-            ],
-        },
-    )
-    examples, metrics = assemble_judge_coherence_grpo_examples([invalid], reward_mode="label")
-    assert metrics["judge_grpo_label_correct_judgments"] == 1
-    assert [example.metadata["judge_label_reward"] for example in examples] == [-1.0, 1.0]
-
-
-def test_judge_label_grpo_reward_ties_score_zero() -> None:
-    tied = _make_debate(
-        reward_a=1.0,
-        reward_b=1.0,
-        judge_raw_response={
-            "bidirectional_judge": True,
-            "order_invariant": False,
-            "_training_judge_turns": [
-                {**_judge_turns()[0], "verdict": "INVALID"},
-                {**_judge_turns()[1], "verdict": "A"},
-            ],
-        },
-    )
-    examples, metrics = assemble_judge_coherence_grpo_examples([tied], reward_mode="label")
-    assert metrics["judge_grpo_reward_std"] == 0.0
-    assert metrics["judge_grpo_label_correct_judgments"] == 0
-    assert [example.metadata["judge_label_reward"] for example in examples] == [0.0, 0.0]
-    assert all(not any(example.advantages) for example in examples)
-
-
-def test_judge_label_grpo_rejects_unknown_mode() -> None:
-    with pytest.raises(ValueError, match="unsupported judge GRPO reward mode"):
-        assemble_judge_coherence_grpo_examples([], reward_mode="unknown")
 
 
 def _make_debate(
@@ -213,6 +124,150 @@ def _make_debate(
         judge_reasoning="judge",
         judge_raw_response=judge_raw_response,
     )
+
+
+def _formatted_round(round_num: int) -> str:
+    header = (
+        "The reasons that my solution is better than my opponent's are:\n1)"
+        if round_num == 2
+        else "Responding to my opponent's criticism:\n1)"
+    )
+    return header + " first\n2) second\n3) third\nCONCLUDED"
+
+
+def _soft_judge_audit(score: float) -> dict[str, object]:
+    return {
+        "bidirectional_judge": True,
+        "soft_judge": True,
+        "order_invariant": False,
+        "soft_score": {"score": score},
+    }
+
+
+def test_soft_judge_r1_allocates_task_gap_and_preserves_pair_sum() -> None:
+    debate = _make_debate(
+        reward_a=1.0,
+        reward_b=0.0,
+        judge_raw_response=_soft_judge_audit(0.5),
+    )
+    split = assemble_split_train_examples(
+        debates=[debate],
+        num_rounds=1,
+        round_adapter_names=("solution",),
+        r1_reward_mode="judge_soft_task_gap",
+        r23_reward_mode="none",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+    )
+    examples = split["solution"]
+    rewards = {example.metadata["agent"]: example.metadata["r1_soft_reward"] for example in examples}
+    assert rewards == {"A": pytest.approx(0.75), "B": pytest.approx(0.25)}
+    assert sum(rewards.values()) == pytest.approx(1.0)
+    assert examples[0].metadata["r1_task_reward_pair_sum"] == pytest.approx(1.0)
+
+
+def test_soft_judge_r23_is_exactly_zero_sum_even_when_hard_labels_disagree() -> None:
+    debate = _make_debate(judge_raw_response=_soft_judge_audit(0.5))
+    split = assemble_split_train_examples(
+        debates=[debate],
+        num_rounds=2,
+        round_adapter_names=("solution", "debate"),
+        r1_reward_mode="task",
+        r23_reward_mode="soft_judge",
+        r23_constant=99.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+    )
+    debate_examples = split["debate"]
+    rewards = {example.metadata["agent"]: example.metadata["r23_reward"] for example in debate_examples}
+    assert rewards == {"A": pytest.approx(0.5), "B": pytest.approx(-0.5)}
+    assert sum(rewards.values()) == pytest.approx(0.0)
+    assert all(example.metadata["r23_incoherent_reward_applied"] is False for example in debate_examples)
+
+
+def test_base_text_debate_format_audit_is_exact_and_terminal() -> None:
+    assert audit_base_text_debate_format(text=_formatted_round(2), round_num=2)["strict_ok"] is True
+    assert audit_base_text_debate_format(text=_formatted_round(3), round_num=3)["strict_ok"] is True
+    extra = audit_base_text_debate_format(text=_formatted_round(2) + "\nextra", round_num=2)
+    assert extra["strict_ok"] is False
+    assert "terminal_CONCLUDED" in extra["failures"]
+
+
+def test_base_text_debate_format_penalizes_legacy_truncation_trigger_without_removing_tail() -> None:
+    raw = (
+        "The reasons that my solution is better than my opponent's are:\n"
+        "1) first point. This unnumbered sentence used to be removed.\n"
+        "2) second point.\n"
+        "3) third point.\n"
+        "CONCLUDED"
+    )
+    audit = audit_base_text_debate_format(text=raw, round_num=2)
+
+    assert audit["strict_ok"] is False
+    assert audit["legacy_truncation_triggered"] is True
+    assert "legacy_truncation_trigger" in audit["failures"]
+
+
+def test_legacy_truncation_trigger_penalty_reaches_all_raw_round_tokens() -> None:
+    debate = _make_debate(
+        judge_raw_response={"bidirectional_judge": True, "order_invariant": True}
+    )
+    raw_r2 = (
+        "The reasons that my solution is better than my opponent's are:\n"
+        "1) first. Unnumbered offending tail.\n2) second.\n3) third.\nCONCLUDED"
+    )
+    for trajectory in (debate.trajectory_a, debate.trajectory_b):
+        trajectory.metrics.update({"r2": raw_r2, "r3": _formatted_round(3)})
+
+    split = assemble_split_train_examples(
+        debates=[debate],
+        num_rounds=3,
+        round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        r23_advantage_scope="merged_r23",
+        r23_format_failure_penalty=-1.0,
+    )
+
+    winner = split["debate"][0]
+    assert winner.target_ids[-5:] == [6, 7, 8, 9, 10]
+    assert winner.advantages[-5:] == [-0.25, -0.25, 0.0, 0.25, 0.25]
+    assert winner.metadata["r2_legacy_truncation_triggered"] is True
+    assert winner.metadata["r2_format_failure_penalty"] == -1.0
+
+
+def test_merged_r23_adds_binary_format_penalty_only_to_failed_round() -> None:
+    debate = _make_debate(
+        judge_raw_response={"bidirectional_judge": True, "order_invariant": True}
+    )
+    debate.trajectory_a.metrics.update({"r2": _formatted_round(2), "r3": "malformed"})
+    debate.trajectory_b.metrics.update({"r2": _formatted_round(2), "r3": _formatted_round(3)})
+    split = assemble_split_train_examples(
+        debates=[debate],
+        num_rounds=3,
+        round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        r23_advantage_scope="merged_r23",
+        r23_format_failure_penalty=-1.0,
+    )
+
+    winner = split["debate"][0]
+    loser = split["debate"][1]
+    assert winner.advantages[-5:] == [0.25, 0.25, 0.0, -0.25, -0.25]
+    assert loser.advantages[-5:] == [-0.25, -0.25, 0.0, -0.25, -0.25]
+    assert winner.metadata["r2_format_strict"] is True
+    assert winner.metadata["r3_format_strict"] is False
+    assert winner.metadata["r2_format_failure_penalty"] == 0.0
+    assert winner.metadata["r3_format_failure_penalty"] == -1.0
+    assert winner.metadata["r23_combined_reward"] == 0.0
 
 
 def test_split_projection_preserves_source_round_advantages() -> None:

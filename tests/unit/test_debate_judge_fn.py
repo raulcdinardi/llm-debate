@@ -10,6 +10,7 @@ from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
 from llm_local_rl.debate_tasks import HTSequenceDebateTask
 from llm_local_rl.judge_harness import (
     CONSTITUTION_SINGLE_TOKEN_V1,
+    PAIRWISE_SINGLE_TOKEN_V1,
     SOLUTION_R1_RATIONALE_V1,
 )
 from llm_local_rl.types import SamplingRequest, SamplingResult
@@ -71,12 +72,27 @@ class TinyChatTokenizer:
         return rendered
 
 
+class PinnedLfmLabelTokenizer(TinyChatTokenizer):
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        labels = {"A": [41], " A": [334], "B": [42], " B": [378]}
+        if text in labels:
+            return list(labels[text])
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
+        labels = {41: "A", 334: " A", 42: "B", 378: " B"}
+        if len(token_ids) == 1 and token_ids[0] in labels:
+            return labels[token_ids[0]]
+        return super().decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+
 @dataclass
 class RecordingSampler:
     tokenizer: object
     requests: list[SamplingRequest]
     batches: list[list[SamplingRequest]] = field(default_factory=list)
     judge_texts: list[str] = field(default_factory=list)
+    candidate_rows: list[dict[int, float]] = field(default_factory=list)
 
     def sample_many(self, requests: list[SamplingRequest]) -> list[SamplingResult]:
         self.batches.append(list(requests))
@@ -99,6 +115,11 @@ class RecordingSampler:
                     text=text,
                     behavior_policy=BehaviorPolicySpec.from_sampling_request(request),
                     completion_logprob_semantics=BEHAVIOR_POLICY_LOGPROBS,
+                    candidate_logprobs=(
+                        [self.candidate_rows.pop(0)]
+                        if request.candidate_logprob_token_ids
+                        else []
+                    ),
                     raw={},
                 )
             )
@@ -166,6 +187,87 @@ def test_external_judge_fn_short_circuits_three_round_policy_judge_sampling() ->
     ]
 
 
+def test_r1_only_bidirectional_judge_samples_both_orders_and_records_audit() -> None:
+    tokenizer = TinyChatTokenizer()
+    sampler = RecordingSampler(
+        tokenizer=tokenizer,
+        requests=[],
+        judge_texts=["A", "B"],
+    )
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=1,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="judge",
+            judge_harness_id=PAIRWISE_SINGLE_TOKEN_V1,
+            judge_bidirectional=True,
+            judge_constrain_single_token=True,
+        ),
+        adapter_layout="split",
+    )
+
+    debate = runtime.rollout(step_seed=7).debates[0]
+
+    assert len(sampler.batches) == 2
+    assert len(sampler.batches[-1]) == 2
+    assert debate.verdict == "A"
+    assert debate.judge_raw_response["bidirectional_judge"] is True
+    assert debate.judge_raw_response["forward_verdict"] == "A"
+    assert debate.judge_raw_response["reverse_verdict"] == "B"
+    assert debate.judge_raw_response["reverse_mapped_verdict"] == "A"
+    assert debate.judge_raw_response["order_invariant"] is True
+
+
+def test_order_symmetric_soft_judge_requests_four_logits_and_never_falls_back() -> None:
+    tokenizer = PinnedLfmLabelTokenizer()
+    sampler = RecordingSampler(
+        tokenizer=tokenizer,
+        requests=[],
+        judge_texts=["A", "B"],
+        candidate_rows=[
+            {41: 0.0, 334: 0.0, 42: -2.0, 378: -2.0},
+            {41: -2.0, 334: -2.0, 42: 0.0, 378: 0.0},
+        ],
+    )
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=1,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="judge",
+            judge_harness_id=PAIRWISE_SINGLE_TOKEN_V1,
+            judge_temperature=0.0,
+            judge_bidirectional=True,
+            judge_constrain_single_token=True,
+            judge_score_mode="order_sym_soft_logit",
+            judge_label_token_contract="lfm25_ab_whitespace_compat_v1",
+        ),
+        adapter_layout="split",
+    )
+
+    debate = runtime.rollout(step_seed=7).debates[0]
+
+    judge_requests = sampler.batches[-1]
+    assert all(request.allowed_token_ids == (41, 334, 42, 378) for request in judge_requests)
+    assert all(request.candidate_logprob_token_ids == (41, 334, 42, 378) for request in judge_requests)
+    assert all(request.max_tokens == 1 and request.temperature == 0.0 for request in judge_requests)
+    audit = debate.judge_raw_response
+    assert audit["aggregation"] == "order_sym_soft_logit_no_fallback"
+    assert audit["judge_label_token_contract"]["temporary"] is True
+    assert audit["soft_score"]["z_symmetric"] == pytest.approx(2.0)
+    assert audit["debate_reward_a"] == pytest.approx(0.7615941559557649)
+    assert audit["debate_reward_a"] + audit["debate_reward_b"] == pytest.approx(0.0)
+
+
 def test_frozen_base_sft_judge_uses_same_sampler_in_one_ordered_batch() -> None:
     tokenizer = TinyChatTokenizer()
     sampler = RecordingSampler(tokenizer=tokenizer, requests=[])
@@ -228,6 +330,7 @@ def test_single_token_harness_owns_parser_prefill_and_one_token_budget() -> None
             group_size=2,
             judge_adapter="judge",
             judge_harness_id=CONSTITUTION_SINGLE_TOKEN_V1,
+            judge_constrain_single_token=True,
         ),
         adapter_layout="split",
     )
@@ -237,6 +340,7 @@ def test_single_token_harness_owns_parser_prefill_and_one_token_budget() -> None
     judge_request = sampler.batches[-1][0]
     prompt = tokenizer.decode(judge_request.prompt_token_ids)
     assert judge_request.max_tokens == 1
+    assert judge_request.allowed_token_ids == (ord("A"), ord("B"))
     assert prompt.endswith(
         "The response most adherent to the constitution was written by Agent"
     )

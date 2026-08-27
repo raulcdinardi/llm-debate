@@ -21,6 +21,8 @@ class SamplingRequest:
     top_k: int = -1
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    allowed_token_ids: tuple[int, ...] = ()
+    candidate_logprob_token_ids: tuple[int, ...] = ()
     stop_strings: tuple[str, ...] = ()
     include_stop_str_in_output: bool = False
 
@@ -34,6 +36,7 @@ class SamplingResult:
     text: str
     behavior_policy: BehaviorPolicySpec | None = None
     completion_logprob_semantics: LogprobSemantics = "unspecified"
+    candidate_logprobs: list[dict[int, float]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
 

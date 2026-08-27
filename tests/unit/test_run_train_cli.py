@@ -7,7 +7,7 @@ import pytest
 
 from scripts.run_train import _parse_csv_tuple, _parse_init_adapter_dirs, parse_args
 from llm_local_rl.config import RolloutConfig, TrainRunConfig
-from llm_local_rl.judge_harness import SOLUTION_R1_RATIONALE_V1
+from llm_local_rl.judge_harness import CONSULTANCY_SINGLE_TOKEN_V1, SOLUTION_R1_RATIONALE_V1
 
 
 def test_parse_named_init_adapter_dirs() -> None:
@@ -63,7 +63,65 @@ def test_cli_defaults_all_sampling_temperatures_to_one() -> None:
     assert args.debate_r1_judge_delta_q == 1.0
     assert args.debate_incoherent_r23_reward == -0.5
     assert args.debate_judge_bidirectional is False
+    assert args.debate_judge_constrain_single_token is False
     assert args.judge_grpo_reward_mode == "coherence"
+
+
+def test_cli_accepts_frozen_single_token_judge_constraint() -> None:
+    args = parse_args(
+        [
+            "--model-path",
+            "/tmp/model",
+            "--output-dir",
+            "/tmp/out",
+            "--debate-judge-constrain-single-token",
+        ]
+    )
+    assert args.debate_judge_constrain_single_token is True
+
+
+def test_cli_accepts_temporary_soft_judge_contract_explicitly() -> None:
+    args = parse_args([
+        "--model-path", "/tmp/model",
+        "--output-dir", "/tmp/out",
+        "--debate-r1-reward", "judge_soft_task_gap",
+        "--debate-r23-reward", "soft_judge",
+        "--debate-judge-score-mode", "order_sym_soft_logit",
+        "--judge-label-token-contract", "lfm25_ab_whitespace_compat_v1",
+    ])
+    assert args.debate_r1_reward == "judge_soft_task_gap"
+    assert args.debate_r23_reward == "soft_judge"
+    assert args.debate_judge_score_mode == "order_sym_soft_logit"
+    assert args.judge_label_token_contract == "lfm25_ab_whitespace_compat_v1"
+
+
+def test_soft_judge_config_is_opt_in_and_fail_closed() -> None:
+    common = dict(
+        model_path="/model",
+        output_dir="/out",
+        rollout=RolloutConfig(mode="debate"),
+        adapter_layout="split",
+        debate_rounds=2,
+        debate_round_adapter_names=("solution", "debate", "debate"),
+        debate_r1_reward="judge_soft_task_gap",
+        debate_r23_reward="soft_judge",
+        debate_judge_harness=CONSULTANCY_SINGLE_TOKEN_V1,
+        debate_judge_temperature=0.0,
+        debate_judge_max_tokens=1,
+        debate_judge_bidirectional=True,
+        debate_judge_constrain_single_token=True,
+        debate_judge_score_mode="order_sym_soft_logit",
+    )
+    with pytest.raises(ValueError, match="explicit temporary"):
+        TrainRunConfig(**common)
+    config = TrainRunConfig(
+        **common,
+        judge_label_token_contract="lfm25_ab_whitespace_compat_v1",
+    )
+    assert config.to_dict()["judge_label_token_contract"] == "lfm25_ab_whitespace_compat_v1"
+    assert config.to_dict()["judge_label_token_contract_temporary"] is True
+    restored = TrainRunConfig.from_dict(config.to_dict())
+    assert restored.debate_judge_score_mode == "order_sym_soft_logit"
 
 
 def test_cli_accepts_label_judge_grpo_reward_mode() -> None:
@@ -201,6 +259,8 @@ def test_parse_sglang_sampler_backend_args(monkeypatch) -> None:
             "0.75",
             "--debate-r23-advantage-scope",
             "merged_r23",
+            "--debate-r23-format-failure-penalty",
+            "-1",
             "--sampler-sglang-pin-loras",
             "--no-sampler-sglang-unload-stale-adapters",
             "--on-policy-logprob-check",
@@ -232,6 +292,7 @@ def test_parse_sglang_sampler_backend_args(monkeypatch) -> None:
     assert args.weight_decay == 0.02
     assert args.max_grad_norm == 0.75
     assert args.debate_r23_advantage_scope == "merged_r23"
+    assert args.debate_r23_format_failure_penalty == -1.0
     assert args.sampler_sglang_pin_loras is True
     assert args.sampler_sglang_unload_stale_adapters is False
     assert args.on_policy_logprob_check is True

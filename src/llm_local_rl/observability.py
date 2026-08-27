@@ -10,6 +10,7 @@ from pathlib import Path
 from queue import Queue
 import re
 import threading
+import time
 from typing import Any
 import shutil
 
@@ -98,6 +99,9 @@ class RunObservability:
                 mode=self.settings.mode,
                 dir=str(self.state_dir),
                 config=config,
+            )
+            (self.state_dir / "wandb_run_url.txt").write_text(
+                str(self.run.url or "") + "\n"
             )
             self._worker = threading.Thread(target=self._artifact_worker, name="wandb-artifacts", daemon=True)
             self._worker.start()
@@ -227,6 +231,17 @@ class RunObservability:
 
     def finish(self) -> None:
         if self._worker is not None:
+            deadline = time.monotonic() + 1800.0
+            while self._queue.unfinished_tasks and time.monotonic() < deadline:
+                time.sleep(0.5)
+            if self._queue.unfinished_tasks:
+                self._failure(
+                    "finish_artifact_timeout",
+                    TimeoutError(
+                        f"W&B artifact queue retained {self._queue.unfinished_tasks} unfinished tasks"
+                    ),
+                )
+                return
             self._queue.put(None)
             self._worker.join(timeout=30.0)
             if self._worker.is_alive():
@@ -238,6 +253,7 @@ class RunObservability:
         if self.run is not None:
             try:
                 self.run.finish()
+                (self.state_dir / "wandb_finished").write_text("finished\n")
             except BaseException as exc:
                 self._failure("finish", exc)
 

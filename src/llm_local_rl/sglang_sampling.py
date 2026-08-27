@@ -280,6 +280,10 @@ class SglangSampler:
             list[tuple[int, SamplingRequest]],
         ] = {}
         for idx, request in enumerate(requests):
+            if request.allowed_token_ids or request.candidate_logprob_token_ids:
+                raise NotImplementedError(
+                    "Constrained candidate-logprob scoring is currently implemented only by vLLM."
+                )
             if (
                 request.top_k != -1
                 or request.presence_penalty != 0.0

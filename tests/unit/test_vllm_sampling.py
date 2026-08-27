@@ -76,6 +76,27 @@ class SamplingParamsWithoutLogprobsMode:
         }
 
 
+class SamplingParamsWithAllowedTokenIds:
+    def __init__(
+        self,
+        *,
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        presence_penalty,
+        repetition_penalty,
+        max_tokens,
+        stop_token_ids,
+        logprobs,
+        seed,
+        logprobs_mode,
+        allowed_token_ids=None,
+    ) -> None:
+        self.kwargs = locals().copy()
+        self.kwargs.pop("self")
+
+
 def test_vllm_sampling_params_pin_processed_behavior_logprobs_mode_when_supported() -> None:
     params = vllm_sampling._build_sampling_params(
         SamplingParamsWithLogprobsMode,
@@ -127,6 +148,61 @@ def test_vllm_sampling_params_preserve_nontrainable_judge_processors_without_cla
         ),
         backend_mode="processed_logprobs",
     ) == TEMPERATURE_SCALED_MODEL_LOGPROBS
+
+
+def test_vllm_sampling_params_record_and_apply_allowed_token_ids() -> None:
+    params = vllm_sampling._build_sampling_params(
+        SamplingParamsWithAllowedTokenIds,
+        temperature=1.0,
+        top_p=1.0,
+        min_p=0.0,
+        max_tokens=1,
+        stop_token_ids=(2,),
+        seed=123,
+        trace_top_logprobs=1,
+        allowed_token_ids=(41, 334, 42, 378),
+    )
+
+    assert params.kwargs["allowed_token_ids"] == [41, 334, 42, 378]
+    policy = BehaviorPolicySpec(allowed_token_ids=(41, 334, 42, 378))
+    assert not policy.exact_trainer_reconstruction_supported()
+    assert policy.to_dict()["allowed_token_ids"] == (41, 334, 42, 378)
+
+
+def test_candidate_logprob_contract_requests_and_extracts_all_allowed_labels() -> None:
+    params = vllm_sampling._build_sampling_params(
+        SamplingParamsWithAllowedTokenIds,
+        temperature=0.0,
+        top_p=1.0,
+        min_p=0.0,
+        max_tokens=1,
+        stop_token_ids=(2,),
+        seed=123,
+        trace_top_logprobs=0,
+        allowed_token_ids=(41, 334, 42, 378),
+        candidate_logprob_token_ids=(41, 334, 42, 378),
+    )
+    assert params.kwargs["logprobs"] == 4
+    rows = vllm_sampling._extract_candidate_logprobs(
+        token_ids=[334],
+        token_logprobs=[{
+            41: SimpleNamespace(logprob=-1.0),
+            334: SimpleNamespace(logprob=-0.2),
+            42: SimpleNamespace(logprob=-2.0),
+            378: SimpleNamespace(logprob=-1.5),
+        }],
+        candidate_token_ids=(41, 334, 42, 378),
+    )
+    assert rows == [{41: -1.0, 334: -0.2, 42: -2.0, 378: -1.5}]
+
+
+def test_candidate_logprob_contract_rejects_missing_candidate() -> None:
+    with pytest.raises(RuntimeError, match="Missing requested candidate token ids"):
+        vllm_sampling._extract_candidate_logprobs(
+            token_ids=[41],
+            token_logprobs=[{41: SimpleNamespace(logprob=-0.1)}],
+            candidate_token_ids=(41, 334, 42, 378),
+        )
 
 
 def test_vllm_logprob_semantics_distinguish_policy_and_greedy_judge_requests() -> None:

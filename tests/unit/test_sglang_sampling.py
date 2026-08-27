@@ -133,6 +133,22 @@ def _payloads(server: _FakeSglangServer, path: str) -> list[dict]:
     return [entry["payload"] for entry in server.requests if entry["path"] == path]
 
 
+def test_sglang_rejects_candidate_logprob_requests_before_network() -> None:
+    sampler = object.__new__(SglangSampler)
+    request = SamplingRequest(
+        adapter_name="judge",
+        prompt_token_ids=[1, 2, 3],
+        stop_token_ids=[],
+        max_tokens=1,
+        temperature=0.0,
+        allowed_token_ids=(41, 334, 42, 378),
+        candidate_logprob_token_ids=(41, 334, 42, 378),
+    )
+
+    with pytest.raises(NotImplementedError, match="only by vLLM"):
+        sampler.sample_many([request])
+
+
 def test_load_adapter_accepts_only_matching_already_loaded_error(tmp_path: Path) -> None:
     sampler = object.__new__(SglangSampler)
     sampler.runtime = SglangRuntimeConfig()

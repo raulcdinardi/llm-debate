@@ -2,12 +2,110 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+import re
 from typing import Any, Callable, Literal
 
 from llm_local_rl.prompts import load_prompt
 from llm_local_rl.types import TrainExample
 
 Verdict = Literal["A", "B", "INVALID"]
+
+_BASE_R2_HEADER = "The reasons that my solution is better than my opponent's are:\n1)"
+_BASE_R3_HEADER = "Responding to my opponent's criticism:\n1)"
+_DEBATE_POINT_RE = re.compile(r"(?m)^\s*([1-9])\)")
+_DEBATE_CONCLUDED_RE = re.compile(r"(?m)^\s*CONCLUDED\s*$")
+_LEGACY_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+_LEGACY_THINK_TAIL_RE = re.compile(r"<think>.*$", re.IGNORECASE | re.DOTALL)
+_LEGACY_CLOSING_THINK_RE = re.compile(r"</think>", re.IGNORECASE)
+_LEGACY_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+_LEGACY_NUMBERED_SENTENCE_RE = re.compile(r"^\s*\d+\)")
+_EOS_LITERAL = "<|endoftext|>"
+
+
+def _legacy_numbered_completion_would_truncate(text: str) -> bool:
+    """Return whether the removed runtime truncator would have shortened ``text``."""
+    clean = _LEGACY_THINK_BLOCK_RE.sub("", text)
+    clean = _LEGACY_THINK_TAIL_RE.sub("", clean)
+    clean = _LEGACY_CLOSING_THINK_RE.sub("", clean)
+    clean = clean.strip().replace(_EOS_LITERAL, "").split("CONCLUDED", 1)[0].strip()
+    if not clean:
+        return False
+    kept_end = 0
+    raw_start = 0
+    boundaries = [match.end() for match in _LEGACY_SENTENCE_BOUNDARY_RE.finditer(clean)]
+    boundaries.append(len(clean))
+    for raw_end in boundaries:
+        raw_segment = clean[raw_start:raw_end]
+        if raw_segment.strip():
+            right_trimmed_segment = raw_segment.rstrip()
+            is_numbered = kept_end == 0 or bool(
+                _LEGACY_NUMBERED_SENTENCE_RE.match(right_trimmed_segment)
+            )
+            if is_numbered:
+                kept_end = raw_start + len(right_trimmed_segment)
+            else:
+                break
+        raw_start = raw_end
+    truncated = clean[:kept_end].strip()
+    return bool(truncated and truncated != clean)
+
+
+def audit_base_text_debate_format(*, text: str, round_num: int) -> dict[str, Any]:
+    """Audit the exact visible R2/R3 contract used by the base-text harness.
+
+    The canonical header and ``1)`` are prompt-side prefill.  They are checked
+    to ensure the expected harness was used, but only sampled completion tokens
+    receive advantages, so no reward is assigned to the prefill itself.
+    """
+    if round_num not in (2, 3):
+        raise ValueError(f"round_num must be 2 or 3, got {round_num!r}")
+    header = _BASE_R2_HEADER if round_num == 2 else _BASE_R3_HEADER
+    visible = text or ""
+    markers = list(_DEBATE_POINT_RE.finditer(visible))
+    marker_numbers = [int(match.group(1)) for match in markers]
+    conclusions = list(_DEBATE_CONCLUDED_RE.finditer(visible))
+    header_ok = visible.startswith(header)
+    completion_text = visible[len(header):] if header_ok else visible
+    would_have_truncated = _legacy_numbered_completion_would_truncate(completion_text)
+    numbering_ok = marker_numbers == [1, 2, 3]
+    concluded_once = len(conclusions) == 1
+    concluded_terminal = concluded_once and not visible[conclusions[0].end():].strip()
+    nonempty_points = False
+    if numbering_ok:
+        end = conclusions[0].start() if concluded_once else len(visible)
+        spans = [
+            visible[markers[index].end():(markers[index + 1].start() if index < 2 else end)].strip()
+            for index in range(3)
+        ]
+        nonempty_points = all(re.search(r"[A-Za-z0-9]", span) for span in spans)
+    strict_ok = (
+        header_ok
+        and numbering_ok
+        and nonempty_points
+        and concluded_terminal
+        and not would_have_truncated
+    )
+    failures = []
+    if not header_ok:
+        failures.append("canonical_header")
+    if not numbering_ok:
+        failures.append("exact_1_2_3_numbering")
+    if not nonempty_points:
+        failures.append("three_nonempty_points")
+    if not concluded_terminal:
+        failures.append("terminal_CONCLUDED")
+    if would_have_truncated:
+        failures.append("legacy_truncation_trigger")
+    return {
+        "strict_ok": strict_ok,
+        "header_ok": header_ok,
+        "numbering_ok": numbering_ok,
+        "nonempty_points_ok": nonempty_points,
+        "concluded_terminal_ok": concluded_terminal,
+        "legacy_truncation_triggered": would_have_truncated,
+        "point_markers": marker_numbers,
+        "failures": failures,
+    }
 
 
 @dataclass
@@ -924,6 +1022,7 @@ def assemble_split_train_examples(
     task_reward_fn: Callable[[DebateTrajectory, DebateResult], float],
     r1_judge_delta_q: float = 1.0,
     incoherent_r23_reward: float = -0.5,
+    r23_format_failure_penalty: float = 0.0,
     pointwise_reward_map: dict[int, float] | None = None,
     r23_advantage_scope: Literal["per_round", "merged_r23"] = "per_round",
 ) -> dict[str, list[TrainExample]]:
@@ -935,7 +1034,19 @@ def assemble_split_train_examples(
         raise ValueError("r1_judge_delta_q must be finite and non-negative")
     if not math.isfinite(incoherent_r23_reward):
         raise ValueError("incoherent_r23_reward must be finite")
+    if not math.isfinite(r23_format_failure_penalty) or r23_format_failure_penalty > 0.0:
+        raise ValueError("r23_format_failure_penalty must be finite and non-positive")
     grouped: dict[str, list[TrainExample]] = {}
+
+    def _soft_score(debate: DebateResult) -> float:
+        audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
+        score_record = audit.get("soft_score")
+        if audit.get("soft_judge") is not True or not isinstance(score_record, dict):
+            raise ValueError("Soft judge reward requires an order-symmetric soft-score audit")
+        score = float(score_record.get("score"))
+        if not math.isfinite(score) or score < -1.0 or score > 1.0:
+            raise ValueError(f"Invalid soft judge score: {score!r}")
+        return score
 
     def _append_turn(*, adapter_name: str, prompt_tokens: list[int], completion_tokens: list[int], completion_logprobs: list[float], advantages: list[float], metadata: dict[str, Any]) -> None:
         datum = TrainingDatum(
@@ -1008,6 +1119,19 @@ def assemble_split_train_examples(
             winner_agent = debate.get_winner_trajectory().agent
             r1_a = task_a + modulation if winner_agent == traj_a.agent else task_a - modulation
             r1_b = task_b + modulation if winner_agent == traj_b.agent else task_b - modulation
+        elif r1_reward_mode == "judge_soft_task_gap":
+            task_a = float(task_reward_fn(traj_a, debate))
+            task_b = float(task_reward_fn(traj_b, debate))
+            if not math.isfinite(task_a) or not math.isfinite(task_b):
+                raise ValueError(f"Non-finite task reward for question={debate.question!r}")
+            score = _soft_score(debate)
+            midpoint = 0.5 * (task_a + task_b)
+            half_gap = 0.5 * abs(task_a - task_b)
+            r1_a = midpoint + score * half_gap
+            r1_b = midpoint - score * half_gap
+            residual = (r1_a + r1_b) - (task_a + task_b)
+            if abs(residual) > 1e-12:
+                raise AssertionError(f"Soft R1 reward failed pair-sum conservation: {residual}")
         elif r1_reward_mode == "judge_pointwise":
             if pointwise_reward_map is None:
                 raise ValueError("judge_pointwise requires pointwise_reward_map")
@@ -1108,6 +1232,20 @@ def assemble_split_train_examples(
                             "r1_judge_delta_q": r1_judge_delta_q,
                             "r1_modulated_reward": r1_reward,
                         })
+                    elif r1_reward_mode == "judge_soft_task_gap":
+                        task_a = float(task_reward_fn(debate.trajectory_a, debate))
+                        task_b = float(task_reward_fn(debate.trajectory_b, debate))
+                        score = _soft_score(debate)
+                        r1_metadata.update({
+                            "reason": "split_layout_judge_soft_task_gap_projection",
+                            "r1_reward_mode": "judge_soft_task_gap",
+                            "judge_soft_score": score,
+                            "r1_task_reward": float(task_reward_fn(traj, debate)),
+                            "r1_task_reward_gap": abs(task_a - task_b),
+                            "r1_task_reward_pair_sum": task_a + task_b,
+                            "r1_soft_reward": r1_reward,
+                            "r1_soft_reward_pair_sum_residual": 0.0,
+                        })
                 _append_turn(
                     adapter_name=round_adapter_names[0],
                     prompt_tokens=t1.prompt_tokens,
@@ -1120,22 +1258,35 @@ def assemble_split_train_examples(
                 t2 = traj.transitions[1]
                 judge_audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
                 coherent = judge_audit.get("order_invariant") is True
-                signed = (
-                    winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
-                ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
+                if r23_reward_mode == "soft_judge":
+                    score = _soft_score(debate)
+                    signed = score if traj.agent == "A" else -score
+                else:
+                    signed = (
+                        winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
+                    ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
+                r2_format = audit_base_text_debate_format(
+                    text=str(traj.metrics.get("r2", "")), round_num=2
+                ) if r23_format_failure_penalty != 0.0 else {"strict_ok": True, "failures": []}
+                r2_format_penalty = 0.0 if r2_format["strict_ok"] else r23_format_failure_penalty
                 if len(t2.completion_tokens) == 0:
                     raise ValueError("R2 completion tokens empty.")
                 if num_rounds >= 3 and round_adapter_names[1] == round_adapter_names[2]:
                     t3 = traj.transitions[2]
                     if len(t3.completion_tokens) == 0:
                         raise ValueError("R3 completion tokens empty.")
+                    r3_format = audit_base_text_debate_format(
+                        text=str(traj.metrics.get("r3", "")), round_num=3
+                    ) if r23_format_failure_penalty != 0.0 else {"strict_ok": True, "failures": []}
+                    r3_format_penalty = 0.0 if r3_format["strict_ok"] else r23_format_failure_penalty
                     if r23_advantage_scope == "per_round":
-                        first_adv_value = signed / len(t2.completion_tokens)
-                        second_adv_value = signed / len(t3.completion_tokens)
+                        first_adv_value = (signed + r2_format_penalty) / len(t2.completion_tokens)
+                        second_adv_value = (signed + r3_format_penalty) / len(t3.completion_tokens)
                     else:
                         r23_token_count = len(t2.completion_tokens) + len(t3.completion_tokens)
-                        first_adv_value = signed / r23_token_count
-                        second_adv_value = signed / r23_token_count
+                        base_adv_value = signed / r23_token_count
+                        first_adv_value = base_adv_value + r2_format_penalty / len(t2.completion_tokens)
+                        second_adv_value = base_adv_value + r3_format_penalty / len(t3.completion_tokens)
                     datum = _merge_transition_pair_with_adv_values(
                         debate=debate,
                         traj=traj,
@@ -1152,11 +1303,27 @@ def assemble_split_train_examples(
                             "round_nums": [2, 3],
                             "rounds_merged": 2,
                             "r23_reward": signed,
+                            "r23_base_judge_reward": signed,
+                            "r2_format_strict": r2_format["strict_ok"],
+                            "r3_format_strict": r3_format["strict_ok"],
+                            "r2_format_failures": r2_format["failures"],
+                            "r3_format_failures": r3_format["failures"],
+                            "r2_legacy_truncation_triggered": r2_format.get("legacy_truncation_triggered", False),
+                            "r3_legacy_truncation_triggered": r3_format.get("legacy_truncation_triggered", False),
+                            "r2_format_failure_penalty": r2_format_penalty,
+                            "r3_format_failure_penalty": r3_format_penalty,
+                            "r23_combined_reward": signed + r2_format_penalty + r3_format_penalty,
                             "r23_advantage_scope": r23_advantage_scope,
                             "r23_first_adv_value": first_adv_value,
                             "r23_second_adv_value": second_adv_value,
                             "judge_order_invariant": coherent,
-                            "r23_incoherent_reward_applied": not coherent and judge_audit.get("bidirectional_judge") is True,
+                            "r23_incoherent_reward_applied": (
+                                r23_reward_mode != "soft_judge"
+                                and not coherent
+                                and judge_audit.get("bidirectional_judge") is True
+                            ),
+                            "r23_reward_mode": r23_reward_mode,
+                            "judge_soft_score": _soft_score(debate) if r23_reward_mode == "soft_judge" else None,
                         },
                     )
                     grouped.setdefault(round_adapter_names[1], []).append(
@@ -1168,7 +1335,7 @@ def assemble_split_train_examples(
                     prompt_tokens=t2.prompt_tokens,
                     completion_tokens=t2.completion_tokens,
                     completion_logprobs=t2.completion_logprobs,
-                    advantages=[signed / len(t2.completion_tokens)] * len(t2.completion_tokens),
+                    advantages=[(signed + r2_format_penalty) / len(t2.completion_tokens)] * len(t2.completion_tokens),
                     metadata={
                         "question": debate.question[:100],
                         "agent": traj.agent,
@@ -1177,18 +1344,38 @@ def assemble_split_train_examples(
                         "reason": "split_layout_per_round_projection",
                         "round_num": 2,
                         "r23_reward": signed,
+                        "r23_base_judge_reward": signed,
+                        "r2_format_strict": r2_format["strict_ok"],
+                        "r2_format_failures": r2_format["failures"],
+                        "r2_legacy_truncation_triggered": r2_format.get("legacy_truncation_triggered", False),
+                        "r2_format_failure_penalty": r2_format_penalty,
+                        "r2_effective_reward": signed + r2_format_penalty,
                         "r23_advantage_scope": r23_advantage_scope,
                         "judge_order_invariant": coherent,
-                        "r23_incoherent_reward_applied": not coherent and judge_audit.get("bidirectional_judge") is True,
+                        "r23_incoherent_reward_applied": (
+                            r23_reward_mode != "soft_judge"
+                            and not coherent
+                            and judge_audit.get("bidirectional_judge") is True
+                        ),
+                        "r23_reward_mode": r23_reward_mode,
+                        "judge_soft_score": _soft_score(debate) if r23_reward_mode == "soft_judge" else None,
                     },
                 )
             if num_rounds >= 3:
                 t3 = traj.transitions[2]
                 judge_audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
                 coherent = judge_audit.get("order_invariant") is True
-                signed = (
-                    winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
-                ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
+                if r23_reward_mode == "soft_judge":
+                    score = _soft_score(debate)
+                    signed = score if traj.agent == "A" else -score
+                else:
+                    signed = (
+                        winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
+                    ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
+                r3_format = audit_base_text_debate_format(
+                    text=str(traj.metrics.get("r3", "")), round_num=3
+                ) if r23_format_failure_penalty != 0.0 else {"strict_ok": True, "failures": []}
+                r3_format_penalty = 0.0 if r3_format["strict_ok"] else r23_format_failure_penalty
                 if len(t3.completion_tokens) == 0:
                     raise ValueError("R3 completion tokens empty.")
                 _append_turn(
@@ -1196,7 +1383,7 @@ def assemble_split_train_examples(
                     prompt_tokens=t3.prompt_tokens,
                     completion_tokens=t3.completion_tokens,
                     completion_logprobs=t3.completion_logprobs,
-                    advantages=[signed / len(t3.completion_tokens)] * len(t3.completion_tokens),
+                    advantages=[(signed + r3_format_penalty) / len(t3.completion_tokens)] * len(t3.completion_tokens),
                     metadata={
                         "question": debate.question[:100],
                         "agent": traj.agent,
@@ -1205,9 +1392,21 @@ def assemble_split_train_examples(
                         "reason": "split_layout_per_round_projection",
                         "round_num": 3,
                         "r23_reward": signed,
+                        "r23_base_judge_reward": signed,
+                        "r3_format_strict": r3_format["strict_ok"],
+                        "r3_format_failures": r3_format["failures"],
+                        "r3_legacy_truncation_triggered": r3_format.get("legacy_truncation_triggered", False),
+                        "r3_format_failure_penalty": r3_format_penalty,
+                        "r3_effective_reward": signed + r3_format_penalty,
                         "r23_advantage_scope": r23_advantage_scope,
                         "judge_order_invariant": coherent,
-                        "r23_incoherent_reward_applied": not coherent and judge_audit.get("bidirectional_judge") is True,
+                        "r23_incoherent_reward_applied": (
+                            r23_reward_mode != "soft_judge"
+                            and not coherent
+                            and judge_audit.get("bidirectional_judge") is True
+                        ),
+                        "r23_reward_mode": r23_reward_mode,
+                        "judge_soft_score": _soft_score(debate) if r23_reward_mode == "soft_judge" else None,
                     },
                 )
     return grouped
@@ -1217,26 +1416,15 @@ def assemble_judge_coherence_grpo_examples(
     debates: list[DebateResult],
     *,
     adapter_name: str = "judge",
-    reward_mode: str = "coherence",
 ) -> tuple[list[TrainExample], dict[str, float | int]]:
     """Build one global GRPO group from both judge orderings of every debate.
 
-    coherence mode: each ordering receives the pair-level raw reward, +1 for
-    referent-coherent forward/reverse verdicts and -1 otherwise.
-
-    label mode: each ordering receives a per-judgment raw reward from the
-    ground-truth trajectory rewards, +1 when that ordering's sampled verdict
-    selects the gold referent and -1 otherwise (INVALID verdicts score -1;
-    reward ties score 0 for both orderings).
-
-    Population z-scoring is performed once across all judgments, deliberately
-    not within each equal-reward pair.
+    Each ordering receives the pair-level raw reward: +1 for referent-coherent
+    forward/reverse verdicts and -1 otherwise. Population z-scoring is performed
+    once across all judgments, deliberately not within each equal-reward pair.
     """
-    if reward_mode not in ("coherence", "label"):
-        raise ValueError(f"unsupported judge GRPO reward mode: {reward_mode!r}")
-    turns: list[tuple[DebateResult, dict[str, Any], float, str | None, str]] = []
+    turns: list[tuple[DebateResult, dict[str, Any], float]] = []
     coherent_debates = 0
-    label_correct_judgments = 0
     for debate in debates:
         audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
         if audit.get("bidirectional_judge") is not True:
@@ -1246,53 +1434,25 @@ def assemble_judge_coherence_grpo_examples(
             raise ValueError("judge coherence GRPO requires exactly two sampled judgment turns per debate")
         coherent = audit.get("order_invariant") is True
         coherent_debates += int(coherent)
-        if reward_mode == "coherence":
-            pair_reward = 1.0 if coherent else -1.0
-            for turn in training_turns:
-                if not isinstance(turn, dict):
-                    raise ValueError("judge training turn must be a mapping")
-                turns.append((debate, turn, pair_reward, None, "INVALID"))
-        else:
-            reward_a = float(debate.trajectory_a.metrics["task_reward"])
-            reward_b = float(debate.trajectory_b.metrics["task_reward"])
-            gold_agent = "A" if reward_a > reward_b else "B" if reward_b > reward_a else None
-            for turn in training_turns:
-                if not isinstance(turn, dict):
-                    raise ValueError("judge training turn must be a mapping")
-                verdict = turn.get("verdict")
-                if turn.get("order") == "reverse":
-                    verdict = "B" if verdict == "A" else "A" if verdict == "B" else "INVALID"
-                if gold_agent is None:
-                    reward = 0.0
-                else:
-                    reward = 1.0 if verdict == gold_agent else -1.0
-                label_correct_judgments += int(reward > 0.0)
-                turns.append((debate, turn, reward, gold_agent, str(verdict)))
+        reward = 1.0 if coherent else -1.0
+        for turn in training_turns:
+            if not isinstance(turn, dict):
+                raise ValueError("judge training turn must be a mapping")
+            turns.append((debate, turn, reward))
 
-    rewards = [reward for _debate, _turn, reward, _gold_agent, _verdict in turns]
+    rewards = [reward for _debate, _turn, reward in turns]
     if not rewards:
         return [], {
             "judge_grpo_group_size": 0,
             "judge_grpo_reward_mean": 0.0,
             "judge_grpo_reward_std": 0.0,
             "judge_grpo_coherent_debates": 0,
-            "judge_grpo_incoherent_debates": 0,
-            "judge_grpo_reward_mode": reward_mode,
-            **(
-                {
-                    "judge_grpo_label_correct_judgments": 0,
-                    "judge_grpo_label_total_judgments": 0,
-                    "judge_grpo_label_accuracy": 0.0,
-                }
-                if reward_mode == "label"
-                else {}
-            ),
         }
     reward_mean = sum(rewards) / len(rewards)
     reward_var = sum((reward - reward_mean) ** 2 for reward in rewards) / len(rewards)
     reward_std = math.sqrt(reward_var)
     examples: list[TrainExample] = []
-    for judgment_index, (debate, turn, reward, gold_agent, referent_verdict) in enumerate(turns):
+    for judgment_index, (debate, turn, reward) in enumerate(turns):
         prompt_tokens = list(turn.get("prompt_tokens", []))
         completion_tokens = list(turn.get("completion_tokens", []))
         completion_logprobs = [float(value) for value in turn.get("completion_logprobs", [])]
@@ -1308,31 +1468,11 @@ def assemble_judge_coherence_grpo_examples(
             completion_logprob_mask=[1] * len(completion_tokens),
             completion_advantages=[zscore / len(completion_tokens)] * len(completion_tokens),
             metadata={
-                "reason": (
-                    "judge_bidirectional_label_grpo"
-                    if reward_mode == "label"
-                    else "judge_bidirectional_coherence_grpo"
-                ),
-                "judge_grpo_reward_mode": reward_mode,
+                "reason": "judge_bidirectional_coherence_grpo",
                 "question": debate.question[:100],
                 "judge_order": turn.get("order"),
-                "judge_order_invariant": (
-                    debate.judge_raw_response.get("order_invariant") is True
-                    if isinstance(debate.judge_raw_response, dict)
-                    else False
-                ),
-                **(
-                    {
-                        "judge_coherence_reward": reward,
-                    }
-                    if reward_mode == "coherence"
-                    else {
-                        "judge_label_gold_agent": gold_agent,
-                        "judge_label_referent_verdict": referent_verdict,
-                        "judge_label_correct": reward > 0.0,
-                        "judge_label_reward": reward,
-                    }
-                ),
+                "judge_coherent": reward > 0.0,
+                "judge_coherence_reward": reward,
                 "judge_grpo_group_index": 0,
                 "judge_grpo_group_size": len(turns),
                 "judge_grpo_reward_mean": reward_mean,
@@ -1348,16 +1488,6 @@ def assemble_judge_coherence_grpo_examples(
         "judge_grpo_reward_std": reward_std,
         "judge_grpo_coherent_debates": coherent_debates,
         "judge_grpo_incoherent_debates": len(debates) - coherent_debates,
-        "judge_grpo_reward_mode": reward_mode,
-        **(
-            {
-                "judge_grpo_label_correct_judgments": label_correct_judgments,
-                "judge_grpo_label_total_judgments": len(turns),
-                "judge_grpo_label_accuracy": label_correct_judgments / len(turns),
-            }
-            if reward_mode == "label"
-            else {}
-        ),
     }
 
 
