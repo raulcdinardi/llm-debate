@@ -1,0 +1,15 @@
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+.coverage
+.env
+.env.*
+!.env.example
+checkpoints/
+artifacts/
+logs/
+hf_home/
+.mypy_cache/
