@@ -26,10 +26,10 @@ LogprobSemantics = Literal[
 class BehaviorPolicySpec:
     """Normalized distribution used to sample policy actions.
 
-    The current trainer can exactly reconstruct temperature scaling. It does
-    not yet reproduce truncation or history-dependent logit processors, so
-    those settings are rejected for PPO rather than silently scored under a
-    different distribution.
+    The current trainer can exactly reconstruct temperature scaling and a
+    finite allowed-token mask. It does not reproduce truncation or
+    history-dependent logit processors, so those settings are rejected for PPO
+    rather than silently scored under a different distribution.
     """
 
     temperature: float = 1.0
@@ -130,10 +130,6 @@ class BehaviorPolicySpec:
         if float(self.repetition_penalty) != 1.0:
             unsupported.append(
                 f"repetition_penalty={self.repetition_penalty} (only 1.0 is supported)"
-            )
-        if self.allowed_token_ids:
-            unsupported.append(
-                f"allowed_token_ids={self.allowed_token_ids} (constrained normalization is unsupported)"
             )
         if unsupported:
             raise ValueError(

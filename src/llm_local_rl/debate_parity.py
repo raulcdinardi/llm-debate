@@ -1416,15 +1416,23 @@ def assemble_judge_coherence_grpo_examples(
     debates: list[DebateResult],
     *,
     adapter_name: str = "judge",
-) -> tuple[list[TrainExample], dict[str, float | int]]:
-    """Build one global GRPO group from both judge orderings of every debate.
+    reward_mode: str = "coherence",
+) -> tuple[list[TrainExample], dict[str, float | int | str]]:
+    """Build one global judge-GRPO group from both transcript orderings.
 
-    Each ordering receives the pair-level raw reward: +1 for referent-coherent
-    forward/reverse verdicts and -1 otherwise. Population z-scoring is performed
-    once across all judgments, deliberately not within each equal-reward pair.
+    ``label_js`` keeps objective OpenBookQA label supervision and replaces the
+    old binary order-coherence term with a continuous, referent-aligned
+    Jensen-Shannon penalty.  JS is normalized by ln(2), so no scale coefficient
+    is needed: ``raw_reward = label_reward - JS/ln(2)``.
     """
-    turns: list[tuple[DebateResult, dict[str, Any], float]] = []
+    if reward_mode not in ("coherence", "label", "label_js"):
+        raise ValueError(f"unsupported judge GRPO reward mode: {reward_mode!r}")
+    turns: list[
+        tuple[DebateResult, dict[str, Any], float, str | None, str, float, float]
+    ] = []
     coherent_debates = 0
+    label_correct_judgments = 0
+    js_values: list[float] = []
     for debate in debates:
         audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
         if audit.get("bidirectional_judge") is not True:
@@ -1434,25 +1442,65 @@ def assemble_judge_coherence_grpo_examples(
             raise ValueError("judge coherence GRPO requires exactly two sampled judgment turns per debate")
         coherent = audit.get("order_invariant") is True
         coherent_debates += int(coherent)
-        reward = 1.0 if coherent else -1.0
+        if reward_mode == "coherence":
+            pair_reward = 1.0 if coherent else -1.0
+            for turn in training_turns:
+                if not isinstance(turn, dict):
+                    raise ValueError("judge training turn must be a mapping")
+                turns.append((debate, turn, pair_reward, None, "INVALID", pair_reward, 0.0))
+            continue
+
+        reward_a = float(debate.trajectory_a.metrics["task_reward"])
+        reward_b = float(debate.trajectory_b.metrics["task_reward"])
+        gold_agent = "A" if reward_a > reward_b else "B" if reward_b > reward_a else None
+        js_penalty = 0.0
+        if reward_mode == "label_js":
+            soft_record = audit.get("soft_score")
+            if audit.get("soft_judge") is not True or not isinstance(soft_record, dict):
+                raise ValueError("label_js judge GRPO requires a soft-score audit")
+            js_penalty = float(soft_record.get("referent_js_divergence_normalized"))
+            if not math.isfinite(js_penalty) or not 0.0 <= js_penalty <= 1.0 + 1e-12:
+                raise ValueError(f"invalid normalized referent JS penalty: {js_penalty!r}")
+            js_penalty = min(1.0, js_penalty)
+            js_values.append(js_penalty)
         for turn in training_turns:
             if not isinstance(turn, dict):
                 raise ValueError("judge training turn must be a mapping")
-            turns.append((debate, turn, reward))
+            verdict = turn.get("verdict")
+            if turn.get("order") == "reverse":
+                verdict = "B" if verdict == "A" else "A" if verdict == "B" else "INVALID"
+            label_reward = (
+                0.0 if gold_agent is None else 1.0 if verdict == gold_agent else -1.0
+            )
+            label_correct_judgments += int(label_reward > 0.0)
+            reward = label_reward - js_penalty
+            turns.append(
+                (debate, turn, reward, gold_agent, str(verdict), label_reward, js_penalty)
+            )
 
-    rewards = [reward for _debate, _turn, reward in turns]
+    rewards = [reward for _debate, _turn, reward, *_rest in turns]
     if not rewards:
         return [], {
             "judge_grpo_group_size": 0,
             "judge_grpo_reward_mean": 0.0,
             "judge_grpo_reward_std": 0.0,
             "judge_grpo_coherent_debates": 0,
+            "judge_grpo_incoherent_debates": 0,
+            "judge_grpo_reward_mode": reward_mode,
         }
     reward_mean = sum(rewards) / len(rewards)
     reward_var = sum((reward - reward_mean) ** 2 for reward in rewards) / len(rewards)
     reward_std = math.sqrt(reward_var)
     examples: list[TrainExample] = []
-    for judgment_index, (debate, turn, reward) in enumerate(turns):
+    for judgment_index, (
+        debate,
+        turn,
+        reward,
+        gold_agent,
+        referent_verdict,
+        label_reward,
+        js_penalty,
+    ) in enumerate(turns):
         prompt_tokens = list(turn.get("prompt_tokens", []))
         completion_tokens = list(turn.get("completion_tokens", []))
         completion_logprobs = [float(value) for value in turn.get("completion_logprobs", [])]
@@ -1460,6 +1508,16 @@ def assemble_judge_coherence_grpo_examples(
             raise ValueError("judge coherence GRPO completion tokens empty")
         if len(completion_tokens) != len(completion_logprobs):
             raise ValueError("judge coherence GRPO completion/logprob lengths differ")
+        allowed_token_ids = tuple(
+            int(token_id) for token_id in turn.get("behavior_policy_allowed_token_ids", ())
+        )
+        if reward_mode == "label_js":
+            if len(allowed_token_ids) != 2 or len(set(allowed_token_ids)) != 2:
+                raise ValueError(
+                    "label_js judge GRPO requires exactly two behavior-policy label tokens"
+                )
+            if any(token_id not in allowed_token_ids for token_id in completion_tokens):
+                raise ValueError("judge completion escaped its two-token behavior policy")
         zscore = (reward - reward_mean) / reward_std if reward_std > 0.0 else 0.0
         datum = TrainingDatum(
             prompt_tokens=prompt_tokens,
@@ -1468,11 +1526,23 @@ def assemble_judge_coherence_grpo_examples(
             completion_logprob_mask=[1] * len(completion_tokens),
             completion_advantages=[zscore / len(completion_tokens)] * len(completion_tokens),
             metadata={
-                "reason": "judge_bidirectional_coherence_grpo",
+                "reason": f"judge_bidirectional_{reward_mode}_grpo",
+                "judge_grpo_reward_mode": reward_mode,
                 "question": debate.question[:100],
                 "judge_order": turn.get("order"),
-                "judge_coherent": reward > 0.0,
-                "judge_coherence_reward": reward,
+                "judge_order_invariant": (
+                    debate.judge_raw_response.get("order_invariant") is True
+                    if isinstance(debate.judge_raw_response, dict)
+                    else False
+                ),
+                "judge_label_gold_agent": gold_agent,
+                "judge_label_referent_verdict": referent_verdict,
+                "judge_label_correct": label_reward > 0.0,
+                "judge_label_reward": label_reward,
+                "judge_referent_js_penalty": js_penalty,
+                "judge_label_js_reward": reward if reward_mode == "label_js" else None,
+                "judge_coherence_reward": reward if reward_mode == "coherence" else None,
+                "behavior_policy_allowed_token_ids": list(allowed_token_ids),
                 "judge_grpo_group_index": 0,
                 "judge_grpo_group_size": len(turns),
                 "judge_grpo_reward_mean": reward_mean,
@@ -1488,6 +1558,25 @@ def assemble_judge_coherence_grpo_examples(
         "judge_grpo_reward_std": reward_std,
         "judge_grpo_coherent_debates": coherent_debates,
         "judge_grpo_incoherent_debates": len(debates) - coherent_debates,
+        "judge_grpo_reward_mode": reward_mode,
+        **(
+            {
+                "judge_grpo_label_correct_judgments": label_correct_judgments,
+                "judge_grpo_label_total_judgments": len(turns),
+                "judge_grpo_label_accuracy": label_correct_judgments / len(turns),
+            }
+            if reward_mode in ("label", "label_js")
+            else {}
+        ),
+        **(
+            {
+                "judge_grpo_referent_js_mean": sum(js_values) / len(js_values),
+                "judge_grpo_referent_js_max": max(js_values),
+                "judge_grpo_reward_formula": "label_reward - referent_js_divergence/ln(2)",
+            }
+            if reward_mode == "label_js" and js_values
+            else {}
+        ),
     }
 
 

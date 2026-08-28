@@ -136,7 +136,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--judge-label-token-contract",
         default="none",
-        choices=["none", "lfm25_ab_whitespace_compat_v1"],
+        choices=["none", "lfm25_ab_whitespace_compat_v1", "lfm25_openbookqa_spaced_ab_v1"],
         help=(
             "Temporary tokenizer compatibility contract for soft judge scoring. "
             "Replace and Phase-0 validate when the judge tokenizer or answer stem changes."
@@ -154,12 +154,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--judge-grpo-reward-mode",
-        choices=["coherence", "label"],
+        choices=["coherence", "label", "label_js"],
         default="coherence",
         help=(
             "Judge GRPO raw reward source: 'coherence' scores referent agreement of the "
             "two orderings; 'label' scores each sampled verdict against the ground-truth "
-            "trajectory reward (+1 gold referent, -1 otherwise, 0 on reward ties)."
+            "trajectory reward (+1 gold referent, -1 otherwise, 0 on reward ties); "
+            "'label_js' subtracts referent-aligned JS/ln(2) from that label reward."
         ),
     )
     parser.add_argument("--debate-round-adapter-names", nargs="*", default=["solution", "debate", "debate"])

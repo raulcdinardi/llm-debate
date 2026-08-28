@@ -165,7 +165,7 @@ def test_vllm_sampling_params_record_and_apply_allowed_token_ids() -> None:
 
     assert params.kwargs["allowed_token_ids"] == [41, 334, 42, 378]
     policy = BehaviorPolicySpec(allowed_token_ids=(41, 334, 42, 378))
-    assert not policy.exact_trainer_reconstruction_supported()
+    assert policy.exact_trainer_reconstruction_supported()
     assert policy.to_dict()["allowed_token_ids"] == (41, 334, 42, 378)
 
 

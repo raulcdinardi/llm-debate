@@ -14,8 +14,10 @@ from llm_local_rl.judge_harness import (
 )
 from llm_local_rl.soft_judge import (
     JUDGE_LABEL_TOKEN_CONTRACT_NONE,
+    LFM25_OPENBOOKQA_SPACED_AB_V1,
     order_symmetric_soft_judge_score,
     resolve_judge_label_token_contract,
+    validate_judge_prompt_label_boundary,
 )
 from llm_local_rl.chat_templates import get_chat_adapter
 from llm_local_rl.debate_parity import DebateConfig, DebateResult, DebateTrajectory, Transition, Verdict
@@ -700,7 +702,27 @@ class DebateRuntime:
             base_system_text=self.debate_config.system_judge,
         )
         if rendered.raw_text is not None:
-            return list(self.tokenizer.encode(rendered.raw_text, add_special_tokens=False))
+            prompt_tokens = list(self.tokenizer.encode(rendered.raw_text, add_special_tokens=False))
+            if self.runtime_config.judge_label_token_contract == LFM25_OPENBOOKQA_SPACED_AB_V1:
+                contract = resolve_judge_label_token_contract(
+                    tokenizer=self.tokenizer,
+                    contract_name=self.runtime_config.judge_label_token_contract,
+                )
+                # Harness-authored suffix is invariant across examples. Validate
+                # one real rendered boundary per distinct suffix and avoid two
+                # extra full-prompt tokenizations for every later debate.
+                cache_key = (contract.name, rendered.raw_text[-128:])
+                validated = getattr(self, "_validated_judge_label_boundaries", set())
+                if cache_key not in validated:
+                    validate_judge_prompt_label_boundary(
+                        tokenizer=self.tokenizer,
+                        prompt_text=rendered.raw_text,
+                        prompt_token_ids=prompt_tokens,
+                        contract=contract,
+                    )
+                    validated.add(cache_key)
+                    self._validated_judge_label_boundaries = validated
+            return prompt_tokens
         return get_chat_adapter(self.tokenizer).encode_messages(
             list(rendered.messages),
             add_generation_prompt=True,
@@ -1274,6 +1296,29 @@ class DebateRuntime:
                     "zero_sum_residual": soft.score + (-soft.score),
                     "final_verdict": final_verdict,
                     "final_verdict_is_diagnostic_only": True,
+                    # Exact behavior-policy turns retained in memory for optional
+                    # labeled+JS judge GRPO.  The driver strips these from the
+                    # durable step record after assembling training examples.
+                    "_training_judge_turns": [
+                        {
+                            "order": "forward",
+                            "verdict": forward_verdict,
+                            "prompt_tokens": prompt_tokens[debate_idx],
+                            "completion_tokens": completion_tokens[debate_idx],
+                            "completion_logprobs": completion_logprobs[debate_idx],
+                            "candidate_logprobs": forward_row,
+                            "behavior_policy_allowed_token_ids": list(contract.allowed_token_ids),
+                        },
+                        {
+                            "order": "reverse",
+                            "verdict": reverse_verdict,
+                            "prompt_tokens": prompt_tokens[debate_count + debate_idx],
+                            "completion_tokens": completion_tokens[debate_count + debate_idx],
+                            "completion_logprobs": completion_logprobs[debate_count + debate_idx],
+                            "candidate_logprobs": reverse_row,
+                            "behavior_policy_allowed_token_ids": list(contract.allowed_token_ids),
+                        },
+                    ],
                 })
             return (
                 final_verdicts,

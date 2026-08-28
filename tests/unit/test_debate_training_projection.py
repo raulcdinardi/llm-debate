@@ -62,6 +62,7 @@ def test_judge_coherence_grpo_normalizes_across_all_judgments() -> None:
         "judge_grpo_reward_std": 1.0,
         "judge_grpo_coherent_debates": 1,
         "judge_grpo_incoherent_debates": 1,
+        "judge_grpo_reward_mode": "coherence",
     }
     assert [example.metadata["judge_coherence_reward"] for example in examples] == [1.0, 1.0, -1.0, -1.0]
     assert [example.metadata["judge_grpo_zscore"] for example in examples] == [1.0, 1.0, -1.0, -1.0]
@@ -83,6 +84,50 @@ def test_judge_coherence_grpo_pairwise_normalization_would_not_be_used() -> None
     examples, metrics = assemble_judge_coherence_grpo_examples(debates)
     assert metrics["judge_grpo_reward_std"] == 0.0
     assert all(not any(example.advantages) for example in examples)
+
+
+def test_label_js_grpo_combines_gold_label_with_referent_js_penalty() -> None:
+    turns = [
+        {
+            "order": "forward",
+            "verdict": "A",
+            "prompt_tokens": [101, 102],
+            "completion_tokens": [334],
+            "completion_logprobs": [-0.2],
+            "behavior_policy_allowed_token_ids": [334, 378],
+        },
+        {
+            "order": "reverse",
+            "verdict": "A",
+            "prompt_tokens": [201, 202],
+            "completion_tokens": [334],
+            "completion_logprobs": [-0.3],
+            "behavior_policy_allowed_token_ids": [334, 378],
+        },
+    ]
+    debate = _make_debate(
+        reward_a=1.0,
+        reward_b=0.0,
+        judge_raw_response={
+            "bidirectional_judge": True,
+            "order_invariant": False,
+            "soft_judge": True,
+            "soft_score": {"referent_js_divergence_normalized": 0.25},
+            "_training_judge_turns": turns,
+        },
+    )
+    examples, metrics = assemble_judge_coherence_grpo_examples(
+        [debate], reward_mode="label_js"
+    )
+    assert [row.metadata["judge_label_reward"] for row in examples] == [1.0, -1.0]
+    assert [row.metadata["judge_label_js_reward"] for row in examples] == [0.75, -1.25]
+    assert [row.metadata["judge_referent_js_penalty"] for row in examples] == [0.25, 0.25]
+    assert [row.metadata["behavior_policy_allowed_token_ids"] for row in examples] == [
+        [334, 378],
+        [334, 378],
+    ]
+    assert metrics["judge_grpo_referent_js_mean"] == pytest.approx(0.25)
+    assert metrics["judge_grpo_reward_formula"] == "label_reward - referent_js_divergence/ln(2)"
 
 
 def _make_debate(

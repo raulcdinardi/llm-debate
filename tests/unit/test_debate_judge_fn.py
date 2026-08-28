@@ -77,6 +77,10 @@ class PinnedLfmLabelTokenizer(TinyChatTokenizer):
         labels = {"A": [41], " A": [334], "B": [42], " B": [378]}
         if text in labels:
             return list(labels[text])
+        if text.endswith("Agent A"):
+            return super().encode(text[:-2], add_special_tokens=add_special_tokens) + [334]
+        if text.endswith("Agent B"):
+            return super().encode(text[:-2], add_special_tokens=add_special_tokens) + [378]
         return super().encode(text, add_special_tokens=add_special_tokens)
 
     def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
@@ -266,6 +270,49 @@ def test_order_symmetric_soft_judge_requests_four_logits_and_never_falls_back() 
     assert audit["soft_score"]["z_symmetric"] == pytest.approx(2.0)
     assert audit["debate_reward_a"] == pytest.approx(0.7615941559557649)
     assert audit["debate_reward_a"] + audit["debate_reward_b"] == pytest.approx(0.0)
+
+
+def test_trainable_openbookqa_soft_judge_uses_exactly_two_spaced_tokens() -> None:
+    tokenizer = PinnedLfmLabelTokenizer()
+    sampler = RecordingSampler(
+        tokenizer=tokenizer,
+        requests=[],
+        judge_texts=[" A", " B"],
+        candidate_rows=[
+            {334: -0.1, 378: -2.1},
+            {334: -2.1, 378: -0.1},
+        ],
+    )
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=1.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=3,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="judge",
+            judge_harness_id=CONSTITUTION_SINGLE_TOKEN_V1,
+            judge_temperature=1.0,
+            judge_bidirectional=True,
+            judge_constrain_single_token=True,
+            judge_score_mode="order_sym_soft_logit",
+            judge_label_token_contract="lfm25_openbookqa_spaced_ab_v1",
+        ),
+        adapter_layout="split",
+    )
+
+    debate = runtime.rollout(step_seed=7).debates[0]
+    judge_requests = sampler.batches[-1]
+    assert all(request.allowed_token_ids == (334, 378) for request in judge_requests)
+    assert all(request.candidate_logprob_token_ids == (334, 378) for request in judge_requests)
+    turns = debate.judge_raw_response["_training_judge_turns"]
+    assert [turn["behavior_policy_allowed_token_ids"] for turn in turns] == [
+        [334, 378],
+        [334, 378],
+    ]
+    assert debate.judge_raw_response["soft_score"]["referent_js_divergence_normalized"] == pytest.approx(0.0)
 
 
 def test_frozen_base_sft_judge_uses_same_sampler_in_one_ordered_batch() -> None:

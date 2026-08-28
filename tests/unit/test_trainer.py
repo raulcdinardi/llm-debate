@@ -335,6 +335,39 @@ def test_target_token_logprobs_reconstruct_temperature_scaled_behavior_distribut
     assert torch.allclose(actual, expected, atol=1e-6)
 
 
+def test_target_token_logprobs_reconstruct_allowed_token_normalization() -> None:
+    logits = torch.tensor([[[9.0, 2.0, -1.0, 7.0]]], dtype=torch.float32)
+    target_ids = torch.tensor([[2]])
+    expected = torch.log_softmax(logits[0, 0, [1, 2]], dim=-1)[1]
+    actual = _target_token_logprobs(
+        logits=logits,
+        target_ids=target_ids,
+        allowed_token_ids_by_position=[(1, 2)],
+    )
+    assert actual[0, 0] == pytest.approx(float(expected), abs=1e-6)
+
+
+def test_selective_lm_head_reconstructs_allowed_token_normalization() -> None:
+    hidden_states = torch.tensor([[[1.0, 0.0]]], dtype=torch.float32)
+    lm_head = torch.nn.Linear(2, 4, bias=False)
+    with torch.no_grad():
+        lm_head.weight.copy_(
+            torch.tensor([[9.0, 0.0], [2.0, 0.0], [-1.0, 0.0], [7.0, 0.0]])
+        )
+    target_ids = torch.tensor([[2]])
+    actual, entropy = _selected_lm_head_token_logprobs(
+        hidden_states=hidden_states,
+        lm_head=lm_head,
+        target_ids=target_ids,
+        selected_positions=torch.tensor([[True]]),
+        allowed_token_ids_by_selected_position=[(1, 2)],
+    )
+    restricted = torch.log_softmax(torch.tensor([2.0, -1.0]), dim=-1)
+    expected_entropy = float((-(restricted.exp() * restricted).sum()).item())
+    assert actual[0] == pytest.approx(float(restricted[1]), abs=1e-6)
+    assert entropy == pytest.approx(expected_entropy, abs=1e-6)
+
+
 def test_temperature_mismatch_negative_control_reproduces_inverse_temperature_slope() -> None:
     logits = torch.tensor([6.0, 2.0, -3.0, -8.0], dtype=torch.float32)
     raw = torch.log_softmax(logits, dim=-1)

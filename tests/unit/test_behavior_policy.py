@@ -57,7 +57,13 @@ def test_train_config_serializes_one_explicit_behavior_policy_contract() -> None
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repetition_penalty": 1.0,
+        "allowed_token_ids": (),
     }
+
+
+def test_trainer_contract_supports_finite_allowed_token_normalization() -> None:
+    policy = BehaviorPolicySpec(temperature=1.0, allowed_token_ids=(334, 378))
+    policy.assert_exact_trainer_reconstruction_supported()
 
 
 @pytest.mark.parametrize(

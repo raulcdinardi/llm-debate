@@ -120,6 +120,104 @@ def _validate_example_lengths(example: TrainExample) -> None:
         )
     ):
         raise ValueError("Every nonzero-advantage token must have a behavior-policy logprob.")
+    allowed_token_ids = _example_allowed_token_ids(example)
+    if allowed_token_ids:
+        for target_id, has_behavior_logprob in zip(
+            example.target_ids, example.behavior_logprob_mask, strict=True
+        ):
+            if has_behavior_logprob and int(target_id) not in allowed_token_ids:
+                raise ValueError(
+                    f"Behavior-policy token {target_id} is outside allowed_token_ids={allowed_token_ids}"
+                )
+
+
+def _example_allowed_token_ids(example: TrainExample) -> tuple[int, ...]:
+    raw = example.metadata.get("behavior_policy_allowed_token_ids", ())
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("behavior_policy_allowed_token_ids must be a list or tuple")
+    allowed = tuple(int(token_id) for token_id in raw)
+    if any(token_id < 0 for token_id in allowed) or len(set(allowed)) != len(allowed):
+        raise ValueError(f"Invalid behavior_policy_allowed_token_ids={allowed!r}")
+    return allowed
+
+
+def _allowed_token_ids_for_selected_positions(
+    *, batch: list[TrainExample], selected_positions: torch.Tensor
+) -> list[tuple[int, ...]]:
+    selected_cpu = selected_positions.detach().cpu()
+    result: list[tuple[int, ...]] = []
+    for row_idx, example in enumerate(batch):
+        allowed = _example_allowed_token_ids(example)
+        count = int(selected_cpu[row_idx, : len(example.input_ids)].sum().item())
+        result.extend([allowed] * count)
+    return result
+
+
+def _allowed_token_ids_for_flat_positions(
+    *, batch: list[TrainExample], behavior_positions: torch.Tensor
+) -> list[tuple[int, ...]]:
+    positions_cpu = behavior_positions.detach().cpu()
+    width = int(positions_cpu.shape[1])
+    result: list[tuple[int, ...]] = []
+    for row_idx, example in enumerate(batch):
+        allowed = _example_allowed_token_ids(example)
+        for column in range(width):
+            result.append(allowed if bool(positions_cpu[row_idx, column].item()) else ())
+    return result
+
+
+def _flat_target_logprobs(
+    *,
+    logits_float: torch.Tensor,
+    target_ids: torch.Tensor,
+    allowed_token_ids: list[tuple[int, ...]] | None = None,
+) -> torch.Tensor:
+    if logits_float.ndim != 2 or target_ids.ndim != 1:
+        raise ValueError("flat target scoring requires [positions,vocab] logits and [positions] targets")
+    if int(logits_float.shape[0]) != int(target_ids.numel()):
+        raise ValueError("flat logits/targets position counts differ")
+    result = -F.cross_entropy(logits_float, target_ids, reduction="none")
+    if allowed_token_ids is None:
+        return result
+    if len(allowed_token_ids) != int(target_ids.numel()):
+        raise ValueError("allowed-token rows do not match scored positions")
+    groups: dict[tuple[int, ...], list[int]] = {}
+    for position, allowed in enumerate(allowed_token_ids):
+        if allowed:
+            groups.setdefault(allowed, []).append(position)
+    for allowed, positions in groups.items():
+        position_ids = torch.tensor(positions, dtype=torch.long, device=logits_float.device)
+        allowed_ids = torch.tensor(allowed, dtype=torch.long, device=logits_float.device)
+        group_targets = target_ids[position_ids]
+        if not bool(torch.isin(group_targets, allowed_ids).all().detach().cpu().item()):
+            raise ValueError("Target token escaped the configured allowed-token set")
+        group_logits = logits_float[position_ids]
+        numerator = group_logits.gather(1, group_targets.unsqueeze(1)).squeeze(1)
+        denominator = torch.logsumexp(group_logits[:, allowed_ids], dim=-1)
+        result = result.index_copy(0, position_ids, numerator - denominator)
+    return result
+
+
+def _flat_policy_entropy(
+    *, logits_float: torch.Tensor, allowed_token_ids: list[tuple[int, ...]] | None = None
+) -> torch.Tensor:
+    log_probs = torch.log_softmax(logits_float.detach(), dim=-1)
+    result = -(log_probs.exp() * log_probs).sum(dim=-1)
+    if allowed_token_ids is None:
+        return result
+    groups: dict[tuple[int, ...], list[int]] = {}
+    for position, allowed in enumerate(allowed_token_ids):
+        if allowed:
+            groups.setdefault(allowed, []).append(position)
+    for allowed, positions in groups.items():
+        position_ids = torch.tensor(positions, dtype=torch.long, device=logits_float.device)
+        allowed_ids = torch.tensor(allowed, dtype=torch.long, device=logits_float.device)
+        restricted = torch.log_softmax(logits_float[position_ids][:, allowed_ids].detach(), dim=-1)
+        entropy = -(restricted.exp() * restricted).sum(dim=-1)
+        result = result.index_copy(0, position_ids, entropy)
+    return result
 
 
 def _is_overlength(*, example: TrainExample, max_tokens: int = 0) -> bool:
@@ -197,6 +295,7 @@ def _target_token_logprobs(
     logits: torch.Tensor,
     target_ids: torch.Tensor,
     behavior_temperature: float = 1.0,
+    allowed_token_ids_by_position: list[tuple[int, ...]] | None = None,
     max_positions_per_chunk: int = _TARGET_LOGPROB_POSITIONS_PER_CHUNK,
 ) -> torch.Tensor:
     if logits.ndim != 3:
@@ -212,14 +311,22 @@ def _target_token_logprobs(
     vocab_size = int(logits.shape[-1])
     flat_logits = logits.reshape(-1, vocab_size)
     flat_target_ids = target_ids.reshape(-1)
+    if allowed_token_ids_by_position is not None and len(allowed_token_ids_by_position) != int(
+        flat_target_ids.numel()
+    ):
+        raise ValueError("allowed-token rows do not match flattened target positions")
     chunks = []
     for start in range(0, int(flat_target_ids.numel()), max_positions_per_chunk):
         end = min(start + max_positions_per_chunk, int(flat_target_ids.numel()))
         chunks.append(
-            -F.cross_entropy(
-                flat_logits[start:end].float() / float(behavior_temperature),
-                flat_target_ids[start:end],
-                reduction="none",
+            _flat_target_logprobs(
+                logits_float=flat_logits[start:end].float() / float(behavior_temperature),
+                target_ids=flat_target_ids[start:end],
+                allowed_token_ids=(
+                    None
+                    if allowed_token_ids_by_position is None
+                    else allowed_token_ids_by_position[start:end]
+                ),
             )
         )
     return torch.cat(chunks, dim=0).reshape(target_ids.shape)
@@ -263,6 +370,7 @@ def _selected_lm_head_token_logprobs(
     selected_positions: torch.Tensor,
     entropy_positions: torch.Tensor | None = None,
     behavior_temperature: float = 1.0,
+    allowed_token_ids_by_selected_position: list[tuple[int, ...]] | None = None,
     max_positions_per_chunk: int = _TARGET_LOGPROB_POSITIONS_PER_CHUNK,
     compile_helper: bool = False,
 ) -> tuple[torch.Tensor, float]:
@@ -300,6 +408,11 @@ def _selected_lm_head_token_logprobs(
     selected_target_ids = target_ids[selected_positions]
     if int(selected_target_ids.numel()) == 0:
         return hidden_states.new_empty((0,), dtype=torch.float32), 0.0
+    if (
+        allowed_token_ids_by_selected_position is not None
+        and len(allowed_token_ids_by_selected_position) != int(selected_target_ids.numel())
+    ):
+        raise ValueError("allowed-token rows do not match selected positions")
 
     selected_hidden_states = hidden_states[selected_positions]
     selected_entropy_positions = (
@@ -326,16 +439,23 @@ def _selected_lm_head_token_logprobs(
             compile_helper=compile_helper,
         )
         logits_float = logits.float() / float(behavior_temperature)
+        chunk_allowed = (
+            None
+            if allowed_token_ids_by_selected_position is None
+            else allowed_token_ids_by_selected_position[start:end]
+        )
         logprob_chunks.append(
-            -F.cross_entropy(
-                logits_float,
-                selected_target_ids[start:end],
-                reduction="none",
+            _flat_target_logprobs(
+                logits_float=logits_float,
+                target_ids=selected_target_ids[start:end],
+                allowed_token_ids=chunk_allowed,
             )
         )
         with torch.no_grad():
-            log_probs = torch.log_softmax(logits_float.detach(), dim=-1)
-            entropy_values = -(log_probs.exp() * log_probs).sum(dim=-1)
+            entropy_values = _flat_policy_entropy(
+                logits_float=logits_float,
+                allowed_token_ids=chunk_allowed,
+            )
             entropy_sum += float(
                 entropy_values[selected_entropy_positions[start:end]].sum().detach().cpu().item()
             )
@@ -514,6 +634,7 @@ class MultiAdapterTrainer:
         *,
         tensors: dict[str, torch.Tensor],
         selected_positions: torch.Tensor,
+        batch: list[TrainExample],
         entropy_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, float]:
         hidden_states = self._selective_lm_head_hidden_states(tensors=tensors)
@@ -525,6 +646,10 @@ class MultiAdapterTrainer:
             selected_positions=selected_positions,
             entropy_positions=entropy_positions,
             behavior_temperature=self.config.behavior_policy.temperature,
+            allowed_token_ids_by_selected_position=_allowed_token_ids_for_selected_positions(
+                batch=batch,
+                selected_positions=selected_positions,
+            ),
             compile_helper=self.config.compile_train_logprob_helper,
         )
 
@@ -755,6 +880,10 @@ class MultiAdapterTrainer:
                     logits=outputs.logits,
                     target_ids=tensors["target_ids"],
                     behavior_temperature=self.config.behavior_policy.temperature,
+                    allowed_token_ids_by_position=_allowed_token_ids_for_flat_positions(
+                        batch=batch,
+                        behavior_positions=tensors["behavior_logprob_mask"],
+                    ),
                 )
                 if is_model_io_tracing_enabled():
                     trace_top_k = get_trace_top_logprobs()
@@ -793,6 +922,7 @@ class MultiAdapterTrainer:
                     selected_logprobs, _ = self._selective_lm_head_logprobs(
                         tensors=tensors,
                         selected_positions=completion_positions,
+                        batch=batch,
                     )
                 else:
                     selected_logprobs = tensors["old_logprobs"].new_empty((0,), dtype=torch.float32)
@@ -950,18 +1080,27 @@ class MultiAdapterTrainer:
                     logits=outputs.logits,
                     target_ids=tensors["target_ids"],
                     behavior_temperature=self.config.behavior_policy.temperature,
+                    allowed_token_ids_by_position=_allowed_token_ids_for_flat_positions(
+                        batch=minibatch,
+                        behavior_positions=tensors["behavior_logprob_mask"],
+                    ),
                 )
                 selected_logprobs = token_logprobs[trained_positions]
                 selected_entropy_sum = 0.0
                 if trained_tokens > 0:
                     with torch.no_grad():
-                        trained_log_probs = torch.log_softmax(
+                        trained_logits = (
                             outputs.logits[trained_positions].float()
-                            / float(self.config.behavior_policy.temperature),
-                            dim=-1,
+                            / float(self.config.behavior_policy.temperature)
                         )
                         selected_entropy_sum = float(
-                            (-(trained_log_probs.exp() * trained_log_probs).sum(dim=-1)).sum().detach().cpu().item()
+                            _flat_policy_entropy(
+                                logits_float=trained_logits,
+                                allowed_token_ids=_allowed_token_ids_for_selected_positions(
+                                    batch=minibatch,
+                                    selected_positions=trained_positions,
+                                ),
+                            ).sum().detach().cpu().item()
                         )
                 if self._mem_trace_active():
                     _mem_alloc_after_forward_full = current_alloc_bytes(self.compute_device)
@@ -1023,6 +1162,10 @@ class MultiAdapterTrainer:
                         selected_positions=selected_positions,
                         entropy_positions=trained_positions,
                         behavior_temperature=self.config.behavior_policy.temperature,
+                        allowed_token_ids_by_selected_position=_allowed_token_ids_for_selected_positions(
+                            batch=minibatch,
+                            selected_positions=selected_positions,
+                        ),
                         compile_helper=self.config.compile_train_logprob_helper,
                     )
                     trained_within_selected = trained_positions[selected_positions]

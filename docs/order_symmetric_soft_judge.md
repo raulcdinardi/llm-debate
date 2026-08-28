@@ -62,3 +62,46 @@ Select either or both reward projections:
 `judge_soft_task_gap` allocates the existing absolute task-reward gap while conserving its
 pair sum before the existing group normalization. `soft_judge` assigns `+s` to A and `-s`
 to B for an exactly zero-sum debate reward.
+
+## Trainable OpenBookQA labeled-debate mode
+
+The labeled OpenBookQA judge uses a separate strict contract:
+
+```text
+--debate-judge-harness constitution_single_token_v1
+--debate-judge-constrain-single-token
+--judge-label-token-contract lfm25_openbookqa_spaced_ab_v1
+--debate-judge-score-mode order_sym_soft_logit
+--train-judge-coherence-grpo
+--judge-grpo-reward-mode label_js
+--debate-r23-reward soft_judge
+```
+
+This contract allows exactly the canonical leading-space tokens `" A"` (334)
+and `" B"` (378). Before sampling, the runtime retokenizes `prompt + label` and
+requires it to equal `prompt_tokens + [label_token]` for both labels. The fixed
+prefill therefore cannot agglutinate with either answer token.
+
+For forward order, let `p = (P(A), P(B))`. For reversed display order, map the
+labels back to original referents and let `q = (P_reverse(B), P_reverse(A))`.
+The consistency penalty is the bounded quantity
+
+```text
+J = JS(p, q) / ln(2)        # 0 <= J <= 1
+```
+
+Each sampled judge action keeps the objective OpenBookQA label reward and
+subtracts the same pair-level consistency penalty:
+
+```text
+r_judge = (+1 if sampled referent is gold else -1) - J
+```
+
+(Gold-label ties retain label reward 0.) The debate adapter independently uses
+the granular zero-sum signal `r_A = s`, `r_B = -s`, where
+`s = tanh((z_forward - z_reverse) / 4)`.
+
+Judge PPO logprobs are reconstructed under the exact two-token conditional
+normalization in both full-logits and selective-LM-head trainer backends. This
+keeps the constrained sampler and trainer behavior policies identical instead
+of scoring a two-token sample under the full vocabulary.

@@ -7,7 +7,11 @@ import pytest
 
 from scripts.run_train import _parse_csv_tuple, _parse_init_adapter_dirs, parse_args
 from llm_local_rl.config import RolloutConfig, TrainRunConfig
-from llm_local_rl.judge_harness import CONSULTANCY_SINGLE_TOKEN_V1, SOLUTION_R1_RATIONALE_V1
+from llm_local_rl.judge_harness import (
+    CONSTITUTION_SINGLE_TOKEN_V1,
+    CONSULTANCY_SINGLE_TOKEN_V1,
+    SOLUTION_R1_RATIONALE_V1,
+)
 
 
 def test_parse_named_init_adapter_dirs() -> None:
@@ -112,7 +116,7 @@ def test_soft_judge_config_is_opt_in_and_fail_closed() -> None:
         debate_judge_constrain_single_token=True,
         debate_judge_score_mode="order_sym_soft_logit",
     )
-    with pytest.raises(ValueError, match="explicit temporary"):
+    with pytest.raises(ValueError, match="explicit tokenizer-bound"):
         TrainRunConfig(**common)
     config = TrainRunConfig(
         **common,
@@ -136,6 +140,33 @@ def test_cli_accepts_label_judge_grpo_reward_mode() -> None:
         ]
     )
     assert args.judge_grpo_reward_mode == "label"
+
+
+def test_openbookqa_label_js_contract_is_trainable_and_granular() -> None:
+    config = TrainRunConfig(
+        model_path="/model",
+        output_dir="/out",
+        rollout=RolloutConfig(mode="debate", temperature=1.0),
+        adapter_layout="split",
+        debate_rounds=3,
+        debate_round_adapter_names=("solution", "debate", "debate"),
+        debate_r1_reward="none",
+        debate_r23_reward="soft_judge",
+        debate_r23_mode="symmetric",
+        debate_judge_adapter="judge",
+        debate_judge_harness=CONSTITUTION_SINGLE_TOKEN_V1,
+        debate_judge_temperature=1.0,
+        debate_judge_max_tokens=1,
+        debate_judge_bidirectional=True,
+        debate_judge_constrain_single_token=True,
+        debate_judge_score_mode="order_sym_soft_logit",
+        judge_label_token_contract="lfm25_openbookqa_spaced_ab_v1",
+        train_judge_coherence_grpo=True,
+        judge_grpo_reward_mode="label_js",
+        train_adapter_names=("debate", "judge"),
+    )
+    assert config.judge_grpo_reward_mode == "label_js"
+    assert config.debate_r23_reward == "soft_judge"
 
 
 def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:

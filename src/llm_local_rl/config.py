@@ -9,6 +9,7 @@ from pathlib import Path
 from llm_local_rl.behavior_policy import BehaviorPolicySpec
 from llm_local_rl.judge_harness import (
     CHAT_SOLUTION_TAGGED_V1,
+    CONSTITUTION_SINGLE_TOKEN_V1,
     JudgeHarnessSpec,
     SOLUTION_R1_RATIONALE_V1,
     get_judge_harness,
@@ -18,6 +19,7 @@ from llm_local_rl.soft_judge import (
     JUDGE_LABEL_TOKEN_CONTRACT_NONE,
     JUDGE_LABEL_TOKEN_CONTRACTS,
     LFM25_AB_WHITESPACE_COMPAT_V1,
+    LFM25_OPENBOOKQA_SPACED_AB_V1,
 )
 
 
@@ -246,11 +248,6 @@ class TrainRunConfig:
                 raise ValueError(
                     "debate_judge_constrain_single_token requires the in-process vLLM judge"
                 )
-            if self.train_judge_coherence_grpo:
-                raise ValueError(
-                    "constrained judge decoding is not supported with judge GRPO because the "
-                    "trainer does not reconstruct constrained normalization"
-                )
         if self.debate_judge_score_mode not in ("hard_verdict", "order_sym_soft_logit"):
             raise ValueError("debate_judge_score_mode must be hard_verdict or order_sym_soft_logit")
         if self.judge_label_token_contract not in JUDGE_LABEL_TOKEN_CONTRACTS:
@@ -263,25 +260,42 @@ class TrainRunConfig:
             or self.debate_r23_reward == "soft_judge"
         )
         if uses_soft_score:
-            if self.judge_label_token_contract != LFM25_AB_WHITESPACE_COMPAT_V1:
+            if self.judge_label_token_contract not in (
+                LFM25_AB_WHITESPACE_COMPAT_V1,
+                LFM25_OPENBOOKQA_SPACED_AB_V1,
+            ):
                 raise ValueError(
-                    "order_sym_soft_logit currently requires the explicit temporary "
-                    f"{LFM25_AB_WHITESPACE_COMPAT_V1!r} token contract"
+                    "order_sym_soft_logit requires an explicit tokenizer-bound A/B token contract"
                 )
             if not self.debate_judge_bidirectional:
                 raise ValueError("order_sym_soft_logit requires bidirectional judge sampling")
             if not self.debate_judge_constrain_single_token:
                 raise ValueError("order_sym_soft_logit requires constrained single-token judging")
-            if float(self.debate_judge_temperature) != 0.0:
-                raise ValueError("order_sym_soft_logit requires debate_judge_temperature=0")
+            if self.train_judge_coherence_grpo:
+                if self.judge_label_token_contract != LFM25_OPENBOOKQA_SPACED_AB_V1:
+                    raise ValueError(
+                        "trainable soft judge requires the strict two-token OpenBookQA contract"
+                    )
+                if self.judge_grpo_reward_mode != "label_js":
+                    raise ValueError("trainable soft judge requires judge_grpo_reward_mode='label_js'")
+                if float(self.debate_judge_temperature) <= 0.0:
+                    raise ValueError("trainable soft judge requires stochastic temperature > 0")
+                if self.debate_judge_harness != CONSTITUTION_SINGLE_TOKEN_V1:
+                    raise ValueError(
+                        "strict OpenBookQA token boundary is bound to constitution_single_token_v1"
+                    )
+                if self.debate_r23_reward != "soft_judge":
+                    raise ValueError(
+                        "OpenBookQA label_js training requires granular soft_judge debate rewards"
+                    )
+            elif float(self.debate_judge_temperature) != 0.0:
+                raise ValueError("frozen order_sym_soft_logit requires debate_judge_temperature=0")
             if self.debate_judge_max_tokens not in (0, 1) or (
                 self.debate_judge_max_tokens == 0 and judge_harness.default_max_tokens != 1
             ):
                 raise ValueError("order_sym_soft_logit requires exactly one judge output token")
             if self.adapter_layout != "split":
                 raise ValueError("order_sym_soft_logit currently requires adapter_layout='split'")
-            if self.train_judge_coherence_grpo:
-                raise ValueError("order_sym_soft_logit is for a frozen judge and cannot train judge GRPO")
         elif self.judge_label_token_contract != JUDGE_LABEL_TOKEN_CONTRACT_NONE:
             raise ValueError(
                 "judge_label_token_contract is temporary and may only be enabled with "
@@ -367,8 +381,8 @@ class TrainRunConfig:
                     "bidirectional judge sampling requires a one-, two-, or three-round transcript"
                 )
         if self.train_judge_coherence_grpo:
-            if self.judge_grpo_reward_mode not in ("coherence", "label"):
-                raise ValueError("judge_grpo_reward_mode must be 'coherence' or 'label'")
+            if self.judge_grpo_reward_mode not in ("coherence", "label", "label_js"):
+                raise ValueError("judge_grpo_reward_mode must be coherence, label, or label_js")
             if not self.debate_judge_bidirectional:
                 raise ValueError("judge coherence GRPO requires bidirectional judge sampling")
             if self.debate_judge_adapter != "judge":

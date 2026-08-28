@@ -1074,7 +1074,7 @@ class TrainingDriver:
             incoherent_r23_reward=self.config.debate_incoherent_r23_reward,
             r23_format_failure_penalty=self.config.debate_r23_format_failure_penalty,
         )
-        judge_grpo_record: dict[str, float | int] | None = None
+        judge_grpo_record: dict[str, float | int | str] | None = None
         if self.config.train_judge_coherence_grpo:
             judge_examples, judge_grpo_record = assemble_judge_coherence_grpo_examples(
                 debates, reward_mode=self.config.judge_grpo_reward_mode
@@ -1122,7 +1122,7 @@ class TrainingDriver:
             projection_record["judge_grpo"] = judge_grpo_record
             projection_record[
                 "judge_label_grpo"
-                if self.config.judge_grpo_reward_mode == "label"
+                if self.config.judge_grpo_reward_mode in ("label", "label_js")
                 else "judge_coherence_grpo"
             ] = judge_grpo_record
         if self.config.debate_r1_reward == "judge_rejection_task":
