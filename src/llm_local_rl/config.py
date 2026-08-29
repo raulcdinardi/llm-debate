@@ -108,6 +108,7 @@ class TrainRunConfig:
     debate_judge_score_mode: str = "hard_verdict"
     judge_label_token_contract: str = JUDGE_LABEL_TOKEN_CONTRACT_NONE
     train_judge_coherence_grpo: bool = False
+    judge_training_objective: str = "grpo"
     judge_grpo_reward_mode: str = "coherence"
     debate_round_adapter_names: tuple[str, ...] = ("solution", "debate", "debate")
     debate_prompt_format: str = "chat"
@@ -276,8 +277,8 @@ class TrainRunConfig:
                     raise ValueError(
                         "trainable soft judge requires the strict two-token OpenBookQA contract"
                     )
-                if self.judge_grpo_reward_mode != "label_js":
-                    raise ValueError("trainable soft judge requires judge_grpo_reward_mode='label_js'")
+                if self.judge_training_objective == "grpo" and self.judge_grpo_reward_mode != "label_js":
+                    raise ValueError("trainable soft judge GRPO requires judge_grpo_reward_mode='label_js'")
                 if float(self.debate_judge_temperature) <= 0.0:
                     raise ValueError("trainable soft judge requires stochastic temperature > 0")
                 if self.debate_judge_harness != CONSTITUTION_SINGLE_TOKEN_V1:
@@ -381,6 +382,10 @@ class TrainRunConfig:
                     "bidirectional judge sampling requires a one-, two-, or three-round transcript"
                 )
         if self.train_judge_coherence_grpo:
+            if self.judge_training_objective not in ("grpo", "supervised_label_ce"):
+                raise ValueError(
+                    "judge_training_objective must be grpo or supervised_label_ce"
+                )
             if self.judge_grpo_reward_mode not in ("coherence", "label", "label_js"):
                 raise ValueError("judge_grpo_reward_mode must be coherence, label, or label_js")
             if not self.debate_judge_bidirectional:
@@ -391,6 +396,14 @@ class TrainRunConfig:
                 raise ValueError("judge coherence GRPO requires adapter_layout='split'")
             if self.train_adapter_names and "judge" not in self.train_adapter_names:
                 raise ValueError("judge coherence GRPO requires judge in train_adapter_names")
+            if (
+                self.judge_training_objective == "supervised_label_ce"
+                and self.judge_grpo_reward_mode != "label_js"
+            ):
+                raise ValueError(
+                    "supervised_label_ce keeps label_js rollout diagnostics and requires "
+                    "judge_grpo_reward_mode='label_js'"
+                )
             judge_behavior_policy = BehaviorPolicySpec(
                 temperature=self.debate_judge_temperature,
                 top_p=self.debate_judge_top_p,
@@ -492,6 +505,7 @@ class TrainRunConfig:
             ),
             train_judge_coherence_grpo=bool(data.get("train_judge_coherence_grpo", False)),
             judge_grpo_reward_mode=str(data.get("judge_grpo_reward_mode", "coherence")),
+            judge_training_objective=str(data.get("judge_training_objective", "grpo")),
             debate_round_adapter_names=tuple(data.get("debate_round_adapter_names", ("solution", "debate", "debate"))),
             debate_prompt_format=data.get("debate_prompt_format", "chat"),
             debate_stop_on_concluded=data.get("debate_stop_on_concluded", False),

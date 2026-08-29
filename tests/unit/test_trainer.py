@@ -241,6 +241,34 @@ def test_train_batch_loss_is_normalized_by_kept_sample_count() -> None:
     assert two_metrics["num_dropped_overlength"] == 0.0
 
 
+def test_supervised_label_ce_uses_correct_label_without_behavior_logprob() -> None:
+    example = TrainExample(
+        adapter_name="judge",
+        input_ids=[0],
+        target_ids=[0],
+        loss_mask=[1],
+        behavior_logprob_mask=[0],
+        old_logprobs=[0.0],
+        advantages=[0.0],
+        metadata={
+            "training_objective": "supervised_label_ce",
+            "behavior_policy_allowed_token_ids": [0, 1],
+        },
+    )
+
+    metrics = _fake_trainer().train_batch(
+        adapter_name="judge",
+        batch=[example],
+        objective="supervised_label_ce",
+    )
+
+    assert metrics["training_objective"] == "supervised_label_ce"
+    assert metrics["loss"] == pytest.approx(math.log(2.0), abs=1e-6)
+    assert metrics["supervised_label_nll"] == pytest.approx(math.log(2.0), abs=1e-6)
+    assert metrics["supervised_correct_label_probability_mean"] == pytest.approx(0.5)
+    assert metrics["completion_tokens_checked"] == 0.0
+
+
 def test_train_batch_drops_overlength_samples_and_reports_counter() -> None:
     old_logprob = -math.log(2.0)
     kept = TrainExample(

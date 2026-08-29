@@ -21,6 +21,7 @@ from llm_local_rl.debate_parity import (
     DebateResult,
     audit_base_text_debate_format,
     assemble_judge_coherence_grpo_examples,
+    assemble_judge_supervised_label_examples,
     assemble_split_train_examples,
     assemble_training_data_by_mode,
     summarize_judge_rejection_r1_projection,
@@ -1076,9 +1077,14 @@ class TrainingDriver:
         )
         judge_grpo_record: dict[str, float | int | str] | None = None
         if self.config.train_judge_coherence_grpo:
-            judge_examples, judge_grpo_record = assemble_judge_coherence_grpo_examples(
-                debates, reward_mode=self.config.judge_grpo_reward_mode
-            )
+            if self.config.judge_training_objective == "supervised_label_ce":
+                judge_examples, judge_grpo_record = assemble_judge_supervised_label_examples(
+                    debates
+                )
+            else:
+                judge_examples, judge_grpo_record = assemble_judge_coherence_grpo_examples(
+                    debates, reward_mode=self.config.judge_grpo_reward_mode
+                )
             grouped.setdefault("judge", []).extend(judge_examples)
         projection_record: dict[str, object] = {
             "source_exact_shared_equivalent": False,
@@ -1119,12 +1125,15 @@ class TrainingDriver:
                 "round_outputs": len(r2_audits) + len(r3_audits),
             }
         if judge_grpo_record is not None:
-            projection_record["judge_grpo"] = judge_grpo_record
-            projection_record[
-                "judge_label_grpo"
-                if self.config.judge_grpo_reward_mode in ("label", "label_js")
-                else "judge_coherence_grpo"
-            ] = judge_grpo_record
+            if self.config.judge_training_objective == "supervised_label_ce":
+                projection_record["judge_supervised_label"] = judge_grpo_record
+            else:
+                projection_record["judge_grpo"] = judge_grpo_record
+                projection_record[
+                    "judge_label_grpo"
+                    if self.config.judge_grpo_reward_mode in ("label", "label_js")
+                    else "judge_coherence_grpo"
+                ] = judge_grpo_record
         if self.config.debate_r1_reward == "judge_rejection_task":
             r1_adapter_name = self.config.debate_round_adapter_names[0]
             projection_record["r1_projection"] = {
@@ -1440,7 +1449,20 @@ class TrainingDriver:
                             train_metrics[adapter_name] = self.trainer.train_batch(
                                 adapter_name=adapter_name,
                                 batch=batch,
+                                objective=(
+                                    "supervised_label_ce"
+                                    if adapter_name == "judge"
+                                    and self.config.judge_training_objective
+                                    == "supervised_label_ce"
+                                    else "ppo"
+                                ),
                                 measure_reference_kl=(
+                                    not (
+                                        adapter_name == "judge"
+                                        and self.config.judge_training_objective
+                                        == "supervised_label_ce"
+                                    )
+                                    and
                                     self.config.reference_kl_every > 0
                                     and step_num % self.config.reference_kl_every == 0
                                 ),

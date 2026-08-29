@@ -10,6 +10,7 @@ from llm_local_rl.debate_parity import (
     Transition,
     audit_base_text_debate_format,
     assemble_judge_coherence_grpo_examples,
+    assemble_judge_supervised_label_examples,
     assemble_split_train_examples,
     assemble_training_data_by_mode,
     assemble_training_data_r1_r23,
@@ -128,6 +129,51 @@ def test_label_js_grpo_combines_gold_label_with_referent_js_penalty() -> None:
     ]
     assert metrics["judge_grpo_referent_js_mean"] == pytest.approx(0.25)
     assert metrics["judge_grpo_reward_formula"] == "label_reward - referent_js_divergence/ln(2)"
+
+
+def test_supervised_judge_targets_gold_referent_in_both_orders() -> None:
+    turns = [
+        {
+            "order": "forward",
+            "verdict": "B",
+            "prompt_tokens": [101, 102],
+            "completion_tokens": [378],
+            "completion_logprobs": [-0.8],
+            "behavior_policy_allowed_token_ids": [334, 378],
+        },
+        {
+            "order": "reverse",
+            "verdict": "A",
+            "prompt_tokens": [201, 202],
+            "completion_tokens": [334],
+            "completion_logprobs": [-0.7],
+            "behavior_policy_allowed_token_ids": [334, 378],
+        },
+    ]
+    debate = _make_debate(
+        reward_a=1.0,
+        reward_b=0.0,
+        judge_raw_response={
+            "bidirectional_judge": True,
+            "order_invariant": False,
+            "judge_label_token_contract": {
+                "a_token_ids": [334],
+                "b_token_ids": [378],
+            },
+            "soft_score": {"referent_js_divergence_normalized": 0.2},
+            "_training_judge_turns": turns,
+        },
+    )
+
+    examples, metrics = assemble_judge_supervised_label_examples([debate])
+
+    assert [row.target_ids[-1] for row in examples] == [334, 378]
+    assert [row.metadata["judge_label_visual_target"] for row in examples] == ["A", "B"]
+    assert all(row.behavior_logprob_mask[-1] == 0 for row in examples)
+    assert all(row.advantages[-1] == 0.0 for row in examples)
+    assert metrics["judge_training_objective"] == "supervised_label_ce"
+    assert metrics["judge_supervised_sampled_label_accuracy"] == 0.0
+    assert metrics["judge_supervised_referent_js_mean"] == pytest.approx(0.2)
 
 
 def _make_debate(

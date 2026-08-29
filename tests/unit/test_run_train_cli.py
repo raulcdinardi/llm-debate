@@ -169,6 +169,33 @@ def test_openbookqa_label_js_contract_is_trainable_and_granular() -> None:
     assert config.debate_r23_reward == "soft_judge"
 
 
+def test_openbookqa_supervised_label_ce_contract_is_trainable_and_granular() -> None:
+    config = TrainRunConfig(
+        model_path="/model",
+        output_dir="/out",
+        rollout=RolloutConfig(mode="debate", temperature=1.0),
+        adapter_layout="split",
+        debate_rounds=3,
+        debate_round_adapter_names=("solution", "debate", "debate"),
+        debate_r1_reward="none",
+        debate_r23_reward="soft_judge",
+        debate_r23_mode="symmetric",
+        debate_judge_adapter="judge",
+        debate_judge_harness=CONSTITUTION_SINGLE_TOKEN_V1,
+        debate_judge_temperature=1.0,
+        debate_judge_max_tokens=1,
+        debate_judge_bidirectional=True,
+        debate_judge_constrain_single_token=True,
+        debate_judge_score_mode="order_sym_soft_logit",
+        judge_label_token_contract="lfm25_openbookqa_spaced_ab_v1",
+        train_judge_coherence_grpo=True,
+        judge_training_objective="supervised_label_ce",
+        judge_grpo_reward_mode="label_js",
+        train_adapter_names=("debate", "judge"),
+    )
+    assert config.judge_training_objective == "supervised_label_ce"
+
+
 def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:
     docs = (
         Path(__file__).parents[2] / "docs" / "debate_judge_grpo.md"

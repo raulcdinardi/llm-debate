@@ -153,6 +153,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--judge-training-objective",
+        choices=["grpo", "supervised_label_ce"],
+        default="grpo",
+        help=(
+            "Optimization objective for the trainable judge. 'grpo' preserves sampled-action "
+            "PPO/GRPO; 'supervised_label_ce' applies two-class cross-entropy directly to the "
+            "known correct label in each transcript ordering. Debate adapters remain GRPO."
+        ),
+    )
+    parser.add_argument(
         "--judge-grpo-reward-mode",
         choices=["coherence", "label", "label_js"],
         default="coherence",
@@ -398,6 +408,7 @@ def main() -> int:
                 debate_judge_score_mode=args.debate_judge_score_mode,
                 judge_label_token_contract=args.judge_label_token_contract,
                 train_judge_coherence_grpo=args.train_judge_coherence_grpo,
+                judge_training_objective=args.judge_training_objective,
                 judge_grpo_reward_mode=args.judge_grpo_reward_mode,
                 debate_round_adapter_names=tuple(args.debate_round_adapter_names),
                 debate_prompt_format=args.debate_prompt_format,

@@ -1580,6 +1580,119 @@ def assemble_judge_coherence_grpo_examples(
     }
 
 
+def assemble_judge_supervised_label_examples(
+    debates: list[DebateResult],
+    *,
+    adapter_name: str = "judge",
+) -> tuple[list[TrainExample], dict[str, float | int | str]]:
+    """Build two-order, two-class supervised examples for the known gold referent.
+
+    The sampled judge action remains useful rollout telemetry, but it is not the
+    training target.  Each transcript ordering is retargeted to the canonical
+    token for the correct underlying trajectory.  The reverse-order target is
+    swapped so both examples supervise the same referent.
+    """
+    examples: list[TrainExample] = []
+    sampled_correct = 0
+    coherent_debates = 0
+    js_values: list[float] = []
+    target_a_count = 0
+    target_b_count = 0
+    for debate in debates:
+        audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
+        if audit.get("bidirectional_judge") is not True:
+            raise ValueError("supervised judge labels require bidirectional judge audit data")
+        turns = audit.get("_training_judge_turns")
+        if not isinstance(turns, list) or len(turns) != 2:
+            raise ValueError("supervised judge labels require exactly two ordered judgment turns")
+        contract = audit.get("judge_label_token_contract")
+        if not isinstance(contract, dict):
+            raise ValueError("supervised judge labels require a frozen judge label-token contract")
+        a_ids = tuple(int(value) for value in contract.get("a_token_ids", ()))
+        b_ids = tuple(int(value) for value in contract.get("b_token_ids", ()))
+        if len(a_ids) != 1 or len(b_ids) != 1 or a_ids[0] == b_ids[0]:
+            raise ValueError("supervised judge labels require one distinct canonical token per label")
+        allowed_token_ids = (a_ids[0], b_ids[0])
+
+        reward_a = float(debate.trajectory_a.metrics["task_reward"])
+        reward_b = float(debate.trajectory_b.metrics["task_reward"])
+        if reward_a == reward_b:
+            raise ValueError("supervised judge labels require a unique gold trajectory")
+        gold_referent = "A" if reward_a > reward_b else "B"
+        coherent_debates += int(audit.get("order_invariant") is True)
+        soft_record = audit.get("soft_score")
+        if isinstance(soft_record, dict):
+            js_value = float(soft_record.get("referent_js_divergence_normalized"))
+            if not math.isfinite(js_value) or not 0.0 <= js_value <= 1.0 + 1e-12:
+                raise ValueError(f"invalid normalized referent JS diagnostic: {js_value!r}")
+            js_values.append(min(1.0, js_value))
+
+        for judgment_index, turn in enumerate(turns):
+            if not isinstance(turn, dict):
+                raise ValueError("judge training turn must be a mapping")
+            order = str(turn.get("order"))
+            if order not in ("forward", "reverse"):
+                raise ValueError(f"unsupported judge order: {order!r}")
+            visual_target = gold_referent
+            if order == "reverse":
+                visual_target = "B" if gold_referent == "A" else "A"
+            target_token = a_ids[0] if visual_target == "A" else b_ids[0]
+            target_a_count += int(visual_target == "A")
+            target_b_count += int(visual_target == "B")
+            sampled_correct += int(turn.get("verdict") == visual_target)
+            prompt_tokens = [int(value) for value in turn.get("prompt_tokens", ())]
+            if not prompt_tokens:
+                raise ValueError("supervised judge prompt tokens empty")
+            turn_allowed = tuple(
+                int(value) for value in turn.get("behavior_policy_allowed_token_ids", ())
+            )
+            if turn_allowed != allowed_token_ids:
+                raise ValueError(
+                    "sampled judge behavior policy differs from the canonical supervised label set"
+                )
+            datum = TrainingDatum(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=[target_token],
+                completion_logprobs=[0.0],
+                completion_logprob_mask=[0],
+                completion_advantages=[0.0],
+                metadata={
+                    "reason": "judge_bidirectional_supervised_gold_label_ce",
+                    "training_objective": "supervised_label_ce",
+                    "question": debate.question[:100],
+                    "judge_order": order,
+                    "judge_label_gold_agent": gold_referent,
+                    "judge_label_visual_target": visual_target,
+                    "judge_label_target_token_id": target_token,
+                    "judge_sampled_verdict": turn.get("verdict"),
+                    "judge_sampled_label_correct": turn.get("verdict") == visual_target,
+                    "behavior_policy_allowed_token_ids": list(allowed_token_ids),
+                    "judgment_index": judgment_index,
+                },
+            )
+            examples.append(training_datum_to_train_example(datum=datum, adapter_name=adapter_name))
+
+    count = len(examples)
+    return examples, {
+        "judge_training_objective": "supervised_label_ce",
+        "judge_supervised_group_size": count,
+        "judge_supervised_sampled_label_correct": sampled_correct,
+        "judge_supervised_sampled_label_accuracy": sampled_correct / count if count else 0.0,
+        "judge_supervised_coherent_debates": coherent_debates,
+        "judge_supervised_incoherent_debates": len(debates) - coherent_debates,
+        "judge_supervised_target_a_count": target_a_count,
+        "judge_supervised_target_b_count": target_b_count,
+        **(
+            {
+                "judge_supervised_referent_js_mean": sum(js_values) / len(js_values),
+                "judge_supervised_referent_js_max": max(js_values),
+            }
+            if js_values
+            else {}
+        ),
+    }
+
+
 def summarize_judge_rejection_r1_projection(
     *,
     r1_examples: list[TrainExample],

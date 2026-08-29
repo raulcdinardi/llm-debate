@@ -105,3 +105,27 @@ Judge PPO logprobs are reconstructed under the exact two-token conditional
 normalization in both full-logits and selective-LM-head trainer backends. This
 keeps the constrained sampler and trainer behavior policies identical instead
 of scoring a two-token sample under the full vocabulary.
+
+## Direct gold-label judge gradient
+
+For labeled tasks, add:
+
+```text
+--judge-training-objective supervised_label_ce
+```
+
+This replaces sampled-action judge GRPO with direct two-class cross-entropy on
+the known correct referent. Both transcript orders remain in the batch. The
+target is swapped in the reversed transcript so both examples supervise the
+same underlying trajectory:
+
+```text
+forward order: target = gold referent (A or B)
+reverse order: target = swap(gold referent)
+loss:          -log P(target | {" A", " B"})
+```
+
+Only the judge objective changes. Debate R2/R3 continues using the granular
+zero-sum GRPO signal. Sampled judge accuracy, order coherence, and
+referent-aligned JS remain rollout diagnostics; they do not enter the judge CE
+loss.
