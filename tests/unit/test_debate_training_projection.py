@@ -208,7 +208,7 @@ def _soft_judge_audit(score: float, *, js: float = 0.0) -> dict[str, object]:
 
 
 @pytest.mark.parametrize("js", [0.0, 0.5, 0.999, 1.0])
-def test_soft_judge_r1_reliability_gates_final_normalized_advantage(js: float) -> None:
+def test_soft_judge_r1_preserves_task_baseline_and_scales_only_adjustment(js: float) -> None:
     debate = _make_debate(
         reward_a=1.0,
         reward_b=0.0,
@@ -222,28 +222,36 @@ def test_soft_judge_r1_reliability_gates_final_normalized_advantage(js: float) -
         r23_reward_mode="none",
         r23_constant=1.0,
         r23_symmetric=True,
+        r1_judge_delta_q=1.0,
         task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
     )
     examples = split["solution"]
     rewards = {
-        example.metadata["agent"]: example.metadata["r1_soft_reward_pre_reliability"]
+        example.metadata["agent"]: example.metadata["r1_modulated_reward"]
         for example in examples
     }
     final_advantages = {
         example.metadata["agent"]: example.advantages[-1] for example in examples
     }
     reliability = 1.0 - js
-    assert rewards == {"A": pytest.approx(0.75), "B": pytest.approx(0.25)}
+    adjustment = reliability * 0.5 * 0.5
+    assert rewards == {
+        "A": pytest.approx(1.0 + adjustment),
+        "B": pytest.approx(-adjustment),
+    }
     assert sum(rewards.values()) == pytest.approx(1.0)
     assert final_advantages == {
-        "A": pytest.approx(0.5 * reliability),
-        "B": pytest.approx(-0.5 * reliability),
+        "A": pytest.approx(0.5 + adjustment),
+        "B": pytest.approx(-0.5 - adjustment),
     }
     assert examples[0].metadata["r1_task_reward_pair_sum"] == pytest.approx(1.0)
     assert examples[0].metadata["judge_coherence_reliability"] == pytest.approx(reliability)
-    assert examples[0].metadata["r1_ungated_zscore"] == pytest.approx(1.0)
-    assert examples[0].metadata["r1_reliability_gated_zscore"] == pytest.approx(
-        reliability
+    assert examples[0].metadata["r1_task_only_zscore"] == pytest.approx(1.0)
+    assert examples[0].metadata["r1_judge_adjustment_normalized"] == pytest.approx(
+        2.0 * adjustment
+    )
+    assert examples[0].metadata["r1_modulated_zscore"] == pytest.approx(
+        1.0 + 2.0 * adjustment
     )
 
 

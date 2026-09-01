@@ -1130,13 +1130,14 @@ def assemble_split_train_examples(
             if not math.isfinite(task_a) or not math.isfinite(task_b):
                 raise ValueError(f"Non-finite task reward for question={debate.question!r}")
             score, js, reliability = _soft_judge_signal(debate)
-            midpoint = 0.5 * (task_a + task_b)
             half_gap = 0.5 * abs(task_a - task_b)
-            # Normalize the ungated preference below, then apply reliability to
-            # the final advantage. Applying it here would be cancelled by the
-            # per-group z-score whenever every row shares the same scale.
-            r1_a = midpoint + score * half_gap
-            r1_b = midpoint - score * half_gap
+            adjustment = reliability * score * r1_judge_delta_q * half_gap
+            # Preserve each trajectory's task reward and add only the judge
+            # preference. Group normalization below uses the unmodified task
+            # rewards, so reliability remains a linear coefficient instead of
+            # being cancelled by a denominator computed from the modulation.
+            r1_a = task_a + adjustment
+            r1_b = task_b - adjustment
             residual = (r1_a + r1_b) - (task_a + task_b)
             if abs(residual) > 1e-12:
                 raise AssertionError(f"Soft R1 reward failed pair-sum conservation: {residual}")
@@ -1173,8 +1174,15 @@ def assemble_split_train_examples(
             if selected_r1_trajectory_ids is None or id(traj) in selected_r1_trajectory_ids
         ]
         rewards = [reward for _traj, _debate, reward in selected_group]
-        mean_reward = sum(rewards) / len(rewards)
-        var = sum((reward - mean_reward) ** 2 for reward in rewards) / len(rewards)
+        normalization_rewards = (
+            [float(task_reward_fn(traj, debate)) for traj, debate, _reward in selected_group]
+            if r1_reward_mode == "judge_soft_task_gap"
+            else rewards
+        )
+        mean_reward = sum(normalization_rewards) / len(normalization_rewards)
+        var = sum(
+            (reward - mean_reward) ** 2 for reward in normalization_rewards
+        ) / len(normalization_rewards)
         std = math.sqrt(var)
         winner_reward = 0.0 if r23_reward_mode == "none" else float(r23_constant)
         loser_reward = -winner_reward if r23_symmetric else 0.0
@@ -1190,10 +1198,6 @@ def assemble_split_train_examples(
                     r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
                 else:
                     r1_value = (r1_reward - mean_reward) / std if std > 0 else 0.0
-                    r1_ungated_value = r1_value
-                    if r1_reward_mode == "judge_soft_task_gap":
-                        _score, _js, reliability = _soft_judge_signal(debate)
-                        r1_value *= reliability
                     r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
                 if r1_reward_mode == "judge_rejection_task":
                     r1_metadata = {
@@ -1248,19 +1252,30 @@ def assemble_split_train_examples(
                         task_a = float(task_reward_fn(debate.trajectory_a, debate))
                         task_b = float(task_reward_fn(debate.trajectory_b, debate))
                         score, js, reliability = _soft_judge_signal(debate)
+                        task_reward = float(task_reward_fn(traj, debate))
+                        judge_adjustment = r1_reward - task_reward
+                        task_only_zscore = (
+                            (task_reward - mean_reward) / std if std > 0 else 0.0
+                        )
                         r1_metadata.update({
                             "reason": "split_layout_judge_soft_task_gap_projection",
                             "r1_reward_mode": "judge_soft_task_gap",
                             "judge_soft_score": score,
                             "judge_referent_js_divergence_normalized": js,
                             "judge_coherence_reliability": reliability,
-                            "r1_task_reward": float(task_reward_fn(traj, debate)),
+                            "r1_task_reward": task_reward,
                             "r1_task_reward_gap": abs(task_a - task_b),
                             "r1_task_reward_pair_sum": task_a + task_b,
-                            "r1_soft_reward_pre_reliability": r1_reward,
+                            "r1_judge_delta_q": r1_judge_delta_q,
+                            "r1_judge_adjustment": judge_adjustment,
+                            "r1_modulated_reward": r1_reward,
                             "r1_soft_reward_pair_sum_residual": 0.0,
-                            "r1_ungated_zscore": r1_ungated_value,
-                            "r1_reliability_gated_zscore": r1_value,
+                            "r1_normalization_source": "raw_task_rewards",
+                            "r1_task_only_zscore": task_only_zscore,
+                            "r1_judge_adjustment_normalized": (
+                                judge_adjustment / std if std > 0 else 0.0
+                            ),
+                            "r1_modulated_zscore": r1_value,
                         })
                 _append_turn(
                     adapter_name=round_adapter_names[0],

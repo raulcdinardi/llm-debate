@@ -60,11 +60,12 @@ Select either or both reward projections:
 ```
 
 Both projections attenuate the judge preference by its order-coherence reliability
-`c = 1 - J`. `judge_soft_task_gap` first constructs a pair-sum-conserving task-gap
-preference, standardizes it within the question/instance group, and then multiplies
-the final R1 advantage by `c`. Applying `c` before the group z-score would cancel
-the reliability gate for a single A/B pair. `soft_judge` assigns `+c*s` to A and
-`-c*s` to B for an exactly zero-sum reward.
+`c = 1 - J`. `judge_soft_task_gap` adds `+c*s*q*gap/2` to A's raw task reward and
+the corresponding negative adjustment to B's raw task reward. It normalizes with
+statistics computed from the raw task rewards, preserving the task-only baseline
+when `c=0` and preventing the reliability coefficient from being cancelled by the
+group denominator. `soft_judge` assigns `+c*s` to A and `-c*s` to B for an exactly
+zero-sum reward.
 
 ## Trainable OpenBookQA labeled-debate mode
 
