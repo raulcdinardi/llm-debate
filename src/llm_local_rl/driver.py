@@ -1158,10 +1158,11 @@ class TrainingDriver:
         elif self.config.debate_r1_reward == "judge_soft_task_gap":
             projection_record["r1_projection"] = {
                 "mode": "judge_soft_task_gap",
-                "formula": "M +/- (1-J) * s * abs(task_reward_a - task_reward_b) / 2",
+                "formula": "advantage=(1-J)*zscore(M +/- s*abs(task_reward_a-task_reward_b)/2)",
                 "judge_score": "tanh((z_forward-z_reverse)/4)",
                 "judge_reliability": "1 - referent_js_divergence/ln(2)",
-                "pair_sum_conserved_before_group_normalization": True,
+                "ungated_reward_pair_sum_conserved_before_group_normalization": True,
+                "reliability_applied_after_group_normalization": True,
             }
         if self.config.debate_r23_reward == "soft_judge":
             projection_record["r23_projection"] = {

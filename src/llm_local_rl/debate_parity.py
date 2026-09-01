@@ -1132,8 +1132,11 @@ def assemble_split_train_examples(
             score, js, reliability = _soft_judge_signal(debate)
             midpoint = 0.5 * (task_a + task_b)
             half_gap = 0.5 * abs(task_a - task_b)
-            r1_a = midpoint + reliability * score * half_gap
-            r1_b = midpoint - reliability * score * half_gap
+            # Normalize the ungated preference below, then apply reliability to
+            # the final advantage. Applying it here would be cancelled by the
+            # per-group z-score whenever every row shares the same scale.
+            r1_a = midpoint + score * half_gap
+            r1_b = midpoint - score * half_gap
             residual = (r1_a + r1_b) - (task_a + task_b)
             if abs(residual) > 1e-12:
                 raise AssertionError(f"Soft R1 reward failed pair-sum conservation: {residual}")
@@ -1187,6 +1190,10 @@ def assemble_split_train_examples(
                     r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
                 else:
                     r1_value = (r1_reward - mean_reward) / std if std > 0 else 0.0
+                    r1_ungated_value = r1_value
+                    if r1_reward_mode == "judge_soft_task_gap":
+                        _score, _js, reliability = _soft_judge_signal(debate)
+                        r1_value *= reliability
                     r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
                 if r1_reward_mode == "judge_rejection_task":
                     r1_metadata = {
@@ -1250,8 +1257,10 @@ def assemble_split_train_examples(
                             "r1_task_reward": float(task_reward_fn(traj, debate)),
                             "r1_task_reward_gap": abs(task_a - task_b),
                             "r1_task_reward_pair_sum": task_a + task_b,
-                            "r1_soft_reward": r1_reward,
+                            "r1_soft_reward_pre_reliability": r1_reward,
                             "r1_soft_reward_pair_sum_residual": 0.0,
+                            "r1_ungated_zscore": r1_ungated_value,
+                            "r1_reliability_gated_zscore": r1_value,
                         })
                 _append_turn(
                     adapter_name=round_adapter_names[0],

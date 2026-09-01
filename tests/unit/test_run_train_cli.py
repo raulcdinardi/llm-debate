@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import shlex
 
@@ -163,12 +164,16 @@ def test_cli_accepts_direct_js_judge_objective_and_legacy_enable_alias() -> None
             "--output-dir",
             "/tmp/out",
             "--train-judge-coherence-grpo",
+            "--judge-grpo-reward-mode",
+            "label_js",
         ]
     )
     assert direct.train_judge is True
     assert direct.judge_training_objective == "supervised_label_ce_js"
     assert direct.judge_coherence_js_weight == pytest.approx(0.75)
     assert legacy.train_judge is True
+    assert legacy.judge_training_objective == "supervised_label_ce_js"
+    assert legacy.judge_grpo_reward_mode == "coherence"
 
 
 def test_openbookqa_supervised_label_ce_js_contract_is_trainable_and_granular() -> None:
@@ -197,6 +202,31 @@ def test_openbookqa_supervised_label_ce_js_contract_is_trainable_and_granular() 
     )
     assert config.judge_training_objective == "supervised_label_ce_js"
     assert config.judge_coherence_js_weight == pytest.approx(0.75)
+
+    with pytest.raises(ValueError, match="order_sym_soft_logit"):
+        replace(
+            config,
+            debate_judge_score_mode="hard_verdict",
+            judge_label_token_contract="none",
+        )
+    with pytest.raises(ValueError, match="even"):
+        replace(config, train_minibatch_size=3)
+    with pytest.raises(ValueError, match="must not contain 'judge'"):
+        replace(
+            config,
+            debate_round_adapter_names=("solution", "judge", "debate"),
+        )
+
+    legacy_data = config.to_dict()
+    legacy_data.pop("train_judge")
+    legacy_data.pop("judge_training_objective")
+    legacy_data.pop("judge_coherence_js_weight")
+    legacy_data["train_judge_coherence_grpo"] = True
+    legacy_data["judge_grpo_reward_mode"] = "label_js"
+    migrated = TrainRunConfig.from_dict(legacy_data)
+    assert migrated.train_judge is True
+    assert migrated.judge_training_objective == "supervised_label_ce_js"
+    assert migrated.judge_grpo_reward_mode == "coherence"
 
 
 def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:

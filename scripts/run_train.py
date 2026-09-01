@@ -171,13 +171,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--judge-grpo-reward-mode",
-        choices=["coherence", "label"],
+        choices=["coherence", "label", "label_js"],
         default="coherence",
         help=(
             "Judge GRPO raw reward source: 'coherence' scores referent agreement of the "
             "two orderings; 'label' scores each sampled verdict against the ground-truth "
             "trajectory reward (+1 gold referent, -1 otherwise, 0 on reward ties). "
-            "JS coherence is a separate direct loss, never a sampled-action reward."
+            "JS coherence is a separate direct loss, never a sampled-action reward. "
+            "The legacy 'label_js' spelling atomically migrates an enabled judge to "
+            "supervised_label_ce_js."
         ),
     )
     parser.add_argument("--debate-round-adapter-names", nargs="*", default=["solution", "debate", "debate"])
@@ -315,7 +317,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--wandb-table-samples-per-shard", type=int, default=32)
     parser.add_argument("--reference-kl-every", type=int, default=10, help="0 disables sampled KL to initialization.")
     parser.add_argument("--resume", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.judge_grpo_reward_mode == "label_js":
+        args.judge_grpo_reward_mode = "coherence"
+        if args.train_judge:
+            args.judge_training_objective = "supervised_label_ce_js"
+    return args
 
 
 def main() -> int:

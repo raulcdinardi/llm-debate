@@ -207,11 +207,12 @@ def _soft_judge_audit(score: float, *, js: float = 0.0) -> dict[str, object]:
     }
 
 
-def test_soft_judge_r1_allocates_task_gap_and_preserves_pair_sum() -> None:
+@pytest.mark.parametrize("js", [0.0, 0.5, 0.999, 1.0])
+def test_soft_judge_r1_reliability_gates_final_normalized_advantage(js: float) -> None:
     debate = _make_debate(
         reward_a=1.0,
         reward_b=0.0,
-        judge_raw_response=_soft_judge_audit(0.5, js=0.5),
+        judge_raw_response=_soft_judge_audit(0.5, js=js),
     )
     split = assemble_split_train_examples(
         debates=[debate],
@@ -224,11 +225,26 @@ def test_soft_judge_r1_allocates_task_gap_and_preserves_pair_sum() -> None:
         task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
     )
     examples = split["solution"]
-    rewards = {example.metadata["agent"]: example.metadata["r1_soft_reward"] for example in examples}
-    assert rewards == {"A": pytest.approx(0.625), "B": pytest.approx(0.375)}
+    rewards = {
+        example.metadata["agent"]: example.metadata["r1_soft_reward_pre_reliability"]
+        for example in examples
+    }
+    final_advantages = {
+        example.metadata["agent"]: example.advantages[-1] for example in examples
+    }
+    reliability = 1.0 - js
+    assert rewards == {"A": pytest.approx(0.75), "B": pytest.approx(0.25)}
     assert sum(rewards.values()) == pytest.approx(1.0)
+    assert final_advantages == {
+        "A": pytest.approx(0.5 * reliability),
+        "B": pytest.approx(-0.5 * reliability),
+    }
     assert examples[0].metadata["r1_task_reward_pair_sum"] == pytest.approx(1.0)
-    assert examples[0].metadata["judge_coherence_reliability"] == pytest.approx(0.5)
+    assert examples[0].metadata["judge_coherence_reliability"] == pytest.approx(reliability)
+    assert examples[0].metadata["r1_ungated_zscore"] == pytest.approx(1.0)
+    assert examples[0].metadata["r1_reliability_gated_zscore"] == pytest.approx(
+        reliability
+    )
 
 
 def test_soft_judge_r23_is_exactly_zero_sum_even_when_hard_labels_disagree() -> None:
