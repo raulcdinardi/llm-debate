@@ -142,7 +142,36 @@ def test_cli_accepts_label_judge_grpo_reward_mode() -> None:
     assert args.judge_grpo_reward_mode == "label"
 
 
-def test_openbookqa_label_js_contract_is_trainable_and_granular() -> None:
+def test_cli_accepts_direct_js_judge_objective_and_legacy_enable_alias() -> None:
+    direct = parse_args(
+        [
+            "--model-path",
+            "/tmp/model",
+            "--output-dir",
+            "/tmp/out",
+            "--train-judge",
+            "--judge-training-objective",
+            "supervised_label_ce_js",
+            "--judge-coherence-js-weight",
+            "0.75",
+        ]
+    )
+    legacy = parse_args(
+        [
+            "--model-path",
+            "/tmp/model",
+            "--output-dir",
+            "/tmp/out",
+            "--train-judge-coherence-grpo",
+        ]
+    )
+    assert direct.train_judge is True
+    assert direct.judge_training_objective == "supervised_label_ce_js"
+    assert direct.judge_coherence_js_weight == pytest.approx(0.75)
+    assert legacy.train_judge is True
+
+
+def test_openbookqa_supervised_label_ce_js_contract_is_trainable_and_granular() -> None:
     config = TrainRunConfig(
         model_path="/model",
         output_dir="/out",
@@ -161,39 +190,13 @@ def test_openbookqa_label_js_contract_is_trainable_and_granular() -> None:
         debate_judge_constrain_single_token=True,
         debate_judge_score_mode="order_sym_soft_logit",
         judge_label_token_contract="lfm25_openbookqa_spaced_ab_v1",
-        train_judge_coherence_grpo=True,
-        judge_grpo_reward_mode="label_js",
+        train_judge=True,
+        judge_training_objective="supervised_label_ce_js",
+        judge_coherence_js_weight=0.75,
         train_adapter_names=("debate", "judge"),
     )
-    assert config.judge_grpo_reward_mode == "label_js"
-    assert config.debate_r23_reward == "soft_judge"
-
-
-def test_openbookqa_supervised_label_ce_contract_is_trainable_and_granular() -> None:
-    config = TrainRunConfig(
-        model_path="/model",
-        output_dir="/out",
-        rollout=RolloutConfig(mode="debate", temperature=1.0),
-        adapter_layout="split",
-        debate_rounds=3,
-        debate_round_adapter_names=("solution", "debate", "debate"),
-        debate_r1_reward="none",
-        debate_r23_reward="soft_judge",
-        debate_r23_mode="symmetric",
-        debate_judge_adapter="judge",
-        debate_judge_harness=CONSTITUTION_SINGLE_TOKEN_V1,
-        debate_judge_temperature=1.0,
-        debate_judge_max_tokens=1,
-        debate_judge_bidirectional=True,
-        debate_judge_constrain_single_token=True,
-        debate_judge_score_mode="order_sym_soft_logit",
-        judge_label_token_contract="lfm25_openbookqa_spaced_ab_v1",
-        train_judge_coherence_grpo=True,
-        judge_training_objective="supervised_label_ce",
-        judge_grpo_reward_mode="label_js",
-        train_adapter_names=("debate", "judge"),
-    )
-    assert config.judge_training_objective == "supervised_label_ce"
+    assert config.judge_training_objective == "supervised_label_ce_js"
+    assert config.judge_coherence_js_weight == pytest.approx(0.75)
 
 
 def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:
@@ -226,7 +229,7 @@ def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:
         debate_judge_presence_penalty=args.debate_judge_presence_penalty,
         debate_judge_repetition_penalty=args.debate_judge_repetition_penalty,
         debate_judge_bidirectional=args.debate_judge_bidirectional,
-        train_judge_coherence_grpo=args.train_judge_coherence_grpo,
+        train_judge=args.train_judge,
         judge_grpo_reward_mode=args.judge_grpo_reward_mode,
         train_adapter_names=tuple(args.train_adapter_names),
     )
@@ -235,7 +238,7 @@ def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:
     assert config.debate_judge_adapter == "judge"
     assert config.debate_judge_harness == SOLUTION_R1_RATIONALE_V1
     assert config.debate_judge_bidirectional is True
-    assert config.train_judge_coherence_grpo is True
+    assert config.train_judge is True
     assert config.judge_grpo_reward_mode == "coherence"
     assert config.rollout.temperature == config.debate_judge_temperature == 1.0
     assert config.train_adapter_names == ("solution", "debate", "judge")

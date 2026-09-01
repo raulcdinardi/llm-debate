@@ -275,11 +275,15 @@ def test_judge_coherence_grpo_config_roundtrip_and_fail_closed() -> None:
         debate_judge_adapter="judge",
         debate_judge_bidirectional=True,
         debate_judge_temperature=0.8,
-        train_judge_coherence_grpo=True,
+        train_judge=True,
         train_adapter_names=("solution", "debate", "judge"),
     )
     restored = TrainRunConfig.from_dict(config.to_dict())
-    assert restored.train_judge_coherence_grpo is True
+    assert restored.train_judge is True
+    legacy_data = config.to_dict()
+    legacy_data.pop("train_judge")
+    legacy_data["train_judge_coherence_grpo"] = True
+    assert TrainRunConfig.from_dict(legacy_data).train_judge is True
 
     with pytest.raises(ValueError, match="behavior distributions to match"):
         TrainRunConfig(
@@ -290,7 +294,7 @@ def test_judge_coherence_grpo_config_roundtrip_and_fail_closed() -> None:
             debate_judge_adapter="judge",
             debate_judge_bidirectional=True,
             debate_judge_temperature=1.0,
-            train_judge_coherence_grpo=True,
+            train_judge=True,
             train_adapter_names=("solution", "debate", "judge"),
         )
 
@@ -302,7 +306,7 @@ def test_judge_coherence_grpo_config_roundtrip_and_fail_closed() -> None:
             adapter_layout="split",
             debate_judge_adapter="judge",
             debate_judge_bidirectional=False,
-            train_judge_coherence_grpo=True,
+            train_judge=True,
         )
     with pytest.raises(ValueError, match="judge in train_adapter_names"):
         TrainRunConfig(
@@ -312,7 +316,7 @@ def test_judge_coherence_grpo_config_roundtrip_and_fail_closed() -> None:
             adapter_layout="split",
             debate_judge_adapter="judge",
             debate_judge_bidirectional=True,
-            train_judge_coherence_grpo=True,
+            train_judge=True,
             train_adapter_names=("solution", "debate"),
         )
     with pytest.raises(ValueError, match="non-negative"):

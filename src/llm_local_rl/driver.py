@@ -1076,8 +1076,8 @@ class TrainingDriver:
             r23_format_failure_penalty=self.config.debate_r23_format_failure_penalty,
         )
         judge_grpo_record: dict[str, float | int | str] | None = None
-        if self.config.train_judge_coherence_grpo:
-            if self.config.judge_training_objective == "supervised_label_ce":
+        if self.config.train_judge:
+            if self.config.judge_training_objective == "supervised_label_ce_js":
                 judge_examples, judge_grpo_record = assemble_judge_supervised_label_examples(
                     debates
                 )
@@ -1125,13 +1125,13 @@ class TrainingDriver:
                 "round_outputs": len(r2_audits) + len(r3_audits),
             }
         if judge_grpo_record is not None:
-            if self.config.judge_training_objective == "supervised_label_ce":
+            if self.config.judge_training_objective == "supervised_label_ce_js":
                 projection_record["judge_supervised_label"] = judge_grpo_record
             else:
                 projection_record["judge_grpo"] = judge_grpo_record
                 projection_record[
                     "judge_label_grpo"
-                    if self.config.judge_grpo_reward_mode in ("label", "label_js")
+                    if self.config.judge_grpo_reward_mode == "label"
                     else "judge_coherence_grpo"
                 ] = judge_grpo_record
         if self.config.debate_r1_reward == "judge_rejection_task":
@@ -1158,14 +1158,16 @@ class TrainingDriver:
         elif self.config.debate_r1_reward == "judge_soft_task_gap":
             projection_record["r1_projection"] = {
                 "mode": "judge_soft_task_gap",
-                "formula": "M +/- s * abs(task_reward_a - task_reward_b) / 2",
+                "formula": "M +/- (1-J) * s * abs(task_reward_a - task_reward_b) / 2",
                 "judge_score": "tanh((z_forward-z_reverse)/4)",
+                "judge_reliability": "1 - referent_js_divergence/ln(2)",
                 "pair_sum_conserved_before_group_normalization": True,
             }
         if self.config.debate_r23_reward == "soft_judge":
             projection_record["r23_projection"] = {
                 "mode": "soft_judge",
-                "formula": "reward_a=s; reward_b=-s",
+                "formula": "reward_a=(1-J)*s; reward_b=-(1-J)*s",
+                "judge_reliability": "1 - referent_js_divergence/ln(2)",
                 "exact_zero_sum_per_debate": True,
                 "r23_constant_ignored": True,
             }
@@ -1450,17 +1452,18 @@ class TrainingDriver:
                                 adapter_name=adapter_name,
                                 batch=batch,
                                 objective=(
-                                    "supervised_label_ce"
+                                    "supervised_label_ce_js"
                                     if adapter_name == "judge"
                                     and self.config.judge_training_objective
-                                    == "supervised_label_ce"
+                                    == "supervised_label_ce_js"
                                     else "ppo"
                                 ),
+                                judge_coherence_js_weight=self.config.judge_coherence_js_weight,
                                 measure_reference_kl=(
                                     not (
                                         adapter_name == "judge"
                                         and self.config.judge_training_objective
-                                        == "supervised_label_ce"
+                                        == "supervised_label_ce_js"
                                     )
                                     and
                                     self.config.reference_kl_every > 0

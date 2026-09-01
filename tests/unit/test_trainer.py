@@ -21,7 +21,9 @@ from llm_local_rl.trainer import (
     MultiAdapterTrainer,
     TrainerConfig,
     _is_configured_adapter_parameter,
+    _normalized_bernoulli_js_from_paired_correct_logprobs,
     _order_batch_for_minibatching,
+    _order_paired_js_batch_for_minibatching,
     _pad_batch,
     _selected_lm_head_token_logprobs,
     _target_token_logprobs,
@@ -36,6 +38,7 @@ from llm_local_rl.debate_parity import (
     training_datum_to_train_example,
 )
 from llm_local_rl.types import TrainExample
+from llm_local_rl.soft_judge import bernoulli_js_divergence
 
 
 def _base_model_path() -> str | None:
@@ -241,32 +244,103 @@ def test_train_batch_loss_is_normalized_by_kept_sample_count() -> None:
     assert two_metrics["num_dropped_overlength"] == 0.0
 
 
-def test_supervised_label_ce_uses_correct_label_without_behavior_logprob() -> None:
-    example = TrainExample(
-        adapter_name="judge",
-        input_ids=[0],
-        target_ids=[0],
-        loss_mask=[1],
-        behavior_logprob_mask=[0],
-        old_logprobs=[0.0],
-        advantages=[0.0],
-        metadata={
-            "training_objective": "supervised_label_ce",
-            "behavior_policy_allowed_token_ids": [0, 1],
-        },
-    )
+def test_supervised_label_ce_js_uses_direct_labels_and_zero_js_for_equal_distributions() -> None:
+    examples = [
+        TrainExample(
+            adapter_name="judge",
+            input_ids=[0],
+            target_ids=[0],
+            loss_mask=[1],
+            behavior_logprob_mask=[0],
+            old_logprobs=[0.0],
+            advantages=[0.0],
+            metadata={
+                "training_objective": "supervised_label_ce_js",
+                "behavior_policy_allowed_token_ids": [0, 1],
+                "judge_coherence_pair_id": "pair-0",
+                "judge_coherence_pair_member": member,
+            },
+        )
+        for member in ("forward", "reverse")
+    ]
 
     metrics = _fake_trainer().train_batch(
         adapter_name="judge",
-        batch=[example],
-        objective="supervised_label_ce",
+        batch=examples,
+        objective="supervised_label_ce_js",
     )
 
-    assert metrics["training_objective"] == "supervised_label_ce"
+    assert metrics["training_objective"] == "supervised_label_ce_js"
     assert metrics["loss"] == pytest.approx(math.log(2.0), abs=1e-6)
     assert metrics["supervised_label_nll"] == pytest.approx(math.log(2.0), abs=1e-6)
     assert metrics["supervised_correct_label_probability_mean"] == pytest.approx(0.5)
+    assert metrics["judge_coherence_js"] == pytest.approx(0.0)
+    assert metrics["judge_coherence_reliability"] == pytest.approx(1.0)
+    assert metrics["judge_coherence_pair_count"] == 1.0
     assert metrics["completion_tokens_checked"] == 0.0
+
+
+def test_direct_js_is_bounded_symmetric_and_differentiable() -> None:
+    logprobs = torch.tensor([math.log(0.9), math.log(0.1)], requires_grad=True)
+    js = _normalized_bernoulli_js_from_paired_correct_logprobs(logprobs)
+    swapped = _normalized_bernoulli_js_from_paired_correct_logprobs(logprobs.flip(0))
+
+    assert js.shape == (1,)
+    assert js.item() == pytest.approx(
+        bernoulli_js_divergence(0.9, 0.1) / math.log(2.0), abs=1e-6
+    )
+    assert 0.0 < js.item() < 1.0
+    assert js.item() == pytest.approx(swapped.item())
+    js.sum().backward()
+    assert logprobs.grad is not None
+    assert torch.isfinite(logprobs.grad).all()
+    assert torch.count_nonzero(logprobs.grad).item() == 2
+
+
+def test_direct_js_pair_ordering_keeps_members_adjacent_when_length_bucketed() -> None:
+    def row(pair_id: str, member: str, length: int) -> TrainExample:
+        return TrainExample(
+            adapter_name="judge",
+            input_ids=[0] * length,
+            target_ids=[0] * length,
+            loss_mask=([0] * (length - 1)) + [1],
+            behavior_logprob_mask=[0] * length,
+            old_logprobs=[0.0] * length,
+            advantages=[0.0] * length,
+            metadata={
+                "training_objective": "supervised_label_ce_js",
+                "behavior_policy_allowed_token_ids": [0, 1],
+                "judge_coherence_pair_id": pair_id,
+                "judge_coherence_pair_member": member,
+            },
+        )
+
+    ordered = _order_paired_js_batch_for_minibatching(
+        batch=[
+            row("long", "reverse", 6),
+            row("short", "forward", 2),
+            row("long", "forward", 5),
+            row("short", "reverse", 3),
+        ],
+        length_bucket_batches=True,
+    )
+    assert [example.metadata["judge_coherence_pair_id"] for example in ordered] == [
+        "short",
+        "short",
+        "long",
+        "long",
+    ]
+    assert [example.metadata["judge_coherence_pair_member"] for example in ordered] == [
+        "forward",
+        "reverse",
+        "forward",
+        "reverse",
+    ]
+
+    with pytest.raises(ValueError, match="one forward and one reverse"):
+        _order_paired_js_batch_for_minibatching(
+            batch=[row("broken", "forward", 2)]
+        )
 
 
 def test_train_batch_drops_overlength_samples_and_reports_counter() -> None:
@@ -392,7 +466,7 @@ def test_selective_lm_head_reconstructs_allowed_token_normalization() -> None:
     )
     restricted = torch.log_softmax(torch.tensor([2.0, -1.0]), dim=-1)
     expected_entropy = float((-(restricted.exp() * restricted).sum()).item())
-    assert actual[0] == pytest.approx(float(restricted[1]), abs=1e-6)
+    assert float(actual[0].detach()) == pytest.approx(float(restricted[1]), abs=1e-6)
     assert entropy == pytest.approx(expected_entropy, abs=1e-6)
 
 

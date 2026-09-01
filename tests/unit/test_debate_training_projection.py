@@ -87,48 +87,9 @@ def test_judge_coherence_grpo_pairwise_normalization_would_not_be_used() -> None
     assert all(not any(example.advantages) for example in examples)
 
 
-def test_label_js_grpo_combines_gold_label_with_referent_js_penalty() -> None:
-    turns = [
-        {
-            "order": "forward",
-            "verdict": "A",
-            "prompt_tokens": [101, 102],
-            "completion_tokens": [334],
-            "completion_logprobs": [-0.2],
-            "behavior_policy_allowed_token_ids": [334, 378],
-        },
-        {
-            "order": "reverse",
-            "verdict": "A",
-            "prompt_tokens": [201, 202],
-            "completion_tokens": [334],
-            "completion_logprobs": [-0.3],
-            "behavior_policy_allowed_token_ids": [334, 378],
-        },
-    ]
-    debate = _make_debate(
-        reward_a=1.0,
-        reward_b=0.0,
-        judge_raw_response={
-            "bidirectional_judge": True,
-            "order_invariant": False,
-            "soft_judge": True,
-            "soft_score": {"referent_js_divergence_normalized": 0.25},
-            "_training_judge_turns": turns,
-        },
-    )
-    examples, metrics = assemble_judge_coherence_grpo_examples(
-        [debate], reward_mode="label_js"
-    )
-    assert [row.metadata["judge_label_reward"] for row in examples] == [1.0, -1.0]
-    assert [row.metadata["judge_label_js_reward"] for row in examples] == [0.75, -1.25]
-    assert [row.metadata["judge_referent_js_penalty"] for row in examples] == [0.25, 0.25]
-    assert [row.metadata["behavior_policy_allowed_token_ids"] for row in examples] == [
-        [334, 378],
-        [334, 378],
-    ]
-    assert metrics["judge_grpo_referent_js_mean"] == pytest.approx(0.25)
-    assert metrics["judge_grpo_reward_formula"] == "label_reward - referent_js_divergence/ln(2)"
+def test_judge_grpo_rejects_js_as_a_sampled_action_reward() -> None:
+    with pytest.raises(ValueError, match="unsupported judge GRPO reward mode"):
+        assemble_judge_coherence_grpo_examples([], reward_mode="label_js")
 
 
 def test_supervised_judge_targets_gold_referent_in_both_orders() -> None:
@@ -171,7 +132,14 @@ def test_supervised_judge_targets_gold_referent_in_both_orders() -> None:
     assert [row.metadata["judge_label_visual_target"] for row in examples] == ["A", "B"]
     assert all(row.behavior_logprob_mask[-1] == 0 for row in examples)
     assert all(row.advantages[-1] == 0.0 for row in examples)
-    assert metrics["judge_training_objective"] == "supervised_label_ce"
+    assert metrics["judge_training_objective"] == "supervised_label_ce_js"
+    assert [row.metadata["judge_coherence_pair_member"] for row in examples] == [
+        "forward",
+        "reverse",
+    ]
+    assert examples[0].metadata["judge_coherence_pair_id"] == examples[1].metadata[
+        "judge_coherence_pair_id"
+    ]
     assert metrics["judge_supervised_sampled_label_accuracy"] == 0.0
     assert metrics["judge_supervised_referent_js_mean"] == pytest.approx(0.2)
 
@@ -226,12 +194,16 @@ def _formatted_round(round_num: int) -> str:
     return header + " first\n2) second\n3) third\nCONCLUDED"
 
 
-def _soft_judge_audit(score: float) -> dict[str, object]:
+def _soft_judge_audit(score: float, *, js: float = 0.0) -> dict[str, object]:
     return {
         "bidirectional_judge": True,
         "soft_judge": True,
         "order_invariant": False,
-        "soft_score": {"score": score},
+        "soft_score": {
+            "score": score,
+            "referent_js_divergence_normalized": js,
+            "coherence_reliability": 1.0 - js,
+        },
     }
 
 
@@ -239,7 +211,7 @@ def test_soft_judge_r1_allocates_task_gap_and_preserves_pair_sum() -> None:
     debate = _make_debate(
         reward_a=1.0,
         reward_b=0.0,
-        judge_raw_response=_soft_judge_audit(0.5),
+        judge_raw_response=_soft_judge_audit(0.5, js=0.5),
     )
     split = assemble_split_train_examples(
         debates=[debate],
@@ -253,13 +225,14 @@ def test_soft_judge_r1_allocates_task_gap_and_preserves_pair_sum() -> None:
     )
     examples = split["solution"]
     rewards = {example.metadata["agent"]: example.metadata["r1_soft_reward"] for example in examples}
-    assert rewards == {"A": pytest.approx(0.75), "B": pytest.approx(0.25)}
+    assert rewards == {"A": pytest.approx(0.625), "B": pytest.approx(0.375)}
     assert sum(rewards.values()) == pytest.approx(1.0)
     assert examples[0].metadata["r1_task_reward_pair_sum"] == pytest.approx(1.0)
+    assert examples[0].metadata["judge_coherence_reliability"] == pytest.approx(0.5)
 
 
 def test_soft_judge_r23_is_exactly_zero_sum_even_when_hard_labels_disagree() -> None:
-    debate = _make_debate(judge_raw_response=_soft_judge_audit(0.5))
+    debate = _make_debate(judge_raw_response=_soft_judge_audit(0.5, js=0.5))
     split = assemble_split_train_examples(
         debates=[debate],
         num_rounds=2,
@@ -272,9 +245,13 @@ def test_soft_judge_r23_is_exactly_zero_sum_even_when_hard_labels_disagree() -> 
     )
     debate_examples = split["debate"]
     rewards = {example.metadata["agent"]: example.metadata["r23_reward"] for example in debate_examples}
-    assert rewards == {"A": pytest.approx(0.5), "B": pytest.approx(-0.5)}
+    assert rewards == {"A": pytest.approx(0.25), "B": pytest.approx(-0.25)}
     assert sum(rewards.values()) == pytest.approx(0.0)
     assert all(example.metadata["r23_incoherent_reward_applied"] is False for example in debate_examples)
+    assert all(
+        example.metadata["judge_coherence_reliability"] == pytest.approx(0.5)
+        for example in debate_examples
+    )
 
 
 def test_base_text_debate_format_audit_is_exact_and_terminal() -> None:

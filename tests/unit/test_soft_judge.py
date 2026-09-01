@@ -151,5 +151,9 @@ def test_referent_js_aligns_reverse_labels_before_comparison() -> None:
         contract=contract,
     )
     assert aligned.referent_js_divergence_normalized == pytest.approx(0.0)
+    assert aligned.coherence_reliability == pytest.approx(1.0)
     assert biased.referent_js_divergence_normalized > 0.0
+    assert biased.coherence_reliability == pytest.approx(
+        1.0 - biased.referent_js_divergence_normalized
+    )
     assert bernoulli_js_divergence(0.0, 1.0) == pytest.approx(math.log(2.0))

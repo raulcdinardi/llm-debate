@@ -59,9 +59,10 @@ Select either or both reward projections:
 --debate-r23-reward soft_judge
 ```
 
-`judge_soft_task_gap` allocates the existing absolute task-reward gap while conserving its
-pair sum before the existing group normalization. `soft_judge` assigns `+s` to A and `-s`
-to B for an exactly zero-sum debate reward.
+Both projections attenuate the judge preference by its order-coherence reliability
+`c = 1 - J`. `judge_soft_task_gap` allocates `c*s` times the existing absolute
+task-reward gap while conserving its pair sum before group normalization.
+`soft_judge` assigns `+c*s` to A and `-c*s` to B for an exactly zero-sum reward.
 
 ## Trainable OpenBookQA labeled-debate mode
 
@@ -72,8 +73,9 @@ The labeled OpenBookQA judge uses a separate strict contract:
 --debate-judge-constrain-single-token
 --judge-label-token-contract lfm25_openbookqa_spaced_ab_v1
 --debate-judge-score-mode order_sym_soft_logit
---train-judge-coherence-grpo
---judge-grpo-reward-mode label_js
+--train-judge
+--judge-training-objective supervised_label_ce_js
+--judge-coherence-js-weight 1.0
 --debate-r23-reward soft_judge
 ```
 
@@ -84,48 +86,36 @@ prefill therefore cannot agglutinate with either answer token.
 
 For forward order, let `p = (P(A), P(B))`. For reversed display order, map the
 labels back to original referents and let `q = (P_reverse(B), P_reverse(A))`.
-The consistency penalty is the bounded quantity
+The coherence loss and debate reliability are
 
 ```text
 J = JS(p, q) / ln(2)        # 0 <= J <= 1
+c = 1 - J                   # 0 <= c <= 1
 ```
 
-Each sampled judge action keeps the objective OpenBookQA label reward and
-subtracts the same pair-level consistency penalty:
+The judge is trained directly from the known gold referent and current model
+probabilities:
 
 ```text
-r_judge = (+1 if sampled referent is gold else -1) - J
+forward target = gold referent
+reverse target = swap(gold referent)
+L_judge = mean(label CE) + lambda_js * mean(J)
 ```
 
-(Gold-label ties retain label reward 0.) The debate adapter independently uses
-the granular zero-sum signal `r_A = s`, `r_B = -s`, where
-`s = tanh((z_forward - z_reverse) / 4)`.
+Forward/reverse pairs remain adjacent within every trainer minibatch, including
+length-bucketed training. An overlength row or incomplete pair fails closed.
+Minimizing `J` alone would admit the trivial constant 50/50 judge, so label CE
+is always present in this objective.
 
-Judge PPO logprobs are reconstructed under the exact two-token conditional
-normalization in both full-logits and selective-LM-head trainer backends. This
-keeps the constrained sampler and trainer behavior policies identical instead
-of scoring a two-token sample under the full vocabulary.
-
-## Direct gold-label judge gradient
-
-For labeled tasks, add:
+The debate adapter consumes the same rollout audit through the reliability-gated
+preference
 
 ```text
---judge-training-objective supervised_label_ce
+r_A = +(1-J)*s
+r_B = -(1-J)*s
 ```
 
-This replaces sampled-action judge GRPO with direct two-class cross-entropy on
-the known correct referent. Both transcript orders remain in the batch. The
-target is swapped in the reversed transcript so both examples supervise the
-same underlying trajectory:
-
-```text
-forward order: target = gold referent (A or B)
-reverse order: target = swap(gold referent)
-loss:          -log P(target | {" A", " B"})
-```
-
-Only the judge objective changes. Debate R2/R3 continues using the granular
-zero-sum GRPO signal. Sampled judge accuracy, order coherence, and
-referent-aligned JS remain rollout diagnostics; they do not enter the judge CE
-loss.
+The R1 task-gap projection uses the same coefficient. JS is therefore neither
+mixed into sampled-action rewards nor duplicated as an unrelated diagnostic:
+it has exactly two explicit roles—judge coherence loss and debate-reward
+reliability.
