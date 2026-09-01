@@ -61,6 +61,7 @@ class OrderSymmetricSoftJudgeScore:
     reverse_referent_a_probability: float
     referent_js_divergence: float
     referent_js_divergence_normalized: float
+    coherence_reliability: float
 
     def record(self) -> dict[str, float | str]:
         return {
@@ -78,6 +79,7 @@ class OrderSymmetricSoftJudgeScore:
             "reverse_referent_a_probability": self.reverse_referent_a_probability,
             "referent_js_divergence": self.referent_js_divergence,
             "referent_js_divergence_normalized": self.referent_js_divergence_normalized,
+            "coherence_reliability": self.coherence_reliability,
         }
 
 
@@ -232,6 +234,7 @@ def order_symmetric_soft_judge_score(
         reverse_referent_a_probability,
     )
     referent_js_divergence_normalized = referent_js_divergence / math.log(2.0)
+    coherence_reliability = 1.0 - referent_js_divergence_normalized
     if not all(
         math.isfinite(value)
         for value in (z_forward, z_reverse, z_symmetric, score)
@@ -251,6 +254,7 @@ def order_symmetric_soft_judge_score(
         reverse_referent_a_probability=reverse_referent_a_probability,
         referent_js_divergence=referent_js_divergence,
         referent_js_divergence_normalized=referent_js_divergence_normalized,
+        coherence_reliability=coherence_reliability,
     )
 
 

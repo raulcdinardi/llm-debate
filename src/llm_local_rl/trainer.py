@@ -34,6 +34,12 @@ from llm_local_rl.types import AdapterName, TrainExample
 TRAIN_LOGPROB_BACKEND_FULL_LOGITS = "full_logits"
 TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD = "selective_lm_head"
 TRAIN_LOGPROB_BACKENDS = (TRAIN_LOGPROB_BACKEND_FULL_LOGITS, TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD)
+TRAIN_OBJECTIVE_PPO = "ppo"
+TRAIN_OBJECTIVE_SUPERVISED_LABEL_CE_JS = "supervised_label_ce_js"
+TRAIN_OBJECTIVES = (
+    TRAIN_OBJECTIVE_PPO,
+    TRAIN_OBJECTIVE_SUPERVISED_LABEL_CE_JS,
+)
 
 
 class BehaviorPolicyLogprobMismatchError(RuntimeError):
@@ -121,6 +127,28 @@ def _validate_example_lengths(example: TrainExample) -> None:
     ):
         raise ValueError("Every nonzero-advantage token must have a behavior-policy logprob.")
     allowed_token_ids = _example_allowed_token_ids(example)
+    if example.metadata.get("training_objective") == TRAIN_OBJECTIVE_SUPERVISED_LABEL_CE_JS:
+        if sum(int(value) for value in example.loss_mask) != 1:
+            raise ValueError("supervised_label_ce_js requires exactly one labeled loss position")
+        if any(example.behavior_logprob_mask):
+            raise ValueError("supervised_label_ce_js must not claim sampled behavior logprobs")
+        labeled_targets = [
+            int(target_id)
+            for target_id, has_loss in zip(example.target_ids, example.loss_mask, strict=True)
+            if has_loss
+        ]
+        if len(allowed_token_ids) != 2 or labeled_targets[0] not in allowed_token_ids:
+            raise ValueError(
+                "supervised_label_ce_js target must belong to an explicit two-token label contract"
+            )
+        pair_id = example.metadata.get("judge_coherence_pair_id")
+        pair_member = example.metadata.get("judge_coherence_pair_member")
+        if not isinstance(pair_id, str) or not pair_id:
+            raise ValueError("supervised_label_ce_js requires a non-empty coherence pair id")
+        if pair_member not in ("forward", "reverse"):
+            raise ValueError(
+                "supervised_label_ce_js pair member must be forward or reverse"
+            )
     if allowed_token_ids:
         for target_id, has_behavior_logprob in zip(
             example.target_ids, example.behavior_logprob_mask, strict=True
@@ -524,6 +552,69 @@ def _order_batch_for_minibatching(
     if not length_bucket_batches:
         return list(batch)
     return sorted(batch, key=lambda example: _effective_train_length(example=example, max_tokens=max_tokens))
+
+
+def _order_paired_js_batch_for_minibatching(
+    *,
+    batch: list[TrainExample],
+    max_tokens: int = 0,
+    length_bucket_batches: bool = False,
+) -> list[TrainExample]:
+    """Keep forward/reverse judge rows adjacent while optionally bucketing pairs by length."""
+    pairs: dict[str, dict[str, TrainExample]] = {}
+    pair_order: list[str] = []
+    for example in batch:
+        pair_id = str(example.metadata.get("judge_coherence_pair_id", ""))
+        member = str(example.metadata.get("judge_coherence_pair_member", ""))
+        if pair_id not in pairs:
+            pairs[pair_id] = {}
+            pair_order.append(pair_id)
+        if member in pairs[pair_id]:
+            raise ValueError(f"Duplicate {member!r} row for judge coherence pair {pair_id!r}")
+        pairs[pair_id][member] = example
+    for pair_id, members in pairs.items():
+        if set(members) != {"forward", "reverse"}:
+            raise ValueError(
+                f"Judge coherence pair {pair_id!r} must contain one forward and one reverse row"
+            )
+    if length_bucket_batches:
+        pair_order.sort(
+            key=lambda pair_id: max(
+                _effective_train_length(example=example, max_tokens=max_tokens)
+                for example in pairs[pair_id].values()
+            )
+        )
+    return [
+        pairs[pair_id][member]
+        for pair_id in pair_order
+        for member in ("forward", "reverse")
+    ]
+
+
+def _normalized_bernoulli_js_from_paired_correct_logprobs(
+    correct_logprobs: torch.Tensor,
+) -> torch.Tensor:
+    """Return per-pair JS/ln(2) from referent-aligned correct-label logprobs.
+
+    Each adjacent forward/reverse row targets the same underlying gold referent,
+    so complement symmetry makes this exactly the JS between the full A/B
+    referent distributions regardless of whether the gold referent is A or B.
+    """
+    if correct_logprobs.ndim != 1 or int(correct_logprobs.numel()) % 2 != 0:
+        raise ValueError("Paired judge coherence requires an even one-dimensional logprob tensor")
+    probabilities = correct_logprobs.float().exp().reshape(-1, 2)
+    forward = probabilities[:, 0]
+    reverse = probabilities[:, 1]
+    midpoint = 0.5 * (forward + reverse)
+
+    def _entropy(probability: torch.Tensor) -> torch.Tensor:
+        return -(
+            torch.special.xlogy(probability, probability)
+            + torch.special.xlogy(1.0 - probability, 1.0 - probability)
+        )
+
+    js = _entropy(midpoint) - 0.5 * (_entropy(forward) + _entropy(reverse))
+    return torch.clamp(js / math.log(2.0), min=0.0, max=1.0)
 
 
 def _patch_weight_converter_compat() -> None:
@@ -942,8 +1033,17 @@ class MultiAdapterTrainer:
         *,
         adapter_name: AdapterName,
         batch: list[TrainExample],
+        objective: str = TRAIN_OBJECTIVE_PPO,
+        judge_coherence_js_weight: float = 1.0,
         measure_reference_kl: bool = False,
     ) -> dict[str, object]:
+        if objective not in TRAIN_OBJECTIVES:
+            raise ValueError(f"Unsupported training objective={objective!r}; expected {TRAIN_OBJECTIVES!r}")
+        supervised_label_ce_js = objective == TRAIN_OBJECTIVE_SUPERVISED_LABEL_CE_JS
+        if not math.isfinite(judge_coherence_js_weight) or judge_coherence_js_weight < 0.0:
+            raise ValueError("judge_coherence_js_weight must be finite and non-negative")
+        if supervised_label_ce_js and measure_reference_kl:
+            raise ValueError("supervised judge objectives do not use sampled-reference KL measurement")
         if len(batch) == 0:
             return {
                 "loss": 0.0,
@@ -952,6 +1052,8 @@ class MultiAdapterTrainer:
                 "num_input_examples": 0.0,
                 "num_dropped_overlength": 0.0,
                 "num_trained_tokens": 0.0,
+                "training_objective": objective,
+                "judge_coherence_js_weight": float(judge_coherence_js_weight),
                 "train_logprob_backend": self.config.train_logprob_backend,
                 "train_logprob_backend_is_selective_lm_head": float(
                     self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD
@@ -976,10 +1078,14 @@ class MultiAdapterTrainer:
                 f"dropped {num_dropped_overlength} of {len(batch)} examples "
                 f"(train_max_tokens={self.config.train_max_tokens})."
             )
+        if supervised_label_ce_js and len(trainable_batch) != len(batch):
+            raise ValueError(
+                "Dropping an overlength row would break a direct-JS forward/reverse pair"
+            )
 
         self.wake_up()
         reference_rows_by_example: dict[int, list[float]] = {}
-        reference_name = self.reference_adapter_names.get(adapter_name)
+        reference_name = getattr(self, "reference_adapter_names", {}).get(adapter_name)
         if measure_reference_kl and reference_name is not None:
             reference_rows = self.compute_logprobs(adapter_name=reference_name, batch=trainable_batch)
             reference_rows_by_example = {
@@ -991,12 +1097,25 @@ class MultiAdapterTrainer:
         minibatch_size = (
             self.config.train_minibatch_size if self.config.train_minibatch_size > 0 else len(trainable_batch)
         )
-        ordered_batch = _order_batch_for_minibatching(
-            batch=trainable_batch,
-            max_tokens=self.config.train_max_tokens,
-            length_bucket_batches=self.config.train_length_bucket_batches and minibatch_size < len(trainable_batch),
-        )
+        if supervised_label_ce_js:
+            if minibatch_size % 2 != 0:
+                raise ValueError("supervised_label_ce_js requires an even train_minibatch_size")
+            ordered_batch = _order_paired_js_batch_for_minibatching(
+                batch=trainable_batch,
+                max_tokens=self.config.train_max_tokens,
+                length_bucket_batches=(
+                    self.config.train_length_bucket_batches
+                    and minibatch_size < len(trainable_batch)
+                ),
+            )
+        else:
+            ordered_batch = _order_batch_for_minibatching(
+                batch=trainable_batch,
+                max_tokens=self.config.train_max_tokens,
+                length_bucket_batches=self.config.train_length_bucket_batches and minibatch_size < len(trainable_batch),
+            )
         normalization_sample_count = len(ordered_batch)
+        normalization_pair_count = len(ordered_batch) // 2 if supervised_label_ce_js else 0
         total_loss_value = 0.0
         total_trained_tokens = 0
         approx_kl_numerator = 0.0
@@ -1018,6 +1137,8 @@ class MultiAdapterTrainer:
         delta_logp_values: list[float] = []
         advantage_values: list[float] = []
         reference_delta_logp_values: list[float] = []
+        supervised_correct_label_logprobs: list[float] = []
+        judge_coherence_js_values: list[float] = []
         clip_count = 0
         clip_high_count = 0
         clip_low_count = 0
@@ -1048,9 +1169,13 @@ class MultiAdapterTrainer:
             total_minibatches += 1
             total_forward_input_tokens += int(tensors["attention_mask"].sum().detach().cpu().item())
             total_padded_input_tokens += int(tensors["input_ids"].numel())
-            trained_positions = tensors["loss_mask"] & (tensors["advantages"] != 0.0)
+            trained_positions = (
+                tensors["loss_mask"]
+                if supervised_label_ce_js
+                else tensors["loss_mask"] & (tensors["advantages"] != 0.0)
+            )
             invalid_trained_positions = trained_positions & ~tensors["behavior_logprob_mask"]
-            if bool(invalid_trained_positions.any().detach().cpu().item()):
+            if not supervised_label_ce_js and bool(invalid_trained_positions.any().detach().cpu().item()):
                 self.optimizer.zero_grad(set_to_none=True)
                 raise ValueError(
                     "A nonzero-advantage token is missing a behavior-policy logprob; "
@@ -1082,7 +1207,11 @@ class MultiAdapterTrainer:
                     behavior_temperature=self.config.behavior_policy.temperature,
                     allowed_token_ids_by_position=_allowed_token_ids_for_flat_positions(
                         batch=minibatch,
-                        behavior_positions=tensors["behavior_logprob_mask"],
+                        behavior_positions=(
+                            trained_positions
+                            if supervised_label_ce_js
+                            else tensors["behavior_logprob_mask"]
+                        ),
                     ),
                 )
                 selected_logprobs = token_logprobs[trained_positions]
@@ -1140,7 +1269,9 @@ class MultiAdapterTrainer:
             elif self.config.train_logprob_backend == TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD:
                 # Config validation makes the fail-closed parity gate mandatory, so
                 # selective scoring always covers every sampled behavior-policy token.
-                selected_positions = tensors["behavior_logprob_mask"]
+                selected_positions = (
+                    trained_positions if supervised_label_ce_js else tensors["behavior_logprob_mask"]
+                )
                 selected_position_count = int(selected_positions.sum().detach().cpu().item())
                 total_lm_head_positions += selected_position_count
                 if selected_position_count > 0:
@@ -1188,7 +1319,7 @@ class MultiAdapterTrainer:
             else:
                 raise ValueError(f"Unsupported train_logprob_backend={self.config.train_logprob_backend!r}.")
 
-            if self.config.on_policy_logprob_check:
+            if self.config.on_policy_logprob_check and not supervised_label_ce_js:
                 check_result = check_on_policy_logprobs(
                     adapter_name=adapter_name,
                     examples=minibatch,
@@ -1285,52 +1416,81 @@ class MultiAdapterTrainer:
                     (selected_logprobs.detach().float() - reference_selected.detach().float()).cpu().tolist()
                 )
             nonfinite_logprobs = int((~torch.isfinite(selected_logprobs)).sum().detach().cpu().item())
-            nonfinite_old_logprobs = int((~torch.isfinite(old_logprobs)).sum().detach().cpu().item())
+            nonfinite_old_logprobs = (
+                0
+                if supervised_label_ce_js
+                else int((~torch.isfinite(old_logprobs)).sum().detach().cpu().item())
+            )
             if nonfinite_logprobs or nonfinite_old_logprobs:
                 self.optimizer.zero_grad(set_to_none=True)
                 raise FloatingPointError(
                     "Non-finite policy logprobs before PPO backward: "
                     f"current={nonfinite_logprobs}, old={nonfinite_old_logprobs}."
                 )
-            ratio = torch.exp(selected_logprobs - old_logprobs)
-            clipped_ratio = torch.clamp(
-                ratio,
-                min=1.0 - self.config.ppo_clip_epsilon,
-                max=1.0 + self.config.ppo_clip_epsilon,
-            )
-            advantages = tensors["advantages"][trained_positions]
-            with torch.no_grad():
-                ratio_detached = ratio.detach().float()
-                ratio_values.extend(ratio_detached.cpu().tolist())
-                delta_logp_values.extend((selected_logprobs.detach().float() - old_logprobs.detach().float()).cpu().tolist())
-                advantage_values.extend(advantages.detach().float().cpu().tolist())
-                clipped_positions = (
-                    (ratio_detached < (1.0 - self.config.ppo_clip_epsilon))
-                    | (ratio_detached > (1.0 + self.config.ppo_clip_epsilon))
+            if supervised_label_ce_js:
+                with torch.no_grad():
+                    supervised_correct_label_logprobs.extend(
+                        selected_logprobs.detach().float().cpu().tolist()
+                    )
+                    entropy_sum += selected_entropy_sum
+                loss = torch.sum(-selected_logprobs) / normalization_sample_count
+                if supervised_label_ce_js:
+                    if trained_tokens != len(minibatch):
+                        raise ValueError(
+                            "supervised_label_ce_js requires exactly one trained token per row"
+                        )
+                    pair_js = _normalized_bernoulli_js_from_paired_correct_logprobs(
+                        selected_logprobs
+                    )
+                    with torch.no_grad():
+                        judge_coherence_js_values.extend(
+                            pair_js.detach().float().cpu().tolist()
+                        )
+                    loss = loss + (
+                        judge_coherence_js_weight
+                        * torch.sum(pair_js)
+                        / normalization_pair_count
+                    )
+            else:
+                ratio = torch.exp(selected_logprobs - old_logprobs)
+                clipped_ratio = torch.clamp(
+                    ratio,
+                    min=1.0 - self.config.ppo_clip_epsilon,
+                    max=1.0 + self.config.ppo_clip_epsilon,
                 )
-                clip_high_count += int(
-                    (ratio_detached > (1.0 + self.config.ppo_clip_epsilon)).sum().detach().cpu().item()
-                )
-                clip_low_count += int(
-                    (ratio_detached < (1.0 - self.config.ppo_clip_epsilon)).sum().detach().cpu().item()
-                )
-                positive_adv_positions = advantages.detach() > 0.0
-                negative_adv_positions = advantages.detach() < 0.0
-                clip_count += int(clipped_positions.sum().detach().cpu().item())
-                positive_adv_count += int(positive_adv_positions.sum().detach().cpu().item())
-                negative_adv_count += int(negative_adv_positions.sum().detach().cpu().item())
-                positive_adv_clip_count += int(
-                    (clipped_positions & positive_adv_positions).sum().detach().cpu().item()
-                )
-                negative_adv_clip_count += int(
-                    (clipped_positions & negative_adv_positions).sum().detach().cpu().item()
-                )
-                entropy_sum += selected_entropy_sum
-            objective = torch.minimum(ratio * advantages, clipped_ratio * advantages)
-            loss = torch.sum(-objective) / normalization_sample_count
+                advantages = tensors["advantages"][trained_positions]
+                with torch.no_grad():
+                    ratio_detached = ratio.detach().float()
+                    ratio_values.extend(ratio_detached.cpu().tolist())
+                    delta_logp_values.extend((selected_logprobs.detach().float() - old_logprobs.detach().float()).cpu().tolist())
+                    advantage_values.extend(advantages.detach().float().cpu().tolist())
+                    clipped_positions = (
+                        (ratio_detached < (1.0 - self.config.ppo_clip_epsilon))
+                        | (ratio_detached > (1.0 + self.config.ppo_clip_epsilon))
+                    )
+                    clip_high_count += int(
+                        (ratio_detached > (1.0 + self.config.ppo_clip_epsilon)).sum().detach().cpu().item()
+                    )
+                    clip_low_count += int(
+                        (ratio_detached < (1.0 - self.config.ppo_clip_epsilon)).sum().detach().cpu().item()
+                    )
+                    positive_adv_positions = advantages.detach() > 0.0
+                    negative_adv_positions = advantages.detach() < 0.0
+                    clip_count += int(clipped_positions.sum().detach().cpu().item())
+                    positive_adv_count += int(positive_adv_positions.sum().detach().cpu().item())
+                    negative_adv_count += int(negative_adv_positions.sum().detach().cpu().item())
+                    positive_adv_clip_count += int(
+                        (clipped_positions & positive_adv_positions).sum().detach().cpu().item()
+                    )
+                    negative_adv_clip_count += int(
+                        (clipped_positions & negative_adv_positions).sum().detach().cpu().item()
+                    )
+                    entropy_sum += selected_entropy_sum
+                ppo_objective = torch.minimum(ratio * advantages, clipped_ratio * advantages)
+                loss = torch.sum(-ppo_objective) / normalization_sample_count
             if not bool(torch.isfinite(loss).detach().cpu().item()):
                 self.optimizer.zero_grad(set_to_none=True)
-                raise FloatingPointError("Non-finite PPO loss before backward.")
+                raise FloatingPointError("Non-finite training loss before backward.")
             if self._mem_trace_active():
                 reset_peak(self.compute_device)
                 _mem_t_backward = now_seconds()
@@ -1367,12 +1527,13 @@ class MultiAdapterTrainer:
                 )
             total_trained_tokens += trained_tokens
             total_loss_value += float(loss.detach().cpu().item())
-            approx_kl_numerator += float(
-                torch.sum(old_logprobs - selected_logprobs)
-                .detach()
-                .cpu()
-                .item()
-            )
+            if not supervised_label_ce_js:
+                approx_kl_numerator += float(
+                    torch.sum(old_logprobs - selected_logprobs)
+                    .detach()
+                    .cpu()
+                    .item()
+                )
 
         if total_trained_tokens == 0:
             self.optimizer.zero_grad(set_to_none=True)
@@ -1383,6 +1544,7 @@ class MultiAdapterTrainer:
                 "num_input_examples": float(len(batch)),
                 "num_dropped_overlength": float(num_dropped_overlength),
                 "num_trained_tokens": 0.0,
+                "training_objective": objective,
                 "on_policy_logprob_checked_tokens": float(on_policy_checked_tokens),
                 "completion_tokens_checked": float(on_policy_checked_tokens),
                 "trained_tokens_checked": float(on_policy_trained_tokens_checked),
@@ -1513,6 +1675,7 @@ class MultiAdapterTrainer:
             return float(sorted_values[idx])
 
         return {
+            "training_objective": objective,
             "loss": total_loss_value,
             "loss_per_trained_token": total_loss_value / total_trained_tokens,
             "num_examples": float(len(ordered_batch)),
@@ -1520,6 +1683,31 @@ class MultiAdapterTrainer:
             "num_dropped_overlength": float(num_dropped_overlength),
             "num_trained_tokens": float(total_trained_tokens),
             "approx_kl": approx_kl_numerator / total_trained_tokens,
+            "supervised_label_nll": (
+                -mean(supervised_correct_label_logprobs)
+                if supervised_correct_label_logprobs
+                else 0.0
+            ),
+            "supervised_correct_label_probability_mean": (
+                mean(math.exp(value) for value in supervised_correct_label_logprobs)
+                if supervised_correct_label_logprobs
+                else 0.0
+            ),
+            "supervised_label_accuracy": (
+                mean(float(math.exp(value) >= 0.5) for value in supervised_correct_label_logprobs)
+                if supervised_correct_label_logprobs
+                else 0.0
+            ),
+            "judge_coherence_js_weight": float(judge_coherence_js_weight),
+            "judge_coherence_js": (
+                mean(judge_coherence_js_values) if judge_coherence_js_values else 0.0
+            ),
+            "judge_coherence_reliability": (
+                1.0 - mean(judge_coherence_js_values)
+                if judge_coherence_js_values
+                else 0.0
+            ),
+            "judge_coherence_pair_count": float(len(judge_coherence_js_values)),
             "ppo_sampled_approx_kl": (
                 sum((ratio - 1.0) - math.log(max(ratio, 1e-30)) for ratio in ratio_values)
                 / len(ratio_values)

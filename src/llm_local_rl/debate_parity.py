@@ -1038,7 +1038,7 @@ def assemble_split_train_examples(
         raise ValueError("r23_format_failure_penalty must be finite and non-positive")
     grouped: dict[str, list[TrainExample]] = {}
 
-    def _soft_score(debate: DebateResult) -> float:
+    def _soft_judge_signal(debate: DebateResult) -> tuple[float, float, float]:
         audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
         score_record = audit.get("soft_score")
         if audit.get("soft_judge") is not True or not isinstance(score_record, dict):
@@ -1046,7 +1046,12 @@ def assemble_split_train_examples(
         score = float(score_record.get("score"))
         if not math.isfinite(score) or score < -1.0 or score > 1.0:
             raise ValueError(f"Invalid soft judge score: {score!r}")
-        return score
+        js = float(score_record.get("referent_js_divergence_normalized"))
+        if not math.isfinite(js) or js < 0.0 or js > 1.0 + 1e-12:
+            raise ValueError(f"Invalid normalized referent JS divergence: {js!r}")
+        js = min(1.0, js)
+        reliability = 1.0 - js
+        return score, js, reliability
 
     def _append_turn(*, adapter_name: str, prompt_tokens: list[int], completion_tokens: list[int], completion_logprobs: list[float], advantages: list[float], metadata: dict[str, Any]) -> None:
         datum = TrainingDatum(
@@ -1124,9 +1129,12 @@ def assemble_split_train_examples(
             task_b = float(task_reward_fn(traj_b, debate))
             if not math.isfinite(task_a) or not math.isfinite(task_b):
                 raise ValueError(f"Non-finite task reward for question={debate.question!r}")
-            score = _soft_score(debate)
+            score, js, reliability = _soft_judge_signal(debate)
             midpoint = 0.5 * (task_a + task_b)
             half_gap = 0.5 * abs(task_a - task_b)
+            # Normalize the ungated preference below, then apply reliability to
+            # the final advantage. Applying it here would be cancelled by the
+            # per-group z-score whenever every row shares the same scale.
             r1_a = midpoint + score * half_gap
             r1_b = midpoint - score * half_gap
             residual = (r1_a + r1_b) - (task_a + task_b)
@@ -1182,6 +1190,10 @@ def assemble_split_train_examples(
                     r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
                 else:
                     r1_value = (r1_reward - mean_reward) / std if std > 0 else 0.0
+                    r1_ungated_value = r1_value
+                    if r1_reward_mode == "judge_soft_task_gap":
+                        _score, _js, reliability = _soft_judge_signal(debate)
+                        r1_value *= reliability
                     r1_advantages = [r1_value / len(t1.completion_tokens)] * len(t1.completion_tokens)
                 if r1_reward_mode == "judge_rejection_task":
                     r1_metadata = {
@@ -1235,16 +1247,20 @@ def assemble_split_train_examples(
                     elif r1_reward_mode == "judge_soft_task_gap":
                         task_a = float(task_reward_fn(debate.trajectory_a, debate))
                         task_b = float(task_reward_fn(debate.trajectory_b, debate))
-                        score = _soft_score(debate)
+                        score, js, reliability = _soft_judge_signal(debate)
                         r1_metadata.update({
                             "reason": "split_layout_judge_soft_task_gap_projection",
                             "r1_reward_mode": "judge_soft_task_gap",
                             "judge_soft_score": score,
+                            "judge_referent_js_divergence_normalized": js,
+                            "judge_coherence_reliability": reliability,
                             "r1_task_reward": float(task_reward_fn(traj, debate)),
                             "r1_task_reward_gap": abs(task_a - task_b),
                             "r1_task_reward_pair_sum": task_a + task_b,
-                            "r1_soft_reward": r1_reward,
+                            "r1_soft_reward_pre_reliability": r1_reward,
                             "r1_soft_reward_pair_sum_residual": 0.0,
+                            "r1_ungated_zscore": r1_ungated_value,
+                            "r1_reliability_gated_zscore": r1_value,
                         })
                 _append_turn(
                     adapter_name=round_adapter_names[0],
@@ -1259,8 +1275,8 @@ def assemble_split_train_examples(
                 judge_audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
                 coherent = judge_audit.get("order_invariant") is True
                 if r23_reward_mode == "soft_judge":
-                    score = _soft_score(debate)
-                    signed = score if traj.agent == "A" else -score
+                    score, js, reliability = _soft_judge_signal(debate)
+                    signed = reliability * score if traj.agent == "A" else -reliability * score
                 else:
                     signed = (
                         winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
@@ -1323,7 +1339,9 @@ def assemble_split_train_examples(
                                 and judge_audit.get("bidirectional_judge") is True
                             ),
                             "r23_reward_mode": r23_reward_mode,
-                            "judge_soft_score": _soft_score(debate) if r23_reward_mode == "soft_judge" else None,
+                            "judge_soft_score": score if r23_reward_mode == "soft_judge" else None,
+                            "judge_referent_js_divergence_normalized": js if r23_reward_mode == "soft_judge" else None,
+                            "judge_coherence_reliability": reliability if r23_reward_mode == "soft_judge" else None,
                         },
                     )
                     grouped.setdefault(round_adapter_names[1], []).append(
@@ -1358,7 +1376,9 @@ def assemble_split_train_examples(
                             and judge_audit.get("bidirectional_judge") is True
                         ),
                         "r23_reward_mode": r23_reward_mode,
-                        "judge_soft_score": _soft_score(debate) if r23_reward_mode == "soft_judge" else None,
+                        "judge_soft_score": score if r23_reward_mode == "soft_judge" else None,
+                        "judge_referent_js_divergence_normalized": js if r23_reward_mode == "soft_judge" else None,
+                        "judge_coherence_reliability": reliability if r23_reward_mode == "soft_judge" else None,
                     },
                 )
             if num_rounds >= 3:
@@ -1366,8 +1386,8 @@ def assemble_split_train_examples(
                 judge_audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
                 coherent = judge_audit.get("order_invariant") is True
                 if r23_reward_mode == "soft_judge":
-                    score = _soft_score(debate)
-                    signed = score if traj.agent == "A" else -score
+                    score, js, reliability = _soft_judge_signal(debate)
+                    signed = reliability * score if traj.agent == "A" else -reliability * score
                 else:
                     signed = (
                         winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
@@ -1406,7 +1426,9 @@ def assemble_split_train_examples(
                             and judge_audit.get("bidirectional_judge") is True
                         ),
                         "r23_reward_mode": r23_reward_mode,
-                        "judge_soft_score": _soft_score(debate) if r23_reward_mode == "soft_judge" else None,
+                        "judge_soft_score": score if r23_reward_mode == "soft_judge" else None,
+                        "judge_referent_js_divergence_normalized": js if r23_reward_mode == "soft_judge" else None,
+                        "judge_coherence_reliability": reliability if r23_reward_mode == "soft_judge" else None,
                     },
                 )
     return grouped
@@ -1420,19 +1442,17 @@ def assemble_judge_coherence_grpo_examples(
 ) -> tuple[list[TrainExample], dict[str, float | int | str]]:
     """Build one global judge-GRPO group from both transcript orderings.
 
-    ``label_js`` keeps objective OpenBookQA label supervision and replaces the
-    old binary order-coherence term with a continuous, referent-aligned
-    Jensen-Shannon penalty.  JS is normalized by ln(2), so no scale coefficient
-    is needed: ``raw_reward = label_reward - JS/ln(2)``.
+    Jensen-Shannon coherence is intentionally absent here. It is optimized as a
+    direct differentiable loss by ``supervised_label_ce_js`` rather than being
+    folded into a sampled-action reward.
     """
-    if reward_mode not in ("coherence", "label", "label_js"):
+    if reward_mode not in ("coherence", "label"):
         raise ValueError(f"unsupported judge GRPO reward mode: {reward_mode!r}")
     turns: list[
-        tuple[DebateResult, dict[str, Any], float, str | None, str, float, float]
+        tuple[DebateResult, dict[str, Any], float, str | None, str, float]
     ] = []
     coherent_debates = 0
     label_correct_judgments = 0
-    js_values: list[float] = []
     for debate in debates:
         audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
         if audit.get("bidirectional_judge") is not True:
@@ -1447,22 +1467,12 @@ def assemble_judge_coherence_grpo_examples(
             for turn in training_turns:
                 if not isinstance(turn, dict):
                     raise ValueError("judge training turn must be a mapping")
-                turns.append((debate, turn, pair_reward, None, "INVALID", pair_reward, 0.0))
+                turns.append((debate, turn, pair_reward, None, "INVALID", pair_reward))
             continue
 
         reward_a = float(debate.trajectory_a.metrics["task_reward"])
         reward_b = float(debate.trajectory_b.metrics["task_reward"])
         gold_agent = "A" if reward_a > reward_b else "B" if reward_b > reward_a else None
-        js_penalty = 0.0
-        if reward_mode == "label_js":
-            soft_record = audit.get("soft_score")
-            if audit.get("soft_judge") is not True or not isinstance(soft_record, dict):
-                raise ValueError("label_js judge GRPO requires a soft-score audit")
-            js_penalty = float(soft_record.get("referent_js_divergence_normalized"))
-            if not math.isfinite(js_penalty) or not 0.0 <= js_penalty <= 1.0 + 1e-12:
-                raise ValueError(f"invalid normalized referent JS penalty: {js_penalty!r}")
-            js_penalty = min(1.0, js_penalty)
-            js_values.append(js_penalty)
         for turn in training_turns:
             if not isinstance(turn, dict):
                 raise ValueError("judge training turn must be a mapping")
@@ -1473,10 +1483,8 @@ def assemble_judge_coherence_grpo_examples(
                 0.0 if gold_agent is None else 1.0 if verdict == gold_agent else -1.0
             )
             label_correct_judgments += int(label_reward > 0.0)
-            reward = label_reward - js_penalty
-            turns.append(
-                (debate, turn, reward, gold_agent, str(verdict), label_reward, js_penalty)
-            )
+            reward = label_reward
+            turns.append((debate, turn, reward, gold_agent, str(verdict), label_reward))
 
     rewards = [reward for _debate, _turn, reward, *_rest in turns]
     if not rewards:
@@ -1499,7 +1507,6 @@ def assemble_judge_coherence_grpo_examples(
         gold_agent,
         referent_verdict,
         label_reward,
-        js_penalty,
     ) in enumerate(turns):
         prompt_tokens = list(turn.get("prompt_tokens", []))
         completion_tokens = list(turn.get("completion_tokens", []))
@@ -1511,13 +1518,6 @@ def assemble_judge_coherence_grpo_examples(
         allowed_token_ids = tuple(
             int(token_id) for token_id in turn.get("behavior_policy_allowed_token_ids", ())
         )
-        if reward_mode == "label_js":
-            if len(allowed_token_ids) != 2 or len(set(allowed_token_ids)) != 2:
-                raise ValueError(
-                    "label_js judge GRPO requires exactly two behavior-policy label tokens"
-                )
-            if any(token_id not in allowed_token_ids for token_id in completion_tokens):
-                raise ValueError("judge completion escaped its two-token behavior policy")
         zscore = (reward - reward_mean) / reward_std if reward_std > 0.0 else 0.0
         datum = TrainingDatum(
             prompt_tokens=prompt_tokens,
@@ -1539,8 +1539,6 @@ def assemble_judge_coherence_grpo_examples(
                 "judge_label_referent_verdict": referent_verdict,
                 "judge_label_correct": label_reward > 0.0,
                 "judge_label_reward": label_reward,
-                "judge_referent_js_penalty": js_penalty,
-                "judge_label_js_reward": reward if reward_mode == "label_js" else None,
                 "judge_coherence_reward": reward if reward_mode == "coherence" else None,
                 "behavior_policy_allowed_token_ids": list(allowed_token_ids),
                 "judge_grpo_group_index": 0,
@@ -1565,16 +1563,123 @@ def assemble_judge_coherence_grpo_examples(
                 "judge_grpo_label_total_judgments": len(turns),
                 "judge_grpo_label_accuracy": label_correct_judgments / len(turns),
             }
-            if reward_mode in ("label", "label_js")
+            if reward_mode == "label"
             else {}
         ),
+    }
+
+
+def assemble_judge_supervised_label_examples(
+    debates: list[DebateResult],
+    *,
+    adapter_name: str = "judge",
+) -> tuple[list[TrainExample], dict[str, float | int | str]]:
+    """Build paired examples for direct label CE plus differentiable JS coherence.
+
+    The sampled judge action remains useful rollout telemetry, but it is not the
+    training target.  Each transcript ordering is retargeted to the canonical
+    token for the correct underlying trajectory.  The reverse-order target is
+    swapped so both examples supervise the same referent.
+    """
+    examples: list[TrainExample] = []
+    sampled_correct = 0
+    coherent_debates = 0
+    js_values: list[float] = []
+    target_a_count = 0
+    target_b_count = 0
+    for pair_index, debate in enumerate(debates):
+        audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
+        if audit.get("bidirectional_judge") is not True:
+            raise ValueError("supervised judge labels require bidirectional judge audit data")
+        turns = audit.get("_training_judge_turns")
+        if not isinstance(turns, list) or len(turns) != 2:
+            raise ValueError("supervised judge labels require exactly two ordered judgment turns")
+        contract = audit.get("judge_label_token_contract")
+        if not isinstance(contract, dict):
+            raise ValueError("supervised judge labels require a frozen judge label-token contract")
+        a_ids = tuple(int(value) for value in contract.get("a_token_ids", ()))
+        b_ids = tuple(int(value) for value in contract.get("b_token_ids", ()))
+        if len(a_ids) != 1 or len(b_ids) != 1 or a_ids[0] == b_ids[0]:
+            raise ValueError("supervised judge labels require one distinct canonical token per label")
+        allowed_token_ids = (a_ids[0], b_ids[0])
+
+        reward_a = float(debate.trajectory_a.metrics["task_reward"])
+        reward_b = float(debate.trajectory_b.metrics["task_reward"])
+        if reward_a == reward_b:
+            raise ValueError("supervised judge labels require a unique gold trajectory")
+        gold_referent = "A" if reward_a > reward_b else "B"
+        coherent_debates += int(audit.get("order_invariant") is True)
+        soft_record = audit.get("soft_score")
+        if isinstance(soft_record, dict):
+            js_value = float(soft_record.get("referent_js_divergence_normalized"))
+            if not math.isfinite(js_value) or not 0.0 <= js_value <= 1.0 + 1e-12:
+                raise ValueError(f"invalid normalized referent JS diagnostic: {js_value!r}")
+            js_values.append(min(1.0, js_value))
+
+        for judgment_index, turn in enumerate(turns):
+            if not isinstance(turn, dict):
+                raise ValueError("judge training turn must be a mapping")
+            order = str(turn.get("order"))
+            if order not in ("forward", "reverse"):
+                raise ValueError(f"unsupported judge order: {order!r}")
+            visual_target = gold_referent
+            if order == "reverse":
+                visual_target = "B" if gold_referent == "A" else "A"
+            target_token = a_ids[0] if visual_target == "A" else b_ids[0]
+            target_a_count += int(visual_target == "A")
+            target_b_count += int(visual_target == "B")
+            sampled_correct += int(turn.get("verdict") == visual_target)
+            prompt_tokens = [int(value) for value in turn.get("prompt_tokens", ())]
+            if not prompt_tokens:
+                raise ValueError("supervised judge prompt tokens empty")
+            turn_allowed = tuple(
+                int(value) for value in turn.get("behavior_policy_allowed_token_ids", ())
+            )
+            if turn_allowed != allowed_token_ids:
+                raise ValueError(
+                    "sampled judge behavior policy differs from the canonical supervised label set"
+                )
+            datum = TrainingDatum(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=[target_token],
+                completion_logprobs=[0.0],
+                completion_logprob_mask=[0],
+                completion_advantages=[0.0],
+                metadata={
+                    "reason": "judge_bidirectional_supervised_label_ce_js",
+                    "training_objective": "supervised_label_ce_js",
+                    "question": debate.question[:100],
+                    "judge_coherence_pair_id": f"{pair_index}:{debate.question[:100]}",
+                    "judge_coherence_pair_member": order,
+                    "judge_order": order,
+                    "judge_label_gold_agent": gold_referent,
+                    "judge_label_visual_target": visual_target,
+                    "judge_label_target_token_id": target_token,
+                    "judge_sampled_verdict": turn.get("verdict"),
+                    "judge_sampled_label_correct": turn.get("verdict") == visual_target,
+                    "behavior_policy_allowed_token_ids": list(allowed_token_ids),
+                    "judgment_index": judgment_index,
+                },
+            )
+            examples.append(training_datum_to_train_example(datum=datum, adapter_name=adapter_name))
+
+    count = len(examples)
+    return examples, {
+        "judge_training_objective": "supervised_label_ce_js",
+        "judge_training_loss_formula": "label_ce + lambda_js * JS(p_forward, p_reverse_referent_aligned)/ln(2)",
+        "judge_supervised_group_size": count,
+        "judge_supervised_sampled_label_correct": sampled_correct,
+        "judge_supervised_sampled_label_accuracy": sampled_correct / count if count else 0.0,
+        "judge_supervised_coherent_debates": coherent_debates,
+        "judge_supervised_incoherent_debates": len(debates) - coherent_debates,
+        "judge_supervised_target_a_count": target_a_count,
+        "judge_supervised_target_b_count": target_b_count,
         **(
             {
-                "judge_grpo_referent_js_mean": sum(js_values) / len(js_values),
-                "judge_grpo_referent_js_max": max(js_values),
-                "judge_grpo_reward_formula": "label_reward - referent_js_divergence/ln(2)",
+                "judge_supervised_referent_js_mean": sum(js_values) / len(js_values),
+                "judge_supervised_referent_js_max": max(js_values),
             }
-            if reward_mode == "label_js" and js_values
+            if js_values
             else {}
         ),
     }

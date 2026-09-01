@@ -143,14 +143,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--train-judge",
         "--train-judge-coherence-grpo",
+        dest="train_judge",
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Train the judge adapter from both orderings. Each judgment receives +1 when "
-            "the pair is referent-coherent and -1 otherwise; advantages are normalized "
-            "once across the complete judgment batch."
+            "Train the judge adapter from both transcript orderings. The legacy "
+            "--train-judge-coherence-grpo spelling is retained as a CLI alias."
         ),
+    )
+    parser.add_argument(
+        "--judge-training-objective",
+        choices=["grpo", "supervised_label_ce_js"],
+        default="grpo",
+        help=(
+            "Optimization objective for the trainable judge. 'grpo' preserves sampled-action "
+            "PPO/GRPO; 'supervised_label_ce_js' applies direct two-class label CE plus "
+            "differentiable referent-aligned JS coherence. Debate adapters remain GRPO."
+        ),
+    )
+    parser.add_argument(
+        "--judge-coherence-js-weight",
+        type=float,
+        default=1.0,
+        help="Coefficient lambda_js in label_ce + lambda_js * JS/ln(2).",
     )
     parser.add_argument(
         "--judge-grpo-reward-mode",
@@ -159,8 +176,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Judge GRPO raw reward source: 'coherence' scores referent agreement of the "
             "two orderings; 'label' scores each sampled verdict against the ground-truth "
-            "trajectory reward (+1 gold referent, -1 otherwise, 0 on reward ties); "
-            "'label_js' subtracts referent-aligned JS/ln(2) from that label reward."
+            "trajectory reward (+1 gold referent, -1 otherwise, 0 on reward ties). "
+            "JS coherence is a separate direct loss, never a sampled-action reward. "
+            "The legacy 'label_js' spelling atomically migrates an enabled judge to "
+            "supervised_label_ce_js."
         ),
     )
     parser.add_argument("--debate-round-adapter-names", nargs="*", default=["solution", "debate", "debate"])
@@ -298,7 +317,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--wandb-table-samples-per-shard", type=int, default=32)
     parser.add_argument("--reference-kl-every", type=int, default=10, help="0 disables sampled KL to initialization.")
     parser.add_argument("--resume", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.judge_grpo_reward_mode == "label_js":
+        args.judge_grpo_reward_mode = "coherence"
+        if args.train_judge:
+            args.judge_training_objective = "supervised_label_ce_js"
+    return args
 
 
 def main() -> int:
@@ -397,7 +421,9 @@ def main() -> int:
                 debate_judge_constrain_single_token=args.debate_judge_constrain_single_token,
                 debate_judge_score_mode=args.debate_judge_score_mode,
                 judge_label_token_contract=args.judge_label_token_contract,
-                train_judge_coherence_grpo=args.train_judge_coherence_grpo,
+                train_judge=args.train_judge,
+                judge_training_objective=args.judge_training_objective,
+                judge_coherence_js_weight=args.judge_coherence_js_weight,
                 judge_grpo_reward_mode=args.judge_grpo_reward_mode,
                 debate_round_adapter_names=tuple(args.debate_round_adapter_names),
                 debate_prompt_format=args.debate_prompt_format,
