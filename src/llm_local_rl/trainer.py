@@ -36,9 +36,11 @@ TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD = "selective_lm_head"
 TRAIN_LOGPROB_BACKENDS = (TRAIN_LOGPROB_BACKEND_FULL_LOGITS, TRAIN_LOGPROB_BACKEND_SELECTIVE_LM_HEAD)
 TRAIN_OBJECTIVE_PPO = "ppo"
 TRAIN_OBJECTIVE_SUPERVISED_LABEL_CE_JS = "supervised_label_ce_js"
+TRAIN_OBJECTIVE_UNSUPERVISED_JS = "unsupervised_js"
 TRAIN_OBJECTIVES = (
     TRAIN_OBJECTIVE_PPO,
     TRAIN_OBJECTIVE_SUPERVISED_LABEL_CE_JS,
+    TRAIN_OBJECTIVE_UNSUPERVISED_JS,
 )
 
 
@@ -127,27 +129,30 @@ def _validate_example_lengths(example: TrainExample) -> None:
     ):
         raise ValueError("Every nonzero-advantage token must have a behavior-policy logprob.")
     allowed_token_ids = _example_allowed_token_ids(example)
-    if example.metadata.get("training_objective") == TRAIN_OBJECTIVE_SUPERVISED_LABEL_CE_JS:
+    if example.metadata.get("training_objective") in (
+        TRAIN_OBJECTIVE_SUPERVISED_LABEL_CE_JS,
+        TRAIN_OBJECTIVE_UNSUPERVISED_JS,
+    ):
         if sum(int(value) for value in example.loss_mask) != 1:
-            raise ValueError("supervised_label_ce_js requires exactly one labeled loss position")
+            raise ValueError("direct JS objectives require exactly one probe position")
         if any(example.behavior_logprob_mask):
-            raise ValueError("supervised_label_ce_js must not claim sampled behavior logprobs")
-        labeled_targets = [
+            raise ValueError("direct JS objectives must not claim sampled behavior logprobs")
+        probe_targets = [
             int(target_id)
             for target_id, has_loss in zip(example.target_ids, example.loss_mask, strict=True)
             if has_loss
         ]
-        if len(allowed_token_ids) != 2 or labeled_targets[0] not in allowed_token_ids:
+        if len(allowed_token_ids) != 2 or probe_targets[0] not in allowed_token_ids:
             raise ValueError(
-                "supervised_label_ce_js target must belong to an explicit two-token label contract"
+                "direct JS probe target must belong to an explicit two-token contract"
             )
         pair_id = example.metadata.get("judge_coherence_pair_id")
         pair_member = example.metadata.get("judge_coherence_pair_member")
         if not isinstance(pair_id, str) or not pair_id:
-            raise ValueError("supervised_label_ce_js requires a non-empty coherence pair id")
+            raise ValueError("direct JS objectives require a non-empty coherence pair id")
         if pair_member not in ("forward", "reverse"):
             raise ValueError(
-                "supervised_label_ce_js pair member must be forward or reverse"
+                "direct JS pair member must be forward or reverse"
             )
     if allowed_token_ids:
         for target_id, has_behavior_logprob in zip(
@@ -1040,10 +1045,14 @@ class MultiAdapterTrainer:
         if objective not in TRAIN_OBJECTIVES:
             raise ValueError(f"Unsupported training objective={objective!r}; expected {TRAIN_OBJECTIVES!r}")
         supervised_label_ce_js = objective == TRAIN_OBJECTIVE_SUPERVISED_LABEL_CE_JS
+        direct_js_objective = objective in (
+            TRAIN_OBJECTIVE_SUPERVISED_LABEL_CE_JS,
+            TRAIN_OBJECTIVE_UNSUPERVISED_JS,
+        )
         if not math.isfinite(judge_coherence_js_weight) or judge_coherence_js_weight < 0.0:
             raise ValueError("judge_coherence_js_weight must be finite and non-negative")
-        if supervised_label_ce_js and measure_reference_kl:
-            raise ValueError("supervised judge objectives do not use sampled-reference KL measurement")
+        if direct_js_objective and measure_reference_kl:
+            raise ValueError("direct JS judge objectives do not use sampled-reference KL measurement")
         if len(batch) == 0:
             return {
                 "loss": 0.0,
@@ -1078,7 +1087,7 @@ class MultiAdapterTrainer:
                 f"dropped {num_dropped_overlength} of {len(batch)} examples "
                 f"(train_max_tokens={self.config.train_max_tokens})."
             )
-        if supervised_label_ce_js and len(trainable_batch) != len(batch):
+        if direct_js_objective and len(trainable_batch) != len(batch):
             raise ValueError(
                 "Dropping an overlength row would break a direct-JS forward/reverse pair"
             )
@@ -1097,9 +1106,9 @@ class MultiAdapterTrainer:
         minibatch_size = (
             self.config.train_minibatch_size if self.config.train_minibatch_size > 0 else len(trainable_batch)
         )
-        if supervised_label_ce_js:
+        if direct_js_objective:
             if minibatch_size % 2 != 0:
-                raise ValueError("supervised_label_ce_js requires an even train_minibatch_size")
+                raise ValueError("direct JS objectives require an even train_minibatch_size")
             ordered_batch = _order_paired_js_batch_for_minibatching(
                 batch=trainable_batch,
                 max_tokens=self.config.train_max_tokens,
@@ -1115,7 +1124,7 @@ class MultiAdapterTrainer:
                 length_bucket_batches=self.config.train_length_bucket_batches and minibatch_size < len(trainable_batch),
             )
         normalization_sample_count = len(ordered_batch)
-        normalization_pair_count = len(ordered_batch) // 2 if supervised_label_ce_js else 0
+        normalization_pair_count = len(ordered_batch) // 2 if direct_js_objective else 0
         total_loss_value = 0.0
         total_trained_tokens = 0
         approx_kl_numerator = 0.0
@@ -1171,11 +1180,11 @@ class MultiAdapterTrainer:
             total_padded_input_tokens += int(tensors["input_ids"].numel())
             trained_positions = (
                 tensors["loss_mask"]
-                if supervised_label_ce_js
+                if direct_js_objective
                 else tensors["loss_mask"] & (tensors["advantages"] != 0.0)
             )
             invalid_trained_positions = trained_positions & ~tensors["behavior_logprob_mask"]
-            if not supervised_label_ce_js and bool(invalid_trained_positions.any().detach().cpu().item()):
+            if not direct_js_objective and bool(invalid_trained_positions.any().detach().cpu().item()):
                 self.optimizer.zero_grad(set_to_none=True)
                 raise ValueError(
                     "A nonzero-advantage token is missing a behavior-policy logprob; "
@@ -1209,7 +1218,7 @@ class MultiAdapterTrainer:
                         batch=minibatch,
                         behavior_positions=(
                             trained_positions
-                            if supervised_label_ce_js
+                            if direct_js_objective
                             else tensors["behavior_logprob_mask"]
                         ),
                     ),
@@ -1270,7 +1279,7 @@ class MultiAdapterTrainer:
                 # Config validation makes the fail-closed parity gate mandatory, so
                 # selective scoring always covers every sampled behavior-policy token.
                 selected_positions = (
-                    trained_positions if supervised_label_ce_js else tensors["behavior_logprob_mask"]
+                    trained_positions if direct_js_objective else tensors["behavior_logprob_mask"]
                 )
                 selected_position_count = int(selected_positions.sum().detach().cpu().item())
                 total_lm_head_positions += selected_position_count
@@ -1319,7 +1328,7 @@ class MultiAdapterTrainer:
             else:
                 raise ValueError(f"Unsupported train_logprob_backend={self.config.train_logprob_backend!r}.")
 
-            if self.config.on_policy_logprob_check and not supervised_label_ce_js:
+            if self.config.on_policy_logprob_check and not direct_js_objective:
                 check_result = check_on_policy_logprobs(
                     adapter_name=adapter_name,
                     examples=minibatch,
@@ -1418,7 +1427,7 @@ class MultiAdapterTrainer:
             nonfinite_logprobs = int((~torch.isfinite(selected_logprobs)).sum().detach().cpu().item())
             nonfinite_old_logprobs = (
                 0
-                if supervised_label_ce_js
+                if direct_js_objective
                 else int((~torch.isfinite(old_logprobs)).sum().detach().cpu().item())
             )
             if nonfinite_logprobs or nonfinite_old_logprobs:
@@ -1427,30 +1436,35 @@ class MultiAdapterTrainer:
                     "Non-finite policy logprobs before PPO backward: "
                     f"current={nonfinite_logprobs}, old={nonfinite_old_logprobs}."
                 )
-            if supervised_label_ce_js:
-                with torch.no_grad():
-                    supervised_correct_label_logprobs.extend(
-                        selected_logprobs.detach().float().cpu().tolist()
-                    )
-                    entropy_sum += selected_entropy_sum
-                loss = torch.sum(-selected_logprobs) / normalization_sample_count
+            if direct_js_objective:
                 if supervised_label_ce_js:
-                    if trained_tokens != len(minibatch):
-                        raise ValueError(
-                            "supervised_label_ce_js requires exactly one trained token per row"
-                        )
-                    pair_js = _normalized_bernoulli_js_from_paired_correct_logprobs(
-                        selected_logprobs
-                    )
                     with torch.no_grad():
-                        judge_coherence_js_values.extend(
-                            pair_js.detach().float().cpu().tolist()
+                        supervised_correct_label_logprobs.extend(
+                            selected_logprobs.detach().float().cpu().tolist()
                         )
-                    loss = loss + (
-                        judge_coherence_js_weight
-                        * torch.sum(pair_js)
-                        / normalization_pair_count
+                with torch.no_grad():
+                    entropy_sum += selected_entropy_sum
+                if trained_tokens != len(minibatch):
+                    raise ValueError(
+                        "direct JS objectives require exactly one trained token per row"
                     )
+                pair_js = _normalized_bernoulli_js_from_paired_correct_logprobs(
+                    selected_logprobs
+                )
+                with torch.no_grad():
+                    judge_coherence_js_values.extend(
+                        pair_js.detach().float().cpu().tolist()
+                    )
+                label_ce_loss = (
+                    torch.sum(-selected_logprobs) / normalization_sample_count
+                    if supervised_label_ce_js
+                    else torch.zeros((), device=selected_logprobs.device)
+                )
+                loss = label_ce_loss + (
+                    judge_coherence_js_weight
+                    * torch.sum(pair_js)
+                    / normalization_pair_count
+                )
             else:
                 ratio = torch.exp(selected_logprobs - old_logprobs)
                 clipped_ratio = torch.clamp(
@@ -1527,7 +1541,7 @@ class MultiAdapterTrainer:
                 )
             total_trained_tokens += trained_tokens
             total_loss_value += float(loss.detach().cpu().item())
-            if not supervised_label_ce_js:
+            if not direct_js_objective:
                 approx_kl_numerator += float(
                     torch.sum(old_logprobs - selected_logprobs)
                     .detach()

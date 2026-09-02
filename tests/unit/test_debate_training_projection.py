@@ -11,6 +11,7 @@ from llm_local_rl.debate_parity import (
     audit_base_text_debate_format,
     assemble_judge_coherence_grpo_examples,
     assemble_judge_supervised_label_examples,
+    assemble_judge_unsupervised_js_examples,
     assemble_split_train_examples,
     assemble_training_data_by_mode,
     assemble_training_data_r1_r23,
@@ -142,6 +143,52 @@ def test_supervised_judge_targets_gold_referent_in_both_orders() -> None:
     ]
     assert metrics["judge_supervised_sampled_label_accuracy"] == 0.0
     assert metrics["judge_supervised_referent_js_mean"] == pytest.approx(0.2)
+
+
+def test_unsupervised_js_uses_referent_probes_without_task_labels() -> None:
+    turns = [
+        {
+            "order": "forward",
+            "verdict": "B",
+            "prompt_tokens": [101, 102],
+            "completion_tokens": [378],
+            "completion_logprobs": [-0.8],
+            "behavior_policy_allowed_token_ids": [334, 378],
+        },
+        {
+            "order": "reverse",
+            "verdict": "A",
+            "prompt_tokens": [201, 202],
+            "completion_tokens": [334],
+            "completion_logprobs": [-0.7],
+            "behavior_policy_allowed_token_ids": [334, 378],
+        },
+    ]
+    # A reward tie proves this path neither requires nor derives a gold winner.
+    debate = _make_debate(
+        reward_a=0.5,
+        reward_b=0.5,
+        judge_raw_response={
+            "bidirectional_judge": True,
+            "order_invariant": False,
+            "judge_label_token_contract": {
+                "a_token_ids": [334],
+                "b_token_ids": [378],
+            },
+            "soft_score": {"referent_js_divergence_normalized": 0.2},
+            "_training_judge_turns": turns,
+        },
+    )
+
+    examples, metrics = assemble_judge_unsupervised_js_examples([debate])
+
+    assert [row.target_ids[-1] for row in examples] == [334, 378]
+    assert all(row.metadata["judge_js_probe_referent"] == "original_agent_a" for row in examples)
+    assert all("judge_label_gold_agent" not in row.metadata for row in examples)
+    assert all(row.behavior_logprob_mask[-1] == 0 for row in examples)
+    assert metrics["judge_training_objective"] == "unsupervised_js"
+    assert metrics["judge_unsupervised_group_size"] == 2
+    assert metrics["judge_unsupervised_referent_js_mean"] == pytest.approx(0.2)
 
 
 def _make_debate(

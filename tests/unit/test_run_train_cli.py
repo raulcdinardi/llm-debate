@@ -229,6 +229,51 @@ def test_openbookqa_supervised_label_ce_js_contract_is_trainable_and_granular() 
     assert migrated.judge_grpo_reward_mode == "coherence"
 
 
+def test_unlabeled_js_direct_objective_uses_same_strict_pair_contract() -> None:
+    args = parse_args(
+        [
+            "--model-path",
+            "/tmp/model",
+            "--output-dir",
+            "/tmp/out",
+            "--train-judge",
+            "--judge-training-objective",
+            "unsupervised_js",
+            "--judge-coherence-js-weight",
+            "1.0",
+        ]
+    )
+    assert args.judge_training_objective == "unsupervised_js"
+
+    config = TrainRunConfig(
+        model_path="/model",
+        output_dir="/out",
+        rollout=RolloutConfig(mode="debate", env_name="constrained_writing", temperature=1.0),
+        adapter_layout="split",
+        debate_rounds=3,
+        debate_round_adapter_names=("solution", "debate", "debate"),
+        debate_r1_reward="none",
+        debate_r23_reward="soft_judge",
+        debate_r23_mode="symmetric",
+        debate_judge_adapter="judge",
+        debate_judge_harness=CONSTITUTION_SINGLE_TOKEN_V1,
+        debate_judge_temperature=1.0,
+        debate_judge_max_tokens=1,
+        debate_judge_bidirectional=True,
+        debate_judge_constrain_single_token=True,
+        debate_judge_score_mode="order_sym_soft_logit",
+        judge_label_token_contract="lfm25_openbookqa_spaced_ab_v1",
+        train_judge=True,
+        judge_training_objective="unsupervised_js",
+        judge_coherence_js_weight=1.0,
+        train_adapter_names=("debate", "judge"),
+    )
+    assert config.judge_training_objective == "unsupervised_js"
+
+    with pytest.raises(ValueError, match="weight > 0"):
+        replace(config, judge_coherence_js_weight=0.0)
+
+
 def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:
     docs = (
         Path(__file__).parents[2] / "docs" / "debate_judge_grpo.md"

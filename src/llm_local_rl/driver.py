@@ -22,6 +22,7 @@ from llm_local_rl.debate_parity import (
     audit_base_text_debate_format,
     assemble_judge_coherence_grpo_examples,
     assemble_judge_supervised_label_examples,
+    assemble_judge_unsupervised_js_examples,
     assemble_split_train_examples,
     assemble_training_data_by_mode,
     summarize_judge_rejection_r1_projection,
@@ -1081,6 +1082,10 @@ class TrainingDriver:
                 judge_examples, judge_grpo_record = assemble_judge_supervised_label_examples(
                     debates
                 )
+            elif self.config.judge_training_objective == "unsupervised_js":
+                judge_examples, judge_grpo_record = assemble_judge_unsupervised_js_examples(
+                    debates
+                )
             else:
                 judge_examples, judge_grpo_record = assemble_judge_coherence_grpo_examples(
                     debates, reward_mode=self.config.judge_grpo_reward_mode
@@ -1127,6 +1132,8 @@ class TrainingDriver:
         if judge_grpo_record is not None:
             if self.config.judge_training_objective == "supervised_label_ce_js":
                 projection_record["judge_supervised_label"] = judge_grpo_record
+            elif self.config.judge_training_objective == "unsupervised_js":
+                projection_record["judge_unsupervised_js"] = judge_grpo_record
             else:
                 projection_record["judge_grpo"] = judge_grpo_record
                 projection_record[
@@ -1458,10 +1465,10 @@ class TrainingDriver:
                                 adapter_name=adapter_name,
                                 batch=batch,
                                 objective=(
-                                    "supervised_label_ce_js"
+                                    self.config.judge_training_objective
                                     if adapter_name == "judge"
                                     and self.config.judge_training_objective
-                                    == "supervised_label_ce_js"
+                                    in ("supervised_label_ce_js", "unsupervised_js")
                                     else "ppo"
                                 ),
                                 judge_coherence_js_weight=self.config.judge_coherence_js_weight,
@@ -1469,7 +1476,7 @@ class TrainingDriver:
                                     not (
                                         adapter_name == "judge"
                                         and self.config.judge_training_objective
-                                        == "supervised_label_ce_js"
+                                        in ("supervised_label_ce_js", "unsupervised_js")
                                     )
                                     and
                                     self.config.reference_kl_every > 0

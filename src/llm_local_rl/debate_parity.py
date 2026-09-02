@@ -1700,6 +1700,109 @@ def assemble_judge_supervised_label_examples(
     }
 
 
+def assemble_judge_unsupervised_js_examples(
+    debates: list[DebateResult],
+    *,
+    adapter_name: str = "judge",
+) -> tuple[list[TrainExample], dict[str, float | int | str]]:
+    """Build paired referent probes for differentiable JS-only judge training.
+
+    No task reward or gold winner is consulted.  Forward ``A`` and reverse
+    visual ``B`` both denote the same underlying referent (the original agent
+    A), so their two-class probabilities can be compared directly by JS.
+    The probe token selects a logit; it is not a supervised label or sampled
+    action reward.
+    """
+    examples: list[TrainExample] = []
+    coherent_debates = 0
+    js_values: list[float] = []
+    for pair_index, debate in enumerate(debates):
+        audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
+        if audit.get("bidirectional_judge") is not True:
+            raise ValueError("unsupervised JS requires bidirectional judge audit data")
+        turns = audit.get("_training_judge_turns")
+        if not isinstance(turns, list) or len(turns) != 2:
+            raise ValueError("unsupervised JS requires exactly two ordered judgment turns")
+        contract = audit.get("judge_label_token_contract")
+        if not isinstance(contract, dict):
+            raise ValueError("unsupervised JS requires a frozen judge token contract")
+        a_ids = tuple(int(value) for value in contract.get("a_token_ids", ()))
+        b_ids = tuple(int(value) for value in contract.get("b_token_ids", ()))
+        if len(a_ids) != 1 or len(b_ids) != 1 or a_ids[0] == b_ids[0]:
+            raise ValueError("unsupervised JS requires one distinct canonical token per side")
+        allowed_token_ids = (a_ids[0], b_ids[0])
+
+        coherent_debates += int(audit.get("order_invariant") is True)
+        soft_record = audit.get("soft_score")
+        if isinstance(soft_record, dict):
+            js_value = float(soft_record.get("referent_js_divergence_normalized"))
+            if not math.isfinite(js_value) or not 0.0 <= js_value <= 1.0 + 1e-12:
+                raise ValueError(f"invalid normalized referent JS diagnostic: {js_value!r}")
+            js_values.append(min(1.0, js_value))
+
+        seen_orders: set[str] = set()
+        for judgment_index, turn in enumerate(turns):
+            if not isinstance(turn, dict):
+                raise ValueError("judge training turn must be a mapping")
+            order = str(turn.get("order"))
+            if order not in ("forward", "reverse") or order in seen_orders:
+                raise ValueError("unsupervised JS pair requires one forward and one reverse turn")
+            seen_orders.add(order)
+            # The original agent A is visual A in forward order and visual B
+            # after swapping the transcript.
+            probe_token = a_ids[0] if order == "forward" else b_ids[0]
+            prompt_tokens = [int(value) for value in turn.get("prompt_tokens", ())]
+            if not prompt_tokens:
+                raise ValueError("unsupervised JS judge prompt tokens empty")
+            turn_allowed = tuple(
+                int(value) for value in turn.get("behavior_policy_allowed_token_ids", ())
+            )
+            if turn_allowed != allowed_token_ids:
+                raise ValueError(
+                    "sampled judge behavior policy differs from the canonical JS probe set"
+                )
+            datum = TrainingDatum(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=[probe_token],
+                completion_logprobs=[0.0],
+                completion_logprob_mask=[0],
+                completion_advantages=[0.0],
+                metadata={
+                    "reason": "judge_bidirectional_unsupervised_js",
+                    "training_objective": "unsupervised_js",
+                    "question": debate.question[:100],
+                    "judge_coherence_pair_id": f"{pair_index}:{debate.question[:100]}",
+                    "judge_coherence_pair_member": order,
+                    "judge_order": order,
+                    "judge_js_probe_referent": "original_agent_a",
+                    "judge_js_probe_visual_token_id": probe_token,
+                    "behavior_policy_allowed_token_ids": list(allowed_token_ids),
+                    "judgment_index": judgment_index,
+                },
+            )
+            examples.append(training_datum_to_train_example(datum=datum, adapter_name=adapter_name))
+
+    count = len(examples)
+    return examples, {
+        "judge_training_objective": "unsupervised_js",
+        "judge_training_loss_formula": (
+            "lambda_js * JS(p_forward_referent_a, "
+            "p_reverse_referent_a_aligned)/ln(2)"
+        ),
+        "judge_unsupervised_group_size": count,
+        "judge_unsupervised_coherent_debates": coherent_debates,
+        "judge_unsupervised_incoherent_debates": len(debates) - coherent_debates,
+        **(
+            {
+                "judge_unsupervised_referent_js_mean": sum(js_values) / len(js_values),
+                "judge_unsupervised_referent_js_max": max(js_values),
+            }
+            if js_values
+            else {}
+        ),
+    }
+
+
 def summarize_judge_rejection_r1_projection(
     *,
     r1_examples: list[TrainExample],

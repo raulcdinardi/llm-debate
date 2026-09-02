@@ -155,19 +155,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--judge-training-objective",
-        choices=["grpo", "supervised_label_ce_js"],
+        choices=["grpo", "supervised_label_ce_js", "unsupervised_js"],
         default="grpo",
         help=(
             "Optimization objective for the trainable judge. 'grpo' preserves sampled-action "
             "PPO/GRPO; 'supervised_label_ce_js' applies direct two-class label CE plus "
-            "differentiable referent-aligned JS coherence. Debate adapters remain GRPO."
+            "differentiable referent-aligned JS coherence; 'unsupervised_js' applies only "
+            "the differentiable coherence loss and consumes no task labels. Debate adapters "
+            "remain PPO/GRPO."
         ),
     )
     parser.add_argument(
         "--judge-coherence-js-weight",
         type=float,
         default=1.0,
-        help="Coefficient lambda_js in label_ce + lambda_js * JS/ln(2).",
+        help=(
+            "Coefficient lambda_js on normalized referent-aligned JS. The labeled objective "
+            "adds label CE; unsupervised_js uses only this weighted JS term."
+        ),
     )
     parser.add_argument(
         "--judge-grpo-reward-mode",

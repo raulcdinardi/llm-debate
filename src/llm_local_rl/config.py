@@ -256,39 +256,42 @@ class TrainRunConfig:
             raise ValueError(
                 f"Unknown judge_label_token_contract={self.judge_label_token_contract!r}"
             )
-        direct_js_judge = self.judge_training_objective == "supervised_label_ce_js"
+        direct_js_judge = self.judge_training_objective in (
+            "supervised_label_ce_js",
+            "unsupervised_js",
+        )
         if direct_js_judge:
             if not self.train_judge:
-                raise ValueError("supervised_label_ce_js requires train_judge=True")
+                raise ValueError("direct JS judge objectives require train_judge=True")
             if self.debate_judge_score_mode != "order_sym_soft_logit":
                 raise ValueError(
-                    "supervised_label_ce_js requires debate_judge_score_mode="
+                    "direct JS judge objectives require debate_judge_score_mode="
                     "'order_sym_soft_logit'"
                 )
             if not self.debate_judge_bidirectional:
-                raise ValueError("supervised_label_ce_js requires bidirectional judge sampling")
+                raise ValueError("direct JS judge objectives require bidirectional judge sampling")
             if not self.debate_judge_constrain_single_token:
-                raise ValueError("supervised_label_ce_js requires constrained single-token judging")
+                raise ValueError("direct JS judge objectives require constrained single-token judging")
             if self.judge_label_token_contract != LFM25_OPENBOOKQA_SPACED_AB_V1:
                 raise ValueError(
-                    "supervised_label_ce_js requires the strict two-token OpenBookQA contract"
+                    "direct JS judge objectives require the strict two-token contract"
                 )
             if self.debate_judge_harness != CONSTITUTION_SINGLE_TOKEN_V1:
                 raise ValueError(
-                    "supervised_label_ce_js requires constitution_single_token_v1"
+                    "direct JS judge objectives require constitution_single_token_v1"
                 )
             if self.debate_r23_reward != "soft_judge":
                 raise ValueError(
-                    "supervised_label_ce_js requires reliability-weighted soft_judge rewards"
+                    "direct JS judge objectives require reliability-weighted soft_judge rewards"
                 )
             if self.train_minibatch_size > 0 and self.train_minibatch_size % 2 != 0:
                 raise ValueError(
-                    "supervised_label_ce_js requires train_minibatch_size=0 or an even value"
+                    "direct JS judge objectives require train_minibatch_size=0 or an even value"
                 )
             active_round_adapters = self.debate_round_adapter_names[: self.debate_rounds]
             if "judge" in active_round_adapters:
                 raise ValueError(
-                    "supervised_label_ce_js reserves the judge adapter for direct judge rows; "
+                    "direct JS judge objectives reserve the judge adapter for direct judge rows; "
                     "active debate_round_adapter_names must not contain 'judge'"
                 )
         uses_soft_score = self.debate_judge_score_mode == "order_sym_soft_logit"
@@ -316,7 +319,7 @@ class TrainRunConfig:
                 if not direct_js_judge:
                     raise ValueError(
                         "trainable soft judge requires judge_training_objective="
-                        "'supervised_label_ce_js'"
+                        "'supervised_label_ce_js' or 'unsupervised_js'"
                     )
                 if float(self.debate_judge_temperature) <= 0.0:
                     raise ValueError("trainable soft judge requires stochastic temperature > 0")
@@ -426,10 +429,20 @@ class TrainRunConfig:
         ):
             raise ValueError("judge_coherence_js_weight must be finite and non-negative")
         if self.train_judge:
-            if self.judge_training_objective not in ("grpo", "supervised_label_ce_js"):
+            if self.judge_training_objective not in (
+                "grpo",
+                "supervised_label_ce_js",
+                "unsupervised_js",
+            ):
                 raise ValueError(
-                    "judge_training_objective must be grpo or supervised_label_ce_js"
+                    "judge_training_objective must be grpo, supervised_label_ce_js, "
+                    "or unsupervised_js"
                 )
+            if (
+                self.judge_training_objective == "unsupervised_js"
+                and self.judge_coherence_js_weight <= 0.0
+            ):
+                raise ValueError("unsupervised_js requires judge_coherence_js_weight > 0")
             if (
                 self.judge_training_objective == "grpo"
                 and self.judge_grpo_reward_mode not in ("coherence", "label")
