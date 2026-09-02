@@ -119,6 +119,24 @@ def test_strict_openbookqa_contract_has_only_spaced_a_and_b_and_safe_boundary() 
     )
 
 
+def test_compat_contract_uses_canonical_surface_token_at_prompt_boundary() -> None:
+    tokenizer = _BoundaryTokenizer()
+    contract = resolve_judge_label_token_contract(
+        tokenizer=tokenizer,
+        contract_name=LFM25_AB_WHITESPACE_COMPAT_V1,
+    )
+    assert contract.a_token_ids == (41, 334)
+    assert contract.b_token_ids == (42, 378)
+    assert tokenizer.encode(contract.canonical_a, add_special_tokens=False) == [334]
+    assert tokenizer.encode(contract.canonical_b, add_special_tokens=False) == [378]
+    validate_judge_prompt_label_boundary(
+        tokenizer=tokenizer,
+        prompt_text="Answer by Agent",
+        prompt_token_ids=[700, 701],
+        contract=contract,
+    )
+
+
 def test_strict_openbookqa_boundary_fails_closed_on_agglutination() -> None:
     tokenizer = _BoundaryTokenizer()
     contract = resolve_judge_label_token_contract(
