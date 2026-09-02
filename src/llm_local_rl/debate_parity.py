@@ -1186,6 +1186,21 @@ def assemble_split_train_examples(
         std = math.sqrt(var)
         winner_reward = 0.0 if r23_reward_mode == "none" else float(r23_constant)
         loser_reward = -winner_reward if r23_symmetric else 0.0
+        prompt_grpo_rewards: list[float] = []
+        if r23_reward_mode == "soft_judge_prompt_grpo":
+            for prompt_traj, prompt_debate, _reward in group:
+                prompt_score, _prompt_js, _prompt_reliability = _soft_judge_signal(prompt_debate)
+                prompt_grpo_rewards.append(
+                    prompt_score if prompt_traj.agent == "A" else -prompt_score
+                )
+            prompt_grpo_mean = sum(prompt_grpo_rewards) / len(prompt_grpo_rewards)
+            prompt_grpo_var = sum(
+                (reward - prompt_grpo_mean) ** 2 for reward in prompt_grpo_rewards
+            ) / len(prompt_grpo_rewards)
+            prompt_grpo_std = math.sqrt(prompt_grpo_var)
+        else:
+            prompt_grpo_mean = 0.0
+            prompt_grpo_std = 0.0
 
         for traj, debate, r1_reward in group:
             r1_selected = selected_r1_trajectory_ids is None or id(traj) in selected_r1_trajectory_ids
@@ -1289,9 +1304,16 @@ def assemble_split_train_examples(
                 t2 = traj.transitions[1]
                 judge_audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
                 coherent = judge_audit.get("order_invariant") is True
-                if r23_reward_mode == "soft_judge":
+                if r23_reward_mode in ("soft_judge", "soft_judge_prompt_grpo"):
                     score, js, reliability = _soft_judge_signal(debate)
-                    signed = reliability * score if traj.agent == "A" else -reliability * score
+                    raw_signed = score if traj.agent == "A" else -score
+                    signed = (
+                        (raw_signed - prompt_grpo_mean) / prompt_grpo_std
+                        if r23_reward_mode == "soft_judge_prompt_grpo" and prompt_grpo_std > 0.0
+                        else 0.0
+                        if r23_reward_mode == "soft_judge_prompt_grpo"
+                        else reliability * raw_signed
+                    )
                 else:
                     signed = (
                         winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
@@ -1334,7 +1356,9 @@ def assemble_split_train_examples(
                             "round_nums": [2, 3],
                             "rounds_merged": 2,
                             "r23_reward": signed,
-                            "r23_base_judge_reward": signed,
+                            "r23_base_judge_reward": raw_signed if r23_reward_mode == "soft_judge_prompt_grpo" else signed,
+                            "reward": raw_signed if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                            "group_std_reward": prompt_grpo_std if r23_reward_mode == "soft_judge_prompt_grpo" else None,
                             "r2_format_strict": r2_format["strict_ok"],
                             "r3_format_strict": r3_format["strict_ok"],
                             "r2_format_failures": r2_format["failures"],
@@ -1349,14 +1373,18 @@ def assemble_split_train_examples(
                             "r23_second_adv_value": second_adv_value,
                             "judge_order_invariant": coherent,
                             "r23_incoherent_reward_applied": (
-                                r23_reward_mode != "soft_judge"
+                                r23_reward_mode not in ("soft_judge", "soft_judge_prompt_grpo")
                                 and not coherent
                                 and judge_audit.get("bidirectional_judge") is True
                             ),
                             "r23_reward_mode": r23_reward_mode,
-                            "judge_soft_score": score if r23_reward_mode == "soft_judge" else None,
-                            "judge_referent_js_divergence_normalized": js if r23_reward_mode == "soft_judge" else None,
-                            "judge_coherence_reliability": reliability if r23_reward_mode == "soft_judge" else None,
+                            "judge_soft_score": score if r23_reward_mode in ("soft_judge", "soft_judge_prompt_grpo") else None,
+                            "judge_referent_js_divergence_normalized": js if r23_reward_mode in ("soft_judge", "soft_judge_prompt_grpo") else None,
+                            "judge_coherence_reliability": reliability if r23_reward_mode in ("soft_judge", "soft_judge_prompt_grpo") else None,
+                            "r23_prompt_grpo_raw_reward": raw_signed if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                            "r23_prompt_grpo_group_mean": prompt_grpo_mean if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                            "r23_prompt_grpo_group_std": prompt_grpo_std if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                            "r23_reliability_applied": False if r23_reward_mode == "soft_judge_prompt_grpo" else None,
                         },
                     )
                     grouped.setdefault(round_adapter_names[1], []).append(
@@ -1377,7 +1405,9 @@ def assemble_split_train_examples(
                         "reason": "split_layout_per_round_projection",
                         "round_num": 2,
                         "r23_reward": signed,
-                        "r23_base_judge_reward": signed,
+                        "r23_base_judge_reward": raw_signed if r23_reward_mode == "soft_judge_prompt_grpo" else signed,
+                        "reward": raw_signed if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                        "group_std_reward": prompt_grpo_std if r23_reward_mode == "soft_judge_prompt_grpo" else None,
                         "r2_format_strict": r2_format["strict_ok"],
                         "r2_format_failures": r2_format["failures"],
                         "r2_legacy_truncation_triggered": r2_format.get("legacy_truncation_triggered", False),
@@ -1386,23 +1416,34 @@ def assemble_split_train_examples(
                         "r23_advantage_scope": r23_advantage_scope,
                         "judge_order_invariant": coherent,
                         "r23_incoherent_reward_applied": (
-                            r23_reward_mode != "soft_judge"
+                            r23_reward_mode not in ("soft_judge", "soft_judge_prompt_grpo")
                             and not coherent
                             and judge_audit.get("bidirectional_judge") is True
                         ),
                         "r23_reward_mode": r23_reward_mode,
-                        "judge_soft_score": score if r23_reward_mode == "soft_judge" else None,
-                        "judge_referent_js_divergence_normalized": js if r23_reward_mode == "soft_judge" else None,
-                        "judge_coherence_reliability": reliability if r23_reward_mode == "soft_judge" else None,
+                        "judge_soft_score": score if r23_reward_mode in ("soft_judge", "soft_judge_prompt_grpo") else None,
+                        "judge_referent_js_divergence_normalized": js if r23_reward_mode in ("soft_judge", "soft_judge_prompt_grpo") else None,
+                        "judge_coherence_reliability": reliability if r23_reward_mode in ("soft_judge", "soft_judge_prompt_grpo") else None,
+                        "r23_prompt_grpo_raw_reward": raw_signed if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                        "r23_prompt_grpo_group_mean": prompt_grpo_mean if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                        "r23_prompt_grpo_group_std": prompt_grpo_std if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                        "r23_reliability_applied": False if r23_reward_mode == "soft_judge_prompt_grpo" else None,
                     },
                 )
             if num_rounds >= 3:
                 t3 = traj.transitions[2]
                 judge_audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
                 coherent = judge_audit.get("order_invariant") is True
-                if r23_reward_mode == "soft_judge":
+                if r23_reward_mode in ("soft_judge", "soft_judge_prompt_grpo"):
                     score, js, reliability = _soft_judge_signal(debate)
-                    signed = reliability * score if traj.agent == "A" else -reliability * score
+                    raw_signed = score if traj.agent == "A" else -score
+                    signed = (
+                        (raw_signed - prompt_grpo_mean) / prompt_grpo_std
+                        if r23_reward_mode == "soft_judge_prompt_grpo" and prompt_grpo_std > 0.0
+                        else 0.0
+                        if r23_reward_mode == "soft_judge_prompt_grpo"
+                        else reliability * raw_signed
+                    )
                 else:
                     signed = (
                         winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
@@ -1427,7 +1468,9 @@ def assemble_split_train_examples(
                         "reason": "split_layout_per_round_projection",
                         "round_num": 3,
                         "r23_reward": signed,
-                        "r23_base_judge_reward": signed,
+                        "r23_base_judge_reward": raw_signed if r23_reward_mode == "soft_judge_prompt_grpo" else signed,
+                        "reward": raw_signed if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                        "group_std_reward": prompt_grpo_std if r23_reward_mode == "soft_judge_prompt_grpo" else None,
                         "r3_format_strict": r3_format["strict_ok"],
                         "r3_format_failures": r3_format["failures"],
                         "r3_legacy_truncation_triggered": r3_format.get("legacy_truncation_triggered", False),
@@ -1436,14 +1479,18 @@ def assemble_split_train_examples(
                         "r23_advantage_scope": r23_advantage_scope,
                         "judge_order_invariant": coherent,
                         "r23_incoherent_reward_applied": (
-                            r23_reward_mode != "soft_judge"
+                            r23_reward_mode not in ("soft_judge", "soft_judge_prompt_grpo")
                             and not coherent
                             and judge_audit.get("bidirectional_judge") is True
                         ),
                         "r23_reward_mode": r23_reward_mode,
-                        "judge_soft_score": score if r23_reward_mode == "soft_judge" else None,
-                        "judge_referent_js_divergence_normalized": js if r23_reward_mode == "soft_judge" else None,
-                        "judge_coherence_reliability": reliability if r23_reward_mode == "soft_judge" else None,
+                        "judge_soft_score": score if r23_reward_mode in ("soft_judge", "soft_judge_prompt_grpo") else None,
+                        "judge_referent_js_divergence_normalized": js if r23_reward_mode in ("soft_judge", "soft_judge_prompt_grpo") else None,
+                        "judge_coherence_reliability": reliability if r23_reward_mode in ("soft_judge", "soft_judge_prompt_grpo") else None,
+                        "r23_prompt_grpo_raw_reward": raw_signed if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                        "r23_prompt_grpo_group_mean": prompt_grpo_mean if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                        "r23_prompt_grpo_group_std": prompt_grpo_std if r23_reward_mode == "soft_judge_prompt_grpo" else None,
+                        "r23_reliability_applied": False if r23_reward_mode == "soft_judge_prompt_grpo" else None,
                     },
                 )
     return grouped

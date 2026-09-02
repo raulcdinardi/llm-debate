@@ -47,8 +47,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--adapter-layout", default="shared", choices=["shared", "split"])
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--num-samples", type=int, default=16)
-    parser.add_argument("--num-groups", type=int, default=2)
-    parser.add_argument("--group-size", type=int, default=8)
+    parser.add_argument("--num-groups", type=int, default=8)
+    parser.add_argument("--group-size", type=int, default=16)
     parser.add_argument("--rollout-batch-size", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -81,7 +81,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ],
     )
     parser.add_argument(
-        "--debate-r23-reward", default="constant", choices=["constant", "soft_judge", "none"]
+        "--debate-r23-reward",
+        default="constant",
+        choices=["constant", "soft_judge", "soft_judge_prompt_grpo", "none"],
     )
     parser.add_argument("--debate-r23-constant", type=float, default=1.0)
     parser.add_argument("--debate-r1-judge-delta-q", type=float, default=1.0)

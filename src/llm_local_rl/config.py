@@ -37,8 +37,8 @@ class RolloutConfig:
     mode: str = "debate"
     num_samples: int = 16
     num_rollouts_per_instance: int = 1
-    num_groups: int = 2
-    group_size: int = 8
+    num_groups: int = 8
+    group_size: int = 16
     rollout_batch_size: int = 0
     max_tokens: int = 1024
     temperature: float = 1.0
@@ -297,7 +297,7 @@ class TrainRunConfig:
         uses_soft_score = self.debate_judge_score_mode == "order_sym_soft_logit"
         uses_soft_reward = (
             self.debate_r1_reward == "judge_soft_task_gap"
-            or self.debate_r23_reward == "soft_judge"
+            or self.debate_r23_reward in ("soft_judge", "soft_judge_prompt_grpo")
         )
         if uses_soft_score:
             if self.judge_label_token_contract not in (
@@ -348,11 +348,16 @@ class TrainRunConfig:
             raise ValueError("soft judge rewards require debate_judge_score_mode='order_sym_soft_logit'")
         if self.debate_r1_reward == "judge_soft_task_gap" and self.rollout.mode != "debate":
             raise ValueError("judge_soft_task_gap is only valid for debate rollouts")
-        if self.debate_r23_reward == "soft_judge":
+        if self.debate_r23_reward in ("soft_judge", "soft_judge_prompt_grpo"):
             if self.debate_rounds < 2:
                 raise ValueError("soft_judge R2/R3 reward requires at least two debate rounds")
             if self.debate_r23_mode != "symmetric":
                 raise ValueError("soft_judge is intrinsically symmetric/zero-sum")
+        if self.debate_r23_reward == "soft_judge_prompt_grpo":
+            if self.train_judge:
+                raise ValueError("soft_judge_prompt_grpo requires a frozen judge")
+            if self.rollout.group_size < 4:
+                raise ValueError("soft_judge_prompt_grpo requires at least two debates per prompt")
         BehaviorPolicySpec(
             temperature=self.debate_judge_temperature,
             top_p=self.debate_judge_top_p,

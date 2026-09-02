@@ -325,6 +325,51 @@ def test_soft_judge_r23_is_exactly_zero_sum_even_when_hard_labels_disagree() -> 
     )
 
 
+def test_soft_judge_prompt_grpo_normalizes_s_within_prompt_and_ignores_reliability() -> None:
+    debates = [
+        _make_debate(
+            instance_id="same-prompt",
+            judge_raw_response=_soft_judge_audit(0.25, js=0.0),
+        ),
+        _make_debate(
+            instance_id="same-prompt",
+            token_offset=100,
+            judge_raw_response=_soft_judge_audit(0.25, js=0.9),
+        ),
+    ]
+    split = assemble_split_train_examples(
+        debates=debates,
+        num_rounds=3,
+        round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="none",
+        r23_reward_mode="soft_judge_prompt_grpo",
+        r23_constant=99.0,
+        r23_symmetric=True,
+        r23_advantage_scope="merged_r23",
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+    )
+
+    examples = split["debate"]
+    assert [example.metadata["r23_reward"] for example in examples] == [1.0, -1.0, 1.0, -1.0]
+    assert [example.metadata["r23_prompt_grpo_raw_reward"] for example in examples] == [
+        0.25,
+        -0.25,
+        0.25,
+        -0.25,
+    ]
+    assert all(example.metadata["r23_prompt_grpo_group_mean"] == pytest.approx(0.0) for example in examples)
+    assert all(example.metadata["r23_prompt_grpo_group_std"] == pytest.approx(0.25) for example in examples)
+    assert all(example.metadata["r23_reliability_applied"] is False for example in examples)
+    assert [example.metadata["judge_coherence_reliability"] for example in examples] == [
+        1.0,
+        1.0,
+        pytest.approx(0.1),
+        pytest.approx(0.1),
+    ]
+    assert all(example.advantages[-5:] == [0.25, 0.25, 0.0, 0.25, 0.25] for example in examples[::2])
+    assert all(example.advantages[-5:] == [-0.25, -0.25, 0.0, -0.25, -0.25] for example in examples[1::2])
+
+
 def test_base_text_debate_format_audit_is_exact_and_terminal() -> None:
     assert audit_base_text_debate_format(text=_formatted_round(2), round_num=2)["strict_ok"] is True
     assert audit_base_text_debate_format(text=_formatted_round(3), round_num=3)["strict_ok"] is True

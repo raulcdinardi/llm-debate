@@ -62,6 +62,8 @@ def test_cli_defaults_all_sampling_temperatures_to_one() -> None:
     args = parse_args(["--model-path", "/tmp/model", "--output-dir", "/tmp/out"])
 
     assert args.adapter_layout == "shared"
+    assert args.num_groups == 8
+    assert args.group_size == 16
     assert args.temperature == 1.0
     assert args.debate_judge_temperature == 1.0
     assert args.debate_r1_reward == "task"
@@ -70,6 +72,25 @@ def test_cli_defaults_all_sampling_temperatures_to_one() -> None:
     assert args.debate_judge_bidirectional is False
     assert args.debate_judge_constrain_single_token is False
     assert args.judge_grpo_reward_mode == "coherence"
+
+
+def test_rollout_config_defaults_to_apples_to_apples_8x16_debate_geometry() -> None:
+    rollout = RolloutConfig()
+
+    assert rollout.num_groups == 8
+    assert rollout.group_size == 16
+
+
+def test_cli_accepts_prompt_group_soft_judge_grpo() -> None:
+    args = parse_args(
+        [
+            "--model-path", "/tmp/model",
+            "--output-dir", "/tmp/out",
+            "--debate-r23-reward", "soft_judge_prompt_grpo",
+        ]
+    )
+
+    assert args.debate_r23_reward == "soft_judge_prompt_grpo"
 
 
 def test_cli_accepts_frozen_single_token_judge_constraint() -> None:
@@ -127,6 +148,41 @@ def test_soft_judge_config_is_opt_in_and_fail_closed() -> None:
     assert config.to_dict()["judge_label_token_contract_temporary"] is True
     restored = TrainRunConfig.from_dict(config.to_dict())
     assert restored.debate_judge_score_mode == "order_sym_soft_logit"
+
+
+def test_prompt_group_soft_judge_grpo_requires_multiple_debates_and_frozen_judge() -> None:
+    config = TrainRunConfig(
+        model_path="/model",
+        output_dir="/out",
+        rollout=RolloutConfig(
+            mode="debate",
+            env_name="mmlu_pro_pairwise",
+            num_groups=8,
+            group_size=16,
+        ),
+        mmlu_pro_data_path="/corpus/mmlu.jsonl",
+        adapter_layout="split",
+        debate_rounds=3,
+        debate_round_adapter_names=("solution", "debate", "debate"),
+        debate_r1_reward="none",
+        debate_r23_reward="soft_judge_prompt_grpo",
+        debate_r23_mode="symmetric",
+        debate_judge_adapter="judge",
+        debate_judge_harness=CONSTITUTION_SINGLE_TOKEN_V1,
+        debate_judge_temperature=0.0,
+        debate_judge_max_tokens=1,
+        debate_judge_bidirectional=True,
+        debate_judge_constrain_single_token=True,
+        debate_judge_score_mode="order_sym_soft_logit",
+        judge_label_token_contract="lfm25_ab_whitespace_compat_v1",
+        train_judge=False,
+        train_adapter_names=("debate",),
+    )
+
+    assert config.rollout.num_groups == 8
+    assert config.rollout.group_size == 16
+    with pytest.raises(ValueError, match="at least two debates per prompt"):
+        replace(config, rollout=replace(config.rollout, group_size=2))
 
 
 def test_cli_accepts_label_judge_grpo_reward_mode() -> None:

@@ -48,6 +48,29 @@ from llm_local_rl.types import EpisodeSample, EpisodeTurn, SamplingRequest
 from llm_local_rl.vllm_sampling import VllmRuntimeConfig, VllmSampler
 
 
+def _distribution_metrics(prefix: str, values: list[float]) -> dict[str, float]:
+    """Return chart-friendly summaries without dropping row-level rollout values."""
+    if not values:
+        return {}
+    ordered = sorted(values)
+
+    def percentile(q: float) -> float:
+        position = q * (len(ordered) - 1)
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return ordered[lower]
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    return {
+        f"{prefix}_mean": mean(values),
+        f"{prefix}_p05": percentile(0.05),
+        f"{prefix}_p50": percentile(0.50),
+        f"{prefix}_p95": percentile(0.95),
+    }
+
+
 class TrainingDriver:
     def __init__(self, *, config: TrainRunConfig) -> None:
         self.config = config
@@ -1026,6 +1049,35 @@ class TrainingDriver:
                     if audit.get("soft_judge") is True
                 ),
             })
+            forward_referent_a = [
+                float(record["forward_referent_a_probability"])
+                for record in soft_records
+            ]
+            reverse_referent_a = [
+                float(record["reverse_referent_a_probability"])
+                for record in soft_records
+            ]
+            directional_values = {
+                # Displayed-label view: A/B always mean the literal output token.
+                "train_judge_forward_display_a_probability": forward_referent_a,
+                "train_judge_forward_display_b_probability": [1.0 - value for value in forward_referent_a],
+                "train_judge_reverse_display_a_probability": [1.0 - value for value in reverse_referent_a],
+                "train_judge_reverse_display_b_probability": reverse_referent_a,
+                "train_judge_forward_display_a_vs_b_logit": [
+                    float(record["z_forward"]) for record in soft_records
+                ],
+                "train_judge_reverse_display_a_vs_b_logit": [
+                    float(record["z_reverse"]) for record in soft_records
+                ],
+                # Referent view: both directions describe the original Agent A.
+                "train_judge_forward_referent_a_probability": forward_referent_a,
+                "train_judge_reverse_referent_a_probability": reverse_referent_a,
+                "train_judge_reverse_referent_a_vs_b_logit": [
+                    -float(record["z_reverse"]) for record in soft_records
+                ],
+            }
+            for prefix, values in directional_values.items():
+                metrics.update(_distribution_metrics(prefix, values))
         return metrics
 
     def _group_debate_examples(self, *, debates: list, step_seed: int | None) -> tuple[dict[str, list], dict[str, object]]:
@@ -1182,6 +1234,17 @@ class TrainingDriver:
                 "formula": "reward_a=(1-J)*s; reward_b=-(1-J)*s",
                 "judge_reliability": "1 - referent_js_divergence/ln(2)",
                 "exact_zero_sum_per_debate": True,
+                "r23_constant_ignored": True,
+            }
+        elif self.config.debate_r23_reward == "soft_judge_prompt_grpo":
+            projection_record["r23_projection"] = {
+                "mode": "soft_judge_prompt_grpo",
+                "raw_reward": "+s for A and -s for B",
+                "normalization": "population z-score across all trajectories for the same prompt",
+                "judge_score": "tanh((z_forward-z_reverse)/4)",
+                "judge_js_role": "diagnostic_only",
+                "judge_reliability_applied": False,
+                "exact_zero_sum_per_debate_before_normalization": True,
                 "r23_constant_ignored": True,
             }
         return grouped, projection_record
