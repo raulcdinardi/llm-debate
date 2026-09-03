@@ -9,9 +9,11 @@ from pathlib import Path
 from llm_local_rl.behavior_policy import BehaviorPolicySpec
 from llm_local_rl.judge_harness import (
     CHAT_SOLUTION_TAGGED_V1,
+    CONSTITUTION_SINGLE_TOKEN_R4_V1,
     CONSTITUTION_SINGLE_TOKEN_V1,
     JudgeHarnessSpec,
     SOLUTION_R1_RATIONALE_V1,
+    SOLUTION_R1_RATIONALE_R4_V1,
     get_judge_harness,
     resolve_judge_harness_id,
 )
@@ -116,10 +118,12 @@ class TrainRunConfig:
     debate_stop_on_concluded: bool = False
     base_r2_prefill: str = "The reasons that my solution is better than my opponent's are:\n1)"
     base_r3_prefill: str = "Responding to my opponent's criticism:\n1)"
+    base_r4_prefill: str = "My closing response to my opponent is:\n1)"
     debate_r1_max_tokens: int = 0
     debate_r23_max_tokens: int = 0
     debate_r2_max_tokens: int = 0
     debate_r3_max_tokens: int = 0
+    debate_r4_max_tokens: int = 0
     rollout_grad_accum_steps: int = 1
     rollout_assistant_prefill: str | None = None
     train_minibatch_size: int = 0
@@ -188,6 +192,16 @@ class TrainRunConfig:
         return get_judge_harness(self.debate_judge_harness)
 
     def __post_init__(self) -> None:
+        if self.debate_rounds == 4 and self.debate_round_adapter_names == (
+            "solution",
+            "debate",
+            "debate",
+        ):
+            object.__setattr__(
+                self,
+                "debate_round_adapter_names",
+                self.debate_round_adapter_names + ("debate",),
+            )
         for name, value in (
             ("adapter_checkpoint_every", self.adapter_checkpoint_every),
             ("rollout_shard_every", self.rollout_shard_every),
@@ -226,18 +240,32 @@ class TrainRunConfig:
             raise ValueError(f"rollout.top_p must be in (0, 1], got {self.rollout.top_p}")
         judge_harness = self.judge_harness()
         uses_configured_harness = self.debate_mock_judge_seed is None
+        if self.debate_rounds not in (1, 2, 3, 4):
+            raise ValueError("debate_rounds must be one of 1, 2, 3, or 4")
         if uses_configured_harness and self.debate_rounds < judge_harness.required_rounds:
             raise ValueError(
                 f"Judge harness {judge_harness.harness_id!r} requires at least "
                 f"{judge_harness.required_rounds} rounds"
             )
         if (
-            self.debate_external_judge_url is not None
-            and judge_harness.harness_id != SOLUTION_R1_RATIONALE_V1
+            uses_configured_harness
+            and self.debate_rounds == 4
+            and judge_harness.required_rounds != 4
         ):
             raise ValueError(
-                "External HTTP judge supports only "
-                f"{SOLUTION_R1_RATIONALE_V1!r}; got {judge_harness.harness_id!r}"
+                f"Judge harness {judge_harness.harness_id!r} is not bound to four-round transcripts"
+            )
+        if (
+            self.debate_external_judge_url is not None
+            and judge_harness.harness_id not in (
+                SOLUTION_R1_RATIONALE_V1,
+                SOLUTION_R1_RATIONALE_R4_V1,
+            )
+        ):
+            raise ValueError(
+                f"External HTTP judge supports only {SOLUTION_R1_RATIONALE_V1!r} or "
+                f"{SOLUTION_R1_RATIONALE_R4_V1!r}; "
+                f"got {judge_harness.harness_id!r}"
             )
         if self.debate_judge_max_tokens < 0:
             raise ValueError("debate_judge_max_tokens must be non-negative")
@@ -273,9 +301,14 @@ class TrainRunConfig:
                 raise ValueError(
                     "supervised_label_ce_js requires the strict two-token OpenBookQA contract"
                 )
-            if self.debate_judge_harness != CONSTITUTION_SINGLE_TOKEN_V1:
+            expected_constitution_harness = (
+                CONSTITUTION_SINGLE_TOKEN_R4_V1
+                if self.debate_rounds == 4
+                else CONSTITUTION_SINGLE_TOKEN_V1
+            )
+            if self.debate_judge_harness != expected_constitution_harness:
                 raise ValueError(
-                    "supervised_label_ce_js requires constitution_single_token_v1"
+                    "supervised_label_ce_js requires the round-count-matched constitution harness"
                 )
             if self.debate_r23_reward != "soft_judge":
                 raise ValueError(
@@ -320,7 +353,10 @@ class TrainRunConfig:
                     )
                 if float(self.debate_judge_temperature) <= 0.0:
                     raise ValueError("trainable soft judge requires stochastic temperature > 0")
-                if self.debate_judge_harness != CONSTITUTION_SINGLE_TOKEN_V1:
+                if self.debate_judge_harness not in (
+                    CONSTITUTION_SINGLE_TOKEN_V1,
+                    CONSTITUTION_SINGLE_TOKEN_R4_V1,
+                ):
                     raise ValueError(
                         "strict OpenBookQA token boundary is bound to constitution_single_token_v1"
                     )
@@ -416,9 +452,9 @@ class TrainRunConfig:
         if self.debate_judge_bidirectional:
             if judge_modes != 0:
                 raise ValueError("bidirectional judge sampling requires the in-process judge sampler")
-            if self.rollout.mode != "debate" or self.debate_rounds not in (1, 2, 3):
+            if self.rollout.mode != "debate" or self.debate_rounds not in (1, 2, 3, 4):
                 raise ValueError(
-                    "bidirectional judge sampling requires a one-, two-, or three-round transcript"
+                    "bidirectional judge sampling requires a one-, two-, three-, or four-round transcript"
                 )
         if (
             not math.isfinite(self.judge_coherence_js_weight)
@@ -564,10 +600,12 @@ class TrainRunConfig:
             debate_stop_on_concluded=data.get("debate_stop_on_concluded", False),
             base_r2_prefill=data.get("base_r2_prefill", "The reasons that my solution is better than my opponent's are:\n1)"),
             base_r3_prefill=data.get("base_r3_prefill", "Responding to my opponent's criticism:\n1)"),
+            base_r4_prefill=data.get("base_r4_prefill", "My closing response to my opponent is:\n1)"),
             debate_r1_max_tokens=data.get("debate_r1_max_tokens", 0),
             debate_r23_max_tokens=data.get("debate_r23_max_tokens", 0),
             debate_r2_max_tokens=data.get("debate_r2_max_tokens", 0),
             debate_r3_max_tokens=data.get("debate_r3_max_tokens", 0),
+            debate_r4_max_tokens=data.get("debate_r4_max_tokens", 0),
             rollout_grad_accum_steps=data.get("rollout_grad_accum_steps", 1),
             rollout_assistant_prefill=(
                 data["rollout_assistant_prefill"] if "rollout_assistant_prefill" in data else ""

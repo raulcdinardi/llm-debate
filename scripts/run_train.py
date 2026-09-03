@@ -71,7 +71,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--thinking-mode", default="default", choices=["default", "no_think", "force_think"])
     parser.add_argument("--advantage-mode", default="zscore", choices=["identity", "centered_mean", "zscore"])
     parser.add_argument("--ppo-clip-epsilon", type=float, default=0.2)
-    parser.add_argument("--debate-rounds", type=int, default=3, choices=[1, 2, 3])
+    parser.add_argument("--debate-rounds", type=int, default=3, choices=[1, 2, 3, 4])
     parser.add_argument(
         "--debate-r1-reward",
         default="task",
@@ -199,10 +199,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--base-r2-prefill", default="The reasons that my solution is better than my opponent's are:\n1)")
     parser.add_argument("--base-r3-prefill", default="Responding to my opponent's criticism:\n1)")
+    parser.add_argument("--base-r4-prefill", default="My closing response to my opponent is:\n1)")
     parser.add_argument("--debate-r1-max-tokens", type=int, default=0, help="0 uses --max-tokens for debate R1.")
-    parser.add_argument("--debate-r23-max-tokens", type=int, default=0, help="0 uses --max-tokens for debate R2/R3.")
+    parser.add_argument("--debate-r23-max-tokens", type=int, default=0, help="0 uses --max-tokens for debate rounds after R1.")
     parser.add_argument("--debate-r2-max-tokens", type=int, default=0, help="0 inherits --debate-r23-max-tokens for debate R2.")
     parser.add_argument("--debate-r3-max-tokens", type=int, default=0, help="0 inherits --debate-r23-max-tokens for debate R3.")
+    parser.add_argument("--debate-r4-max-tokens", type=int, default=0, help="0 inherits --debate-r23-max-tokens for debate R4.")
     parser.add_argument(
         "--rollout-grad-accum-steps",
         type=int,
@@ -430,10 +432,12 @@ def main() -> int:
                 debate_stop_on_concluded=args.debate_stop_on_concluded,
                 base_r2_prefill=args.base_r2_prefill,
                 base_r3_prefill=args.base_r3_prefill,
+                base_r4_prefill=args.base_r4_prefill,
                 debate_r1_max_tokens=args.debate_r1_max_tokens,
                 debate_r23_max_tokens=args.debate_r23_max_tokens,
                 debate_r2_max_tokens=args.debate_r2_max_tokens,
                 debate_r3_max_tokens=args.debate_r3_max_tokens,
+                debate_r4_max_tokens=args.debate_r4_max_tokens,
                 rollout_grad_accum_steps=args.rollout_grad_accum_steps,
                 rollout_assistant_prefill=args.rollout_assistant_prefill,
                 train_minibatch_size=args.train_minibatch_size,

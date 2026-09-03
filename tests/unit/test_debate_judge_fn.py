@@ -9,6 +9,7 @@ from llm_local_rl.debate_parity import DebateConfig
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
 from llm_local_rl.debate_tasks import HTSequenceDebateTask
 from llm_local_rl.judge_harness import (
+    CHAT_SOLUTION_TAGGED_R4_V1,
     CONSTITUTION_SINGLE_TOKEN_V1,
     PAIRWISE_SINGLE_TOKEN_V1,
     SOLUTION_R1_RATIONALE_V1,
@@ -189,6 +190,43 @@ def test_external_judge_fn_short_circuits_three_round_policy_judge_sampling() ->
         "debate",
         "debate",
     ]
+
+
+def test_four_round_rollout_routes_r4_and_judges_the_complete_transcript() -> None:
+    tokenizer = TinyChatTokenizer()
+    sampler = RecordingSampler(tokenizer=tokenizer, requests=[])
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=4,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="judge",
+            judge_harness_id=CHAT_SOLUTION_TAGGED_R4_V1,
+        ),
+        adapter_layout="split",
+    )
+
+    debate = runtime.rollout(step_seed=0).debates[0]
+
+    assert [turn.round_num for turn in debate.trajectory_a.transitions] == [1, 2, 3, 4]
+    assert [request.adapter_name for request in sampler.requests] == [
+        "solution",
+        "solution",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+        "judge",
+    ]
+    judge_prompt = tokenizer.decode(debate.judge_prompt_tokens, skip_special_tokens=False)
+    assert "Round 4 (Closing rebuttal):" in judge_prompt
+    assert debate.trajectory_a.metrics["r4_completion_raw"]
 
 
 def test_r1_only_bidirectional_judge_samples_both_orders_and_records_audit() -> None:

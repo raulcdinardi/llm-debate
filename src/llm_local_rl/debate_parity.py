@@ -12,6 +12,7 @@ Verdict = Literal["A", "B", "INVALID"]
 
 _BASE_R2_HEADER = "The reasons that my solution is better than my opponent's are:\n1)"
 _BASE_R3_HEADER = "Responding to my opponent's criticism:\n1)"
+_BASE_R4_HEADER = "My closing response to my opponent is:\n1)"
 _DEBATE_POINT_RE = re.compile(r"(?m)^\s*([1-9])\)")
 _DEBATE_CONCLUDED_RE = re.compile(r"(?m)^\s*CONCLUDED\s*$")
 _LEGACY_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
@@ -51,15 +52,15 @@ def _legacy_numbered_completion_would_truncate(text: str) -> bool:
 
 
 def audit_base_text_debate_format(*, text: str, round_num: int) -> dict[str, Any]:
-    """Audit the exact visible R2/R3 contract used by the base-text harness.
+    """Audit the exact visible later-round contract used by the base-text harness.
 
     The canonical header and ``1)`` are prompt-side prefill.  They are checked
     to ensure the expected harness was used, but only sampled completion tokens
     receive advantages, so no reward is assigned to the prefill itself.
     """
-    if round_num not in (2, 3):
-        raise ValueError(f"round_num must be 2 or 3, got {round_num!r}")
-    header = _BASE_R2_HEADER if round_num == 2 else _BASE_R3_HEADER
+    if round_num not in (2, 3, 4):
+        raise ValueError(f"round_num must be 2, 3, or 4, got {round_num!r}")
+    header = {2: _BASE_R2_HEADER, 3: _BASE_R3_HEADER, 4: _BASE_R4_HEADER}[round_num]
     visible = text or ""
     markers = list(_DEBATE_POINT_RE.finditer(visible))
     marker_numbers = [int(match.group(1)) for match in markers]
@@ -168,6 +169,7 @@ class DebateConfig:
     max_tokens_r23: int | None = None
     max_tokens_r2: int | None = None
     max_tokens_r3: int | None = None
+    max_tokens_r4: int | None = None
     temperature: float = 1.0
     kl_coef: float = 0.01
     learning_rate: float = 1e-5
@@ -176,6 +178,7 @@ class DebateConfig:
     system_judge: str = load_prompt("debate/system_judge.md")
     r2_user_template: str = load_prompt("debate/r2_user_template.md")
     r3_user_template: str = load_prompt("debate/r3_user_template.md")
+    r4_user_template: str = load_prompt("debate/r4_user_template.md")
     chat_preamble: str = ""
 
     @staticmethod
@@ -202,10 +205,13 @@ def _im_end() -> str:
 
 
 def build_r1_prompt(question: str, config: DebateConfig) -> str:
+    system_propose = config.system_propose
+    if config.num_rounds == 4:
+        system_propose = system_propose.replace("3-round debate", "4-round debate", 1)
     return (
         config.chat_preamble
         + _im_start("system")
-        + config.system_propose
+        + system_propose
         + "\n"
         + _im_end()
         + _im_start("user")
@@ -223,6 +229,11 @@ def build_r2_continuation(opponent_r1: str, config: DebateConfig) -> str:
 
 def build_r3_continuation(opponent_r2: str, config: DebateConfig) -> str:
     user_msg = config.r3_user_template.format(opponent_r2=opponent_r2)
+    return _im_end() + _im_start("user") + user_msg + "\n" + _im_end() + _im_start("assistant")
+
+
+def build_r4_continuation(opponent_r3: str, config: DebateConfig) -> str:
+    user_msg = config.r4_user_template.format(opponent_r3=opponent_r3)
     return _im_end() + _im_start("user") + user_msg + "\n" + _im_end() + _im_start("assistant")
 
 
@@ -506,6 +517,63 @@ def _merge_transition_pair_with_adv_values(
     )
 
 
+def _merge_transition_sequence_with_adv_values(
+    *,
+    debate: DebateResult,
+    traj: DebateTrajectory,
+    transitions: list[Transition],
+    adv_values: list[float],
+    metadata: dict[str, Any],
+) -> TrainingDatum:
+    if not transitions or len(transitions) != len(adv_values):
+        raise ValueError("transitions and adv_values must be non-empty and have equal length")
+    merged_completion: list[int] = []
+    merged_logprobs: list[float] = []
+    merged_logprob_mask: list[int] = []
+    merged_advantages: list[float] = []
+    previous: Transition | None = None
+    for transition, adv_value in zip(transitions, adv_values, strict=True):
+        if len(transition.completion_tokens) != len(transition.completion_logprobs):
+            raise ValueError(
+                f"Completion/logprob length mismatch in round {transition.round_num}: "
+                f"{len(transition.completion_tokens)} vs {len(transition.completion_logprobs)}"
+            )
+        if adv_value != 0.0 and not transition.completion_tokens:
+            raise ValueError(
+                f"Non-zero R{transition.round_num} advantage with zero completion tokens."
+            )
+        if previous is not None:
+            previous_full_len = len(previous.prompt_tokens) + len(previous.completion_tokens)
+            if len(transition.prompt_tokens) < previous_full_len:
+                raise ValueError(
+                    f"R{transition.round_num} prompt shorter than R{previous.round_num} history; "
+                    "extension property violated."
+                )
+            continuation = transition.prompt_tokens[previous_full_len:]
+            merged_completion.extend(continuation)
+            merged_logprobs.extend([0.0] * len(continuation))
+            merged_logprob_mask.extend([0] * len(continuation))
+            merged_advantages.extend([0.0] * len(continuation))
+        merged_completion.extend(transition.completion_tokens)
+        merged_logprobs.extend(transition.completion_logprobs)
+        merged_logprob_mask.extend([1] * len(transition.completion_tokens))
+        merged_advantages.extend([adv_value] * len(transition.completion_tokens))
+        previous = transition
+    return TrainingDatum(
+        prompt_tokens=transitions[0].prompt_tokens,
+        completion_tokens=merged_completion,
+        completion_logprobs=merged_logprobs,
+        completion_logprob_mask=merged_logprob_mask,
+        completion_advantages=merged_advantages,
+        metadata={
+            "question": debate.question[:100],
+            "agent": traj.agent,
+            "verdict": debate.verdict,
+            **metadata,
+        },
+    )
+
+
 def assemble_training_data_grpo(
     debates: list[DebateResult],
     reward_fn: Callable[[DebateTrajectory, DebateResult], float],
@@ -607,6 +675,75 @@ def assemble_training_data_r1_r23(
                         "rounds_merged": 3,
                         "r1_trained": True,
                         "r23_trained": r23_reward_signed != 0.0,
+                    },
+                )
+            )
+    return data
+
+
+def assemble_training_data_r1_r234(
+    debates: list[DebateResult],
+    r1_reward_fn: Callable[[DebateTrajectory, DebateResult], float],
+    *,
+    r23_reward: float,
+    r23_symmetric: bool,
+    r23_advantage_scope: Literal["per_round", "merged_r23"],
+) -> list[TrainingDatum]:
+    groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
+    for debate in debates:
+        if debate.verdict not in ("A", "B"):
+            continue
+        groups.setdefault(debate.question, []).extend(
+            [
+                (debate.trajectory_a, debate, r1_reward_fn(debate.trajectory_a, debate)),
+                (debate.trajectory_b, debate, r1_reward_fn(debate.trajectory_b, debate)),
+            ]
+        )
+    data: list[TrainingDatum] = []
+    for group in groups.values():
+        rewards = [reward for _traj, _debate, reward in group]
+        mean_reward = sum(rewards) / len(rewards)
+        variance = sum((reward - mean_reward) ** 2 for reward in rewards) / len(rewards)
+        std = math.sqrt(variance)
+        for traj, debate, r1_reward in group:
+            if len(traj.transitions) != 4:
+                raise ValueError(f"Expected 4 rounds, got {len(traj.transitions)}")
+            if any(not transition.completion_tokens for transition in traj.transitions):
+                raise ValueError("Every R1-R4 completion must contain at least one token")
+            r1_centered = (r1_reward - mean_reward) / std if std > 0 else 0.0
+            signed = (
+                float(r23_reward)
+                if debate.get_winner_trajectory().agent == traj.agent
+                else (-float(r23_reward) if r23_symmetric else 0.0)
+            )
+            later = traj.transitions[1:]
+            if r23_advantage_scope == "merged_r23":
+                later_token_count = sum(len(transition.completion_tokens) for transition in later)
+                later_adv_values = [signed / later_token_count] * len(later)
+            else:
+                later_adv_values = [
+                    signed / len(transition.completion_tokens) for transition in later
+                ]
+            r1_adv = r1_centered / len(traj.transitions[0].completion_tokens)
+            data.append(
+                _merge_transition_sequence_with_adv_values(
+                    debate=debate,
+                    traj=traj,
+                    transitions=list(traj.transitions),
+                    adv_values=[r1_adv, *later_adv_values],
+                    metadata={
+                        "r1_reward": r1_reward,
+                        "r1_centered_reward": r1_centered,
+                        "r1_adv_value": r1_adv,
+                        "r1_group_mean_reward": mean_reward,
+                        "r1_group_std_reward": std,
+                        "r1_group_size": len(group),
+                        "r23_reward": signed,
+                        "r23_symmetric": r23_symmetric,
+                        "r23_advantage_scope": r23_advantage_scope,
+                        "rounds_merged": 4,
+                        "r1_trained": True,
+                        "r23_trained": signed != 0.0,
                     },
                 )
             )
@@ -883,6 +1020,59 @@ def assemble_training_data_r1_compare_r23(
     return data
 
 
+def assemble_training_data_r1_compare_r234(
+    debates: list[DebateResult],
+    *,
+    r1_reward: float,
+    r1_symmetric: bool,
+    r23_reward: float,
+    r23_symmetric: bool,
+    r23_advantage_scope: Literal["per_round", "merged_r23"],
+) -> list[TrainingDatum]:
+    data: list[TrainingDatum] = []
+    for debate in debates:
+        if debate.verdict not in ("A", "B"):
+            continue
+        for traj in (debate.trajectory_a, debate.trajectory_b):
+            if len(traj.transitions) != 4:
+                raise ValueError(f"Expected 4 rounds, got {len(traj.transitions)}")
+            if any(not transition.completion_tokens for transition in traj.transitions):
+                raise ValueError("Every R1-R4 completion must contain at least one token")
+            is_winner = debate.get_winner_trajectory().agent == traj.agent
+            signed_r1 = float(r1_reward) if is_winner else (-float(r1_reward) if r1_symmetric else 0.0)
+            signed_later = float(r23_reward) if is_winner else (-float(r23_reward) if r23_symmetric else 0.0)
+            later = traj.transitions[1:]
+            if r23_advantage_scope == "merged_r23":
+                later_token_count = sum(len(transition.completion_tokens) for transition in later)
+                later_adv_values = [signed_later / later_token_count] * len(later)
+            else:
+                later_adv_values = [
+                    signed_later / len(transition.completion_tokens) for transition in later
+                ]
+            r1_adv = signed_r1 / len(traj.transitions[0].completion_tokens)
+            data.append(
+                _merge_transition_sequence_with_adv_values(
+                    debate=debate,
+                    traj=traj,
+                    transitions=list(traj.transitions),
+                    adv_values=[r1_adv, *later_adv_values],
+                    metadata={
+                        "r1_reward": signed_r1,
+                        "r1_compare": True,
+                        "r1_symmetric": r1_symmetric,
+                        "r1_adv_value": r1_adv,
+                        "r23_reward": signed_later,
+                        "r23_symmetric": r23_symmetric,
+                        "r23_advantage_scope": r23_advantage_scope,
+                        "rounds_merged": 4,
+                        "r1_trained": signed_r1 != 0.0,
+                        "r23_trained": signed_later != 0.0,
+                    },
+                )
+            )
+    return data
+
+
 def training_datum_to_train_example(*, datum: TrainingDatum, adapter_name: str) -> TrainExample:
     if len(datum.completion_tokens) == 0:
         raise ValueError("Cannot train on an empty completion.")
@@ -933,6 +1123,7 @@ def assemble_training_data_by_mode(
     r23_symmetric: bool,
     task_reward_fn: Callable[[DebateTrajectory, DebateResult], float],
     pointwise_reward_map: dict[int, float] | None = None,
+    r23_advantage_scope: Literal["per_round", "merged_r23"] = "per_round",
 ) -> list[TrainingDatum]:
     if num_rounds == 1:
         if r23_reward_mode != "none":
@@ -1007,6 +1198,35 @@ def assemble_training_data_by_mode(
             r23_reward=r23_reward,
             r23_symmetric=r23_symmetric,
         )
+    if num_rounds == 4:
+        if r1_reward_mode == "task":
+            r1_reward_fn = task_reward_fn
+        elif r1_reward_mode == "judge_pointwise":
+            if pointwise_reward_map is None:
+                raise ValueError("judge_pointwise requires pointwise_reward_map")
+            r1_reward_fn = lambda traj, _debate: pointwise_reward_map[id(traj)]
+        elif r1_reward_mode == "judge":
+            later_reward = 0.0 if r23_reward_mode == "none" else float(r23_constant)
+            return assemble_training_data_r1_compare_r234(
+                debates,
+                r1_reward=float(r23_constant),
+                r1_symmetric=r23_symmetric,
+                r23_reward=later_reward,
+                r23_symmetric=r23_symmetric,
+                r23_advantage_scope=r23_advantage_scope,
+            )
+        elif r1_reward_mode == "none":
+            r1_reward_fn = lambda _traj, _debate: 0.0
+        else:
+            raise ValueError(f"Unsupported r1_reward_mode={r1_reward_mode!r}")
+        later_reward = 0.0 if r23_reward_mode == "none" else float(r23_constant)
+        return assemble_training_data_r1_r234(
+            debates,
+            r1_reward_fn=r1_reward_fn,
+            r23_reward=later_reward,
+            r23_symmetric=r23_symmetric,
+            r23_advantage_scope=r23_advantage_scope,
+        )
     raise ValueError(f"Unsupported num_rounds={num_rounds!r}")
 
 
@@ -1064,6 +1284,65 @@ def assemble_split_train_examples(
         )
         grouped.setdefault(adapter_name, []).append(
             training_datum_to_train_example(datum=datum, adapter_name=adapter_name)
+        )
+
+    def _append_r4(
+        *,
+        traj: DebateTrajectory,
+        debate: DebateResult,
+        signed: float,
+        coherent: bool,
+    ) -> None:
+        t4 = traj.transitions[3]
+        if not t4.completion_tokens:
+            raise ValueError("R4 completion tokens empty.")
+        r4_format = audit_base_text_debate_format(
+            text=str(traj.metrics.get("r4", "")), round_num=4
+        ) if r23_format_failure_penalty != 0.0 else {"strict_ok": True, "failures": []}
+        r4_penalty = 0.0 if r4_format["strict_ok"] else r23_format_failure_penalty
+        base_adv = (
+            signed / sum(len(t.completion_tokens) for t in traj.transitions[1:4])
+            if r23_advantage_scope == "merged_r23"
+            else signed / len(t4.completion_tokens)
+        )
+        r4_adv = base_adv + r4_penalty / len(t4.completion_tokens)
+        score = js = reliability = None
+        if r23_reward_mode == "soft_judge":
+            score, js, reliability = _soft_judge_signal(debate)
+        judge_audit = debate.judge_raw_response if isinstance(debate.judge_raw_response, dict) else {}
+        _append_turn(
+            adapter_name=round_adapter_names[3],
+            prompt_tokens=t4.prompt_tokens,
+            completion_tokens=t4.completion_tokens,
+            completion_logprobs=t4.completion_logprobs,
+            advantages=[r4_adv] * len(t4.completion_tokens),
+            metadata={
+                "question": debate.question[:100],
+                "agent": traj.agent,
+                "verdict": debate.verdict,
+                "source_exact_shared_equivalent": False,
+                "reason": "split_layout_per_round_projection",
+                "round_num": 4,
+                "r23_reward": signed,
+                "r23_base_judge_reward": signed,
+                "r4_format_strict": r4_format["strict_ok"],
+                "r4_format_failures": r4_format["failures"],
+                "r4_legacy_truncation_triggered": r4_format.get("legacy_truncation_triggered", False),
+                "r4_format_failure_penalty": r4_penalty,
+                "r4_effective_reward": signed + r4_penalty,
+                "r4_adv_value": r4_adv,
+                "r23_advantage_scope": r23_advantage_scope,
+                "judge_order_invariant": coherent,
+                "r23_incoherent_reward_applied": (
+                    r23_reward_mode != "soft_judge"
+                    and not coherent
+                    and judge_audit.get("bidirectional_judge") is True
+                ),
+                "r23_reward_mode": r23_reward_mode,
+                "judge_soft_score": score,
+                "judge_referent_js_divergence_normalized": js,
+                "judge_coherence_reliability": reliability,
+            },
         )
 
     if num_rounds == 1 and r1_reward_mode == "judge":
@@ -1302,6 +1581,77 @@ def assemble_split_train_examples(
                 r2_format_penalty = 0.0 if r2_format["strict_ok"] else r23_format_failure_penalty
                 if len(t2.completion_tokens) == 0:
                     raise ValueError("R2 completion tokens empty.")
+                if num_rounds == 4 and len(set(round_adapter_names[1:4])) == 1:
+                    later = list(traj.transitions[1:4])
+                    if any(not transition.completion_tokens for transition in later):
+                        raise ValueError("R2-R4 completion tokens must be non-empty.")
+                    format_audits = [
+                        audit_base_text_debate_format(
+                            text=str(traj.metrics.get(f"r{transition.round_num}", "")),
+                            round_num=transition.round_num,
+                        )
+                        if r23_format_failure_penalty != 0.0
+                        else {"strict_ok": True, "failures": []}
+                        for transition in later
+                    ]
+                    format_penalties = [
+                        0.0 if audit["strict_ok"] else r23_format_failure_penalty
+                        for audit in format_audits
+                    ]
+                    if r23_advantage_scope == "per_round":
+                        adv_values = [
+                            (signed + penalty) / len(transition.completion_tokens)
+                            for transition, penalty in zip(later, format_penalties, strict=True)
+                        ]
+                    else:
+                        later_token_count = sum(len(transition.completion_tokens) for transition in later)
+                        adv_values = [
+                            signed / later_token_count + penalty / len(transition.completion_tokens)
+                            for transition, penalty in zip(later, format_penalties, strict=True)
+                        ]
+                    per_round_metadata: dict[str, Any] = {}
+                    for transition, audit, penalty, adv_value in zip(
+                        later, format_audits, format_penalties, adv_values, strict=True
+                    ):
+                        prefix = f"r{transition.round_num}"
+                        per_round_metadata.update({
+                            f"{prefix}_format_strict": audit["strict_ok"],
+                            f"{prefix}_format_failures": audit["failures"],
+                            f"{prefix}_legacy_truncation_triggered": audit.get("legacy_truncation_triggered", False),
+                            f"{prefix}_format_failure_penalty": penalty,
+                            f"{prefix}_adv_value": adv_value,
+                        })
+                    datum = _merge_transition_sequence_with_adv_values(
+                        debate=debate,
+                        traj=traj,
+                        transitions=later,
+                        adv_values=adv_values,
+                        metadata={
+                            "source_exact_shared_equivalent": False,
+                            "reason": "split_layout_same_adapter_round_merge",
+                            "round_nums": [2, 3, 4],
+                            "rounds_merged": 3,
+                            "r23_reward": signed,
+                            "r23_base_judge_reward": signed,
+                            "r23_combined_reward": signed + sum(format_penalties),
+                            "r23_advantage_scope": r23_advantage_scope,
+                            "judge_order_invariant": coherent,
+                            "r23_incoherent_reward_applied": (
+                                r23_reward_mode != "soft_judge"
+                                and not coherent
+                                and judge_audit.get("bidirectional_judge") is True
+                            ),
+                            "r23_reward_mode": r23_reward_mode,
+                            "judge_soft_score": score if r23_reward_mode == "soft_judge" else None,
+                            "judge_referent_js_divergence_normalized": js if r23_reward_mode == "soft_judge" else None,
+                            "judge_coherence_reliability": reliability if r23_reward_mode == "soft_judge" else None,
+                            **per_round_metadata,
+                        },
+                    )
+                    grouped.setdefault(round_adapter_names[1], []).append(
+                        training_datum_to_train_example(datum=datum, adapter_name=round_adapter_names[1])
+                    )
+                    continue
                 if num_rounds >= 3 and round_adapter_names[1] == round_adapter_names[2]:
                     t3 = traj.transitions[2]
                     if len(t3.completion_tokens) == 0:
@@ -1314,7 +1664,10 @@ def assemble_split_train_examples(
                         first_adv_value = (signed + r2_format_penalty) / len(t2.completion_tokens)
                         second_adv_value = (signed + r3_format_penalty) / len(t3.completion_tokens)
                     else:
-                        r23_token_count = len(t2.completion_tokens) + len(t3.completion_tokens)
+                        r23_token_count = sum(
+                            len(transition.completion_tokens)
+                            for transition in traj.transitions[1:num_rounds]
+                        )
                         base_adv_value = signed / r23_token_count
                         first_adv_value = base_adv_value + r2_format_penalty / len(t2.completion_tokens)
                         second_adv_value = base_adv_value + r3_format_penalty / len(t3.completion_tokens)
@@ -1362,6 +1715,8 @@ def assemble_split_train_examples(
                     grouped.setdefault(round_adapter_names[1], []).append(
                         training_datum_to_train_example(datum=datum, adapter_name=round_adapter_names[1])
                     )
+                    if num_rounds == 4:
+                        _append_r4(traj=traj, debate=debate, signed=signed, coherent=coherent)
                     continue
                 _append_turn(
                     adapter_name=round_adapter_names[1],
@@ -1446,6 +1801,8 @@ def assemble_split_train_examples(
                         "judge_coherence_reliability": reliability if r23_reward_mode == "soft_judge" else None,
                     },
                 )
+            if num_rounds == 4:
+                _append_r4(traj=traj, debate=debate, signed=signed, coherent=coherent)
     return grouped
 
 

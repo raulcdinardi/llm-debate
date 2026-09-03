@@ -25,8 +25,10 @@ class SeededRandomJudge:
         r2_b: str,
         r3_a: str,
         r3_b: str,
+        r4_a: str = "",
+        r4_b: str = "",
     ) -> tuple[str, str]:
-        _ = (question, constitution, r1_a, r1_b, r2_a, r2_b, r3_a, r3_b)
+        _ = (question, constitution, r1_a, r1_b, r2_a, r2_b, r3_a, r3_b, r4_a, r4_b)
         self._call_index += 1
         verdict = self._rng.choice(("A", "B"))
         return verdict, f"seeded_random_judge seed={self.seed} call={self._call_index} verdict={verdict}"

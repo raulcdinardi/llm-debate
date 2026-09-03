@@ -194,6 +194,52 @@ def _formatted_round(round_num: int) -> str:
     return header + " first\n2) second\n3) third\nCONCLUDED"
 
 
+def _append_fourth_round(debate: DebateResult) -> DebateResult:
+    for trajectory, offset in ((debate.trajectory_a, 0), (debate.trajectory_b, 20)):
+        trajectory.transitions.append(
+            Transition(
+                prompt_tokens=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                completion_tokens=[21 + offset, 22 + offset],
+                completion_logprobs=[-0.7, -0.8],
+                round_num=4,
+            )
+        )
+    return debate
+
+
+def test_four_round_split_projection_merges_shared_later_adapter_reward_mass() -> None:
+    debate = _append_fourth_round(
+        _make_debate(
+            judge_raw_response={"bidirectional_judge": True, "order_invariant": True}
+        )
+    )
+
+    split = assemble_split_train_examples(
+        debates=[debate],
+        num_rounds=4,
+        round_adapter_names=("solution", "debate", "debate", "debate"),
+        r1_reward_mode="task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        r23_advantage_scope="merged_r23",
+    )
+
+    assert len(split["solution"]) == 2
+    assert len(split["debate"]) == 2
+    winner, loser = split["debate"]
+    assert winner.metadata["round_nums"] == [2, 3, 4]
+    assert winner.metadata["rounds_merged"] == 3
+    assert sum(winner.advantages) == pytest.approx(1.0)
+    assert sum(loser.advantages) == pytest.approx(-1.0)
+    assert all(
+        value == pytest.approx(1.0 / 6.0)
+        for value in winner.advantages
+        if value
+    )
+
+
 def _soft_judge_audit(score: float, *, js: float = 0.0) -> dict[str, object]:
     return {
         "bidirectional_judge": True,
