@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+import json
 import random
 import re
-from typing import Callable
 
 from llm_local_rl.behavior_policy import validate_sampling_result_contract
+from llm_local_rl.debate_depth import (
+    DebateDepthContext,
+    generate_debate_depths,
+    validate_debate_depth_policy,
+)
 from llm_local_rl.judge_harness import (
     AgentDebateText,
     CHAT_SOLUTION_TAGGED_V1,
@@ -28,7 +34,7 @@ from llm_local_rl.task_types import BaseTextDebateExtension, TaskInstance, TaskS
 from llm_local_rl.types import RolloutSampler, SamplingRequest
 
 JudgeAdapterMode = str
-JudgeFn = Callable[[str, str, str, str, str, str, str, str], tuple[Verdict, str]]
+JudgeFn = Callable[..., tuple[Verdict, str]]
 
 _SOLUTION_RE = re.compile(r"<SOLUTION>(.*?)</SOLUTION>", re.IGNORECASE | re.DOTALL)
 _VERDICT_RE = re.compile(r"<VERDICT>\s*([AB])\s*</VERDICT>", re.IGNORECASE)
@@ -115,6 +121,8 @@ class DebateRolloutOutput:
 @dataclass(frozen=True)
 class DebateRuntimeConfig:
     num_rounds: int = 3
+    depth_policy_name: str = "fixed"
+    depth_policy_params: dict[str, object] = field(default_factory=dict)
     num_groups: int = 1
     group_size: int = 2
     enable_thinking: bool | None = None
@@ -149,6 +157,43 @@ class DebateRuntimeConfig:
     debate_judge_server_url: str | None = None
     debate_judge_server_adapter_path: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.num_rounds < 1:
+            raise ValueError("num_rounds must be at least 1")
+        try:
+            depth_policy_params_json = json.dumps(
+                self.depth_policy_params,
+                sort_keys=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("depth_policy_params must be JSON-serializable") from exc
+        object.__setattr__(
+            self,
+            "depth_policy_params",
+            json.loads(depth_policy_params_json),
+        )
+        if self.group_size < 2 or self.group_size % 2 != 0:
+            raise ValueError("Debate requires an even group_size of at least 2")
+        validate_debate_depth_policy(
+            name=self.depth_policy_name,
+            params=self.depth_policy_params,
+            max_rounds=self.num_rounds,
+            debates_per_group=self.group_size // 2,
+        )
+        if not self.round_adapter_names:
+            raise ValueError("round_adapter_names must not be empty")
+
+    def effective_min_num_rounds(self) -> int:
+        return validate_debate_depth_policy(
+            name=self.depth_policy_name,
+            params=self.depth_policy_params,
+            max_rounds=self.num_rounds,
+            debates_per_group=self.group_size // 2,
+        )
+
+    def effective_max_num_rounds(self) -> int:
+        return self.num_rounds
+
 
 @dataclass
 class DebateRuntime:
@@ -179,34 +224,29 @@ class DebateRuntime:
         *,
         question: str,
         constitution: str,
-        r1_a: str,
-        r1_b: str,
-        r2_a: str,
-        r2_b: str,
-        r3_a: str,
-        r3_b: str,
+        rounds_a: list[str] | tuple[str, ...],
+        rounds_b: list[str] | tuple[str, ...],
     ) -> tuple[Verdict, str]:
         if self.judge_fn is None:
             raise ValueError("External judge requested but judge_fn is not configured.")
-        verdict, reasoning = self.judge_fn(
-            question,
-            constitution,
-            r1_a,
-            r1_b,
-            r2_a,
-            r2_b,
-            r3_a,
-            r3_b,
+        if len(rounds_a) != len(rounds_b):
+            raise ValueError("External judge received different A/B round counts")
+        if len(rounds_a) < 3:
+            padding = ("",) * (3 - len(rounds_a))
+            rounds_a = (*rounds_a, *padding)
+            rounds_b = (*rounds_b, *padding)
+        interleaved = tuple(
+            text
+            for pair in zip(rounds_a, rounds_b, strict=True)
+            for text in pair
         )
+        verdict, reasoning = self.judge_fn(question, constitution, *interleaved)
         return verdict, reasoning
 
-    def _run_external_judge_three_rounds(
+    def _run_external_judge_transcripts(
         self,
         *,
-        inst_pairs: list[tuple[TaskInstance, TaskInstance]],
-        r1_visible_text: list[str],
-        r2_visible_text: list[str],
-        r3_visible_text: list[str],
+        transcripts: list[JudgeTranscript],
     ) -> tuple[list[Verdict], list[str], list[list[int]], list[list[int]], list[list[float]], list[dict], list[bool]]:
         verdicts: list[Verdict] = []
         reasonings: list[str] = []
@@ -215,18 +255,12 @@ class DebateRuntime:
         completion_logprobs: list[list[float]] = []
         raw_responses: list[dict] = []
         retry_flags: list[bool] = []
-        for debate_idx, (inst_a, _inst_b) in enumerate(inst_pairs):
-            a_idx = 2 * debate_idx
-            b_idx = 2 * debate_idx + 1
+        for transcript in transcripts:
             verdict, reasoning = self._run_external_judge(
-                question=self.task.judge_context_text(inst=inst_a),
-                constitution=self.task.judge_constitution_text(inst=inst_a),
-                r1_a=r1_visible_text[a_idx],
-                r1_b=r1_visible_text[b_idx],
-                r2_a=r2_visible_text[a_idx],
-                r2_b=r2_visible_text[b_idx],
-                r3_a=r3_visible_text[a_idx],
-                r3_b=r3_visible_text[b_idx],
+                question=transcript.question,
+                constitution=transcript.constitution,
+                rounds_a=transcript.agent_a.rounds,
+                rounds_b=transcript.agent_b.rounds,
             )
             verdicts.append(verdict)
             reasonings.append(reasoning)
@@ -237,16 +271,39 @@ class DebateRuntime:
             retry_flags.append(False)
         return verdicts, reasonings, prompt_tokens, completion_tokens, completion_logprobs, raw_responses, retry_flags
 
-    def rollout(self, *, step_seed: int | None) -> DebateRolloutOutput:
-        if self.runtime_config.group_size % 2 != 0:
-            raise ValueError("Debate requires even group_size.")
+    def rollout(
+        self,
+        *,
+        step_seed: int | None,
+        optimizer_step: int | None = None,
+        rollout_index: int = 0,
+    ) -> DebateRolloutOutput:
+        """Roll out debates using the configured, registered depth policy."""
+        if self.runtime_config.num_groups < 1:
+            raise ValueError("Debate requires at least one group.")
+        if (
+            self.runtime_config.group_size < 2
+            or self.runtime_config.group_size % 2 != 0
+        ):
+            raise ValueError("Debate requires even group_size of at least 2.")
+        instances = self.task.sample_instances(
+            n=self.runtime_config.num_groups,
+            seed=step_seed,
+        )
+        target_round_counts = self._target_round_counts(
+            group_instances=instances,
+            step_seed=step_seed,
+            optimizer_step=optimizer_step,
+            rollout_index=rollout_index,
+        )
         harness = get_judge_harness(self.runtime_config.judge_harness_id)
-        if self.judge_fn is None and self.runtime_config.num_rounds < harness.required_rounds:
+        actual_min_rounds = min(target_round_counts)
+        if self.judge_fn is None and actual_min_rounds < harness.required_rounds:
             raise ValueError(
                 f"Judge harness {harness.harness_id!r} requires at least "
-                f"{harness.required_rounds} rounds; got num_rounds={self.runtime_config.num_rounds}"
+                f"{harness.required_rounds} rounds; generated minimum is "
+                f"{actual_min_rounds}"
             )
-        instances = self.task.sample_instances(n=self.runtime_config.num_groups, seed=step_seed)
         instances_repeated: list[TaskInstance] = []
         expander = getattr(self.task, "expand_group_instances", None)
         for group_idx, inst in enumerate(instances):
@@ -260,13 +317,17 @@ class DebateRuntime:
                 )
             else:
                 instances_repeated.extend([inst] * self.runtime_config.group_size)
-        if self.runtime_config.num_rounds == 1:
-            return self._rollout_r1_only(instances_repeated=instances_repeated, step_seed=step_seed)
-        if self.runtime_config.num_rounds == 2:
-            return self._rollout_two_rounds(instances_repeated=instances_repeated, step_seed=step_seed)
-        if self.runtime_config.num_rounds != 3:
-            raise ValueError(f"Unsupported num_rounds={self.runtime_config.num_rounds}")
-        return self._rollout_three_rounds(instances_repeated=instances_repeated, step_seed=step_seed)
+        if max(target_round_counts) == 1:
+            return self._rollout_r1_only(
+                instances_repeated=instances_repeated,
+                step_seed=step_seed,
+                target_round_counts=target_round_counts,
+            )
+        return self._rollout_variable_rounds(
+            instances_repeated=instances_repeated,
+            step_seed=step_seed,
+            target_round_counts=target_round_counts,
+        )
 
     def _postprocess_visible_texts(
         self,
@@ -348,9 +409,11 @@ class DebateRuntime:
         if self.adapter_layout == "shared":
             return "shared"
         round_idx = round_num - 1
-        if round_idx < 0 or round_idx >= len(self.runtime_config.round_adapter_names):
-            raise ValueError(f"Missing adapter mapping for round_num={round_num}")
-        return self.runtime_config.round_adapter_names[round_idx]
+        if round_idx < 0:
+            raise ValueError(f"Invalid round_num={round_num}")
+        return self.runtime_config.round_adapter_names[
+            min(round_idx, len(self.runtime_config.round_adapter_names) - 1)
+        ]
 
     def _judge_adapter_name(self) -> str:
         if self.runtime_config.debate_judge_server_url is not None:
@@ -394,7 +457,7 @@ class DebateRuntime:
                 return int(self.debate_config.max_tokens_r2)
             if self.debate_config.max_tokens_r23 is not None:
                 return int(self.debate_config.max_tokens_r23)
-        elif round_num == 3:
+        elif round_num >= 3:
             if self.debate_config.max_tokens_r3 is not None:
                 return int(self.debate_config.max_tokens_r3)
             if self.debate_config.max_tokens_r23 is not None:
@@ -539,7 +602,7 @@ class DebateRuntime:
                 f"Opponent Round 2 argument:\n{opponent_r2}\n\n"
                 "Write exactly 3 short numbered points for your Round 3 response.\n"
                 "- Respond to the opponent's criticisms.\n"
-                "- Make your final case that your fixed answer better satisfies the constitution.\n"
+                "- Reinforce why your fixed answer better satisfies the constitution.\n"
                 "- Do not revise your Round 1 answer.\n"
                 f"- After point 3, immediately output {_BASE_STOP_SENTINEL} and nothing else.\n"
             )
@@ -562,9 +625,125 @@ class DebateRuntime:
             )
         )
 
+    def _base_response_continuation_tokens(
+        self,
+        *,
+        inst: TaskInstance,
+        round_num: int,
+        opponent_response: str,
+    ) -> list[int]:
+        if round_num < 3:
+            raise ValueError("Repeated response continuation starts at round 3")
+        extension = self._task_base_text_debate_extension(
+            inst=inst,
+            opponent_round=round_num - 1,
+            opponent_answer=opponent_response,
+        )
+        if extension is not None:
+            system_text = extension.system_text
+            user_text = extension.user_text
+            assistant_prefill = extension.assistant_prefill
+        else:
+            task_template = self.task.debate_r3_user_template()
+            if task_template is None:
+                user_text = (
+                    f"Constitution:\n{self.task.judge_constitution_text(inst=inst)}\n\n"
+                    f"Opponent Round {round_num - 1} response:\n{opponent_response}\n\n"
+                    f"Write exactly 3 short numbered points for your Round {round_num} response.\n"
+                    "- Respond to the opponent's latest criticisms.\n"
+                    "- Reinforce why your fixed Round 1 answer better satisfies the constitution.\n"
+                    "- Do not revise your Round 1 answer.\n"
+                    f"- After point 3, immediately output {_BASE_STOP_SENTINEL} and nothing else.\n"
+                )
+            else:
+                user_text = task_template.format(
+                    round_num=round_num,
+                    opponent_round=round_num - 1,
+                    opponent_response=opponent_response,
+                )
+                user_text += (
+                    f"\n\nWrite exactly 3 short numbered points. After point 3, immediately output "
+                    f"{_BASE_STOP_SENTINEL} and nothing else.\n"
+                )
+            system_text = _base_debate_system_text(str(round_num))
+            assistant_prefill = self.runtime_config.base_r3_prefill
+        return self._encode_base_text(
+            "\n\n"
+            + _base_text_prompt(
+                system_text=system_text,
+                user_text=user_text,
+                assistant_prefill=assistant_prefill,
+            )
+        )
+
+    def _chat_continuation_parts(self, *, round_num: int) -> tuple[list[int], list[int]]:
+        if round_num == 2:
+            template = self.task.debate_r2_user_template() or load_prompt("debate/r2_token_template.md")
+            marker = "{opponent_r1}"
+        elif round_num >= 3:
+            template = self.task.debate_r3_user_template() or load_prompt("debate/r3_token_template.md")
+            marker = "{opponent_response}"
+            template = template.format(
+                round_num=round_num,
+                opponent_round=round_num - 1,
+                opponent_response=marker,
+            )
+        else:
+            raise ValueError("Continuation rounds start at round 2")
+        pre, post = _split_template(template, marker)
+        return get_chat_adapter(self.tokenizer).build_user_continuation_tokens(
+            user_pre=pre,
+            user_post=post,
+            enable_thinking=self.debate_config.enable_thinking,
+        )
+
+    def _target_round_counts(
+        self,
+        *,
+        group_instances: list[TaskInstance],
+        step_seed: int | None,
+        optimizer_step: int | None = None,
+        rollout_index: int = 0,
+    ) -> list[int]:
+        if len(group_instances) != self.runtime_config.num_groups:
+            raise ValueError("Depth policy requires exactly one instance per group")
+        counts: list[int] = []
+        debates_per_group = self.runtime_config.group_size // 2
+        for group_index, instance in enumerate(group_instances):
+            seed = (
+                None
+                if step_seed is None
+                else f"{step_seed}:debate_round_counts:group={group_index}"
+            )
+            context = DebateDepthContext(
+                rollout_seed=step_seed,
+                optimizer_step=optimizer_step,
+                rollout_index=rollout_index,
+                group_index=group_index,
+                num_groups=self.runtime_config.num_groups,
+                debates_per_group=debates_per_group,
+                max_rounds=self.runtime_config.num_rounds,
+                group_instance_id=instance.instance_id,
+                group_payload=dict(instance.payload),
+                rng=random.Random(seed),
+            )
+            counts.extend(
+                generate_debate_depths(
+                    name=self.runtime_config.depth_policy_name,
+                    params=self.runtime_config.depth_policy_params,
+                    context=context,
+                )
+            )
+        expected_debates = self.runtime_config.num_groups * debates_per_group
+        if len(counts) != expected_debates:
+            raise ValueError(
+                f"Depth policy produced {len(counts)} debates; expected {expected_debates}"
+            )
+        return counts
+
     def _sample_many(self, *, prompt_tokens_list: list[list[int]], round_num: int, step_seed: int | None, stop_token_ids: list[int], max_tokens: int, temperature: float, adapter_name: str | None = None) -> list[tuple[list[int], list[float], str, dict]]:
         requests = []
-        use_real_debate_stop = self.runtime_config.stop_on_concluded and round_num in {2, 3}
+        use_real_debate_stop = self.runtime_config.stop_on_concluded and round_num >= 2
         for idx, prompt_tokens in enumerate(prompt_tokens_list):
             requests.append(
                 SamplingRequest(
@@ -673,23 +852,14 @@ class DebateRuntime:
             )
         return tuple(token_ids)
 
-    def _judge_prompts(self, *, inst_pairs: list[tuple[TaskInstance, TaskInstance]], r1_visible_text: list[str], r2_visible_text: list[str], r3_visible_text: list[str], reverse_order: bool = False) -> list[list[int]]:
+    def _judge_prompts(
+        self,
+        *,
+        transcripts: list[JudgeTranscript],
+        reverse_order: bool = False,
+    ) -> list[list[int]]:
         prompts: list[list[int]] = []
-        for debate_idx, (inst_a, _inst_b) in enumerate(inst_pairs):
-            transcript = JudgeTranscript(
-                question=self.task.judge_context_text(inst=inst_a),
-                constitution=self.task.judge_constitution_text(inst=inst_a),
-                agent_a=AgentDebateText(
-                    r1=r1_visible_text[2 * debate_idx],
-                    r2=r2_visible_text[2 * debate_idx],
-                    r3=r3_visible_text[2 * debate_idx],
-                ),
-                agent_b=AgentDebateText(
-                    r1=r1_visible_text[2 * debate_idx + 1],
-                    r2=r2_visible_text[2 * debate_idx + 1],
-                    r3=r3_visible_text[2 * debate_idx + 1],
-                ),
-            )
+        for transcript in transcripts:
             if reverse_order:
                 transcript = transcript.swapped()
             prompts.append(self._encode_judge_transcript(transcript))
@@ -739,29 +909,22 @@ class DebateRuntime:
             return harness_default
         return self._max_tokens_for_round(round_num=1)
 
-    def _rollout_three_rounds(self, *, instances_repeated: list[TaskInstance], step_seed: int | None) -> DebateRolloutOutput:
+    def _rollout_variable_rounds(
+        self,
+        *,
+        instances_repeated: list[TaskInstance],
+        step_seed: int | None,
+        target_round_counts: list[int],
+    ) -> DebateRolloutOutput:
         use_base_text_prefill = self._use_base_text_prefill()
-        if use_base_text_prefill:
-            r2_prefix_tokens: list[int] = []
-            r2_suffix_tokens: list[int] = []
-            r3_prefix_tokens: list[int] = []
-            r3_suffix_tokens: list[int] = []
-        else:
-            r2_template = self.task.debate_r2_user_template() or load_prompt("debate/r2_token_template.md")
-            r3_template = self.task.debate_r3_user_template() or load_prompt("debate/r3_token_template.md")
-            r2_pre, r2_post = _split_template(r2_template, "{opponent_r1}")
-            r3_pre, r3_post = _split_template(r3_template, "{opponent_r2}")
-            adapter = get_chat_adapter(self.tokenizer)
-            r2_prefix_tokens, r2_suffix_tokens = adapter.build_user_continuation_tokens(
-                user_pre=r2_pre,
-                user_post=r2_post,
-                enable_thinking=self.debate_config.enable_thinking,
-            )
-            r3_prefix_tokens, r3_suffix_tokens = adapter.build_user_continuation_tokens(
-                user_pre=r3_pre,
-                user_post=r3_post,
-                enable_thinking=self.debate_config.enable_thinking,
-            )
+        n_agents = len(instances_repeated)
+        n_debates = n_agents // 2
+        inst_pairs = [
+            (instances_repeated[2 * index], instances_repeated[2 * index + 1])
+            for index in range(n_debates)
+        ]
+        if len(target_round_counts) != n_debates:
+            raise ValueError("Target round counts do not match the generated debates")
         base_r1_prompt_tokens = [
             (
                 self._base_r1_prompt_tokens(inst=inst)
@@ -795,250 +958,245 @@ class DebateRuntime:
                 max_tokens=self._max_tokens_for_round(round_num=1),
                 temperature=float(self.debate_config.temperature),
             )
-        r1_tokens = [comp for comp, _lps, _text, _raw in r1_results]
-        r1_lps = [lps for _comp, lps, _text, _raw in r1_results]
-        r1_text = [text for _comp, _lps, text, _raw in r1_results]
-        r1_visible_text, r1_visible_metrics = self._postprocess_visible_texts(instances=instances_repeated, texts=r1_text)
-        r1_sol = [
+
+        r1_tokens = [result[0] for result in r1_results]
+        r1_lps = [result[1] for result in r1_results]
+        r1_text = [result[2] for result in r1_results]
+        r1_raw = [result[3] for result in r1_results]
+        r1_visible_text, r1_visible_metrics = self._postprocess_visible_texts(
+            instances=instances_repeated,
+            texts=r1_text,
+        )
+        r1_solutions = [
             text if callable(fixed_r1_builder) else extract_solution(text)
             for text in r1_visible_text
         ]
-        r1_raw = [raw for _comp, _lps, _text, raw in r1_results]
-        r1_task_rewards = []
-        r1_task_reward_metrics = []
-        for inst, comp in zip(instances_repeated, r1_tokens, strict=True):
-            out = self.task.compute_reward(inst=inst, completion_tokens=comp, tokenizer=self.tokenizer)
-            r1_task_rewards.append(float(out.reward))
-            r1_task_reward_metrics.append(dict(out.metrics))
-
-        n_debates = len(instances_repeated) // 2
-        inst_pairs = [(instances_repeated[2 * idx], instances_repeated[2 * idx + 1]) for idx in range(n_debates)]
-        r2_prompt_tokens = []
-        r2_argument_prefills: list[str] = []
-        for idx in range(n_debates):
-            a_idx = 2 * idx
-            b_idx = 2 * idx + 1
-            if use_base_text_prefill:
-                r2_argument_prefills.append(
-                    self._base_text_debate_prefill(
-                        inst=instances_repeated[a_idx],
-                        opponent_round=1,
-                        opponent_answer=r1_visible_text[b_idx],
-                        fallback=self.runtime_config.base_r2_prefill,
-                    )
-                )
-                r2_prompt_tokens.append(
-                    base_r1_prompt_tokens[a_idx]
-                    + r1_tokens[a_idx]
-                    + self._base_r2_continuation_tokens(
-                        inst=instances_repeated[a_idx],
-                        own_r1=r1_visible_text[a_idx],
-                        opponent_r1=r1_visible_text[b_idx],
-                    )
-                )
-                r2_argument_prefills.append(
-                    self._base_text_debate_prefill(
-                        inst=instances_repeated[b_idx],
-                        opponent_round=1,
-                        opponent_answer=r1_visible_text[a_idx],
-                        fallback=self.runtime_config.base_r2_prefill,
-                    )
-                )
-                r2_prompt_tokens.append(
-                    base_r1_prompt_tokens[b_idx]
-                    + r1_tokens[b_idx]
-                    + self._base_r2_continuation_tokens(
-                        inst=instances_repeated[b_idx],
-                        own_r1=r1_visible_text[b_idx],
-                        opponent_r1=r1_visible_text[a_idx],
-                    )
-                )
-            else:
-                opp_r1_a = self.tokenizer.encode(r1_visible_text[b_idx], add_special_tokens=False)
-                opp_r1_b = self.tokenizer.encode(r1_visible_text[a_idx], add_special_tokens=False)
-                r2_prompt_tokens.append(base_r1_prompt_tokens[a_idx] + r1_tokens[a_idx] + r2_prefix_tokens + opp_r1_a + r2_suffix_tokens)
-                r2_prompt_tokens.append(base_r1_prompt_tokens[b_idx] + r1_tokens[b_idx] + r2_prefix_tokens + opp_r1_b + r2_suffix_tokens)
-        r2_results = self._sample_many(
-            prompt_tokens_list=r2_prompt_tokens,
-            round_num=2,
-            step_seed=step_seed,
-            stop_token_ids=stop_token_ids,
-            max_tokens=self._max_tokens_for_round(round_num=2),
-            temperature=float(self.debate_config.temperature),
-        )
-        r2_tokens = [comp for comp, _lps, _text, _raw in r2_results]
-        r2_lps = [lps for _comp, lps, _text, _raw in r2_results]
-        r2_text = [text for _comp, _lps, text, _raw in r2_results]
-        r2_visible_text, r2_visible_metrics = self._postprocess_visible_texts(
-            instances=instances_repeated,
-            texts=r2_text,
-            strip_stop_sentinel=self.runtime_config.stop_on_concluded,
-            preserve_sampled_text=use_base_text_prefill and not self.runtime_config.stop_on_concluded,
-        )
-        r2_argument_text = (
-            [
-                prefill + text
-                for prefill, text in zip(r2_argument_prefills, r2_visible_text, strict=True)
-            ]
-            if use_base_text_prefill
-            else list(r2_visible_text)
-        )
-        r2_raw = [raw for _comp, _lps, _text, raw in r2_results]
-
-        r3_prompt_tokens = []
-        r3_argument_prefills: list[str] = []
-        for idx in range(n_debates):
-            a_idx = 2 * idx
-            b_idx = 2 * idx + 1
-            if use_base_text_prefill:
-                r3_argument_prefills.append(
-                    self._base_text_debate_prefill(
-                        inst=instances_repeated[a_idx],
-                        opponent_round=2,
-                        opponent_answer=r2_argument_text[b_idx],
-                        fallback=self.runtime_config.base_r3_prefill,
-                    )
-                )
-                r3_prompt_tokens.append(
-                    r2_prompt_tokens[a_idx]
-                    + r2_tokens[a_idx]
-                    + self._base_r3_continuation_tokens(
-                        inst=instances_repeated[a_idx],
-                        own_r1=r1_visible_text[a_idx],
-                        opponent_r1=r1_visible_text[b_idx],
-                        own_r2=r2_argument_text[a_idx],
-                        opponent_r2=r2_argument_text[b_idx],
-                    )
-                )
-                r3_argument_prefills.append(
-                    self._base_text_debate_prefill(
-                        inst=instances_repeated[b_idx],
-                        opponent_round=2,
-                        opponent_answer=r2_argument_text[a_idx],
-                        fallback=self.runtime_config.base_r3_prefill,
-                    )
-                )
-                r3_prompt_tokens.append(
-                    r2_prompt_tokens[b_idx]
-                    + r2_tokens[b_idx]
-                    + self._base_r3_continuation_tokens(
-                        inst=instances_repeated[b_idx],
-                        own_r1=r1_visible_text[b_idx],
-                        opponent_r1=r1_visible_text[a_idx],
-                        own_r2=r2_argument_text[b_idx],
-                        opponent_r2=r2_argument_text[a_idx],
-                    )
-                )
-            else:
-                opp_r2_a = self.tokenizer.encode(r2_visible_text[b_idx], add_special_tokens=False)
-                opp_r2_b = self.tokenizer.encode(r2_visible_text[a_idx], add_special_tokens=False)
-                r3_prompt_tokens.append(r2_prompt_tokens[a_idx] + r2_tokens[a_idx] + r3_prefix_tokens + opp_r2_a + r3_suffix_tokens)
-                r3_prompt_tokens.append(r2_prompt_tokens[b_idx] + r2_tokens[b_idx] + r3_prefix_tokens + opp_r2_b + r3_suffix_tokens)
-        r3_results = self._sample_many(
-            prompt_tokens_list=r3_prompt_tokens,
-            round_num=3,
-            step_seed=step_seed,
-            stop_token_ids=stop_token_ids,
-            max_tokens=self._max_tokens_for_round(round_num=3),
-            temperature=float(self.debate_config.temperature),
-        )
-        r3_tokens = [comp for comp, _lps, _text, _raw in r3_results]
-        r3_lps = [lps for _comp, lps, _text, _raw in r3_results]
-        r3_text = [text for _comp, _lps, text, _raw in r3_results]
-        r3_visible_text, r3_visible_metrics = self._postprocess_visible_texts(
-            instances=instances_repeated,
-            texts=r3_text,
-            strip_stop_sentinel=self.runtime_config.stop_on_concluded,
-            preserve_sampled_text=use_base_text_prefill and not self.runtime_config.stop_on_concluded,
-        )
-        r3_argument_text = (
-            [
-                prefill + text
-                for prefill, text in zip(r3_argument_prefills, r3_visible_text, strict=True)
-            ]
-            if use_base_text_prefill
-            else list(r3_visible_text)
-        )
-        r3_raw = [raw for _comp, _lps, _text, raw in r3_results]
-
-        if self.judge_fn is not None:
-            verdicts, judge_reasonings, judge_prompt_tokens, judge_completion_tokens, judge_completion_logprobs, judge_raw_responses, judge_retry_flags = self._run_external_judge_three_rounds(
-                inst_pairs=inst_pairs,
-                r1_visible_text=r1_visible_text,
-                r2_visible_text=r2_argument_text,
-                r3_visible_text=r3_argument_text,
+        task_rewards: list[float] = []
+        task_reward_metrics: list[dict] = []
+        for inst, completion in zip(instances_repeated, r1_tokens, strict=True):
+            reward = self.task.compute_reward(
+                inst=inst,
+                completion_tokens=completion,
+                tokenizer=self.tokenizer,
             )
+            task_rewards.append(float(reward.reward))
+            task_reward_metrics.append(dict(reward.metrics))
+
+        transitions: list[list[Transition]] = []
+        visible_rounds: list[list[str]] = []
+        trajectory_metrics: list[dict] = []
+        for index, inst in enumerate(instances_repeated):
+            transitions.append([
+                Transition(
+                    prompt_tokens=base_r1_prompt_tokens[index],
+                    completion_tokens=r1_tokens[index],
+                    completion_logprobs=r1_lps[index],
+                    round_num=1,
+                    metrics={
+                        "solution": r1_solutions[index],
+                        "instance_id": inst.instance_id,
+                        "visible_text_metrics": r1_visible_metrics[index],
+                    },
+                    raw_response=r1_raw[index],
+                )
+            ])
+            visible_rounds.append([r1_visible_text[index]])
+            trajectory_metrics.append({
+                "r1": r1_text[index],
+                "instance_id": inst.instance_id,
+                "task_reward": task_rewards[index],
+                "task_reward_metrics": task_reward_metrics[index],
+            })
+
+        for round_num in range(2, max(target_round_counts) + 1):
+            active_debates = [
+                index
+                for index, target in enumerate(target_round_counts)
+                if target >= round_num
+            ]
+            if not active_debates:
+                continue
+            active_agents = [
+                agent_index
+                for debate_index in active_debates
+                for agent_index in (2 * debate_index, 2 * debate_index + 1)
+            ]
+            chat_prefix: list[int] = []
+            chat_suffix: list[int] = []
+            if not use_base_text_prefill:
+                chat_prefix, chat_suffix = self._chat_continuation_parts(round_num=round_num)
+            prompt_tokens_list: list[list[int]] = []
+            prefills: list[str] = []
+            for agent_index in active_agents:
+                opponent_index = agent_index + 1 if agent_index % 2 == 0 else agent_index - 1
+                previous = transitions[agent_index][-1]
+                opponent_response = visible_rounds[opponent_index][-1]
+                if use_base_text_prefill:
+                    fallback = (
+                        self.runtime_config.base_r2_prefill
+                        if round_num == 2
+                        else self.runtime_config.base_r3_prefill
+                    )
+                    prefill = self._base_text_debate_prefill(
+                        inst=instances_repeated[agent_index],
+                        opponent_round=round_num - 1,
+                        opponent_answer=opponent_response,
+                        fallback=fallback,
+                    )
+                    prefills.append(prefill)
+                    continuation = (
+                        self._base_r2_continuation_tokens(
+                            inst=instances_repeated[agent_index],
+                            own_r1=visible_rounds[agent_index][0],
+                            opponent_r1=visible_rounds[opponent_index][0],
+                        )
+                        if round_num == 2
+                        else self._base_response_continuation_tokens(
+                            inst=instances_repeated[agent_index],
+                            round_num=round_num,
+                            opponent_response=opponent_response,
+                        )
+                    )
+                else:
+                    continuation = (
+                        chat_prefix
+                        + list(self.tokenizer.encode(opponent_response, add_special_tokens=False))
+                        + chat_suffix
+                    )
+                prompt_tokens_list.append(
+                    previous.prompt_tokens + previous.completion_tokens + continuation
+                )
+
+            results = self._sample_many(
+                prompt_tokens_list=prompt_tokens_list,
+                round_num=round_num,
+                step_seed=step_seed,
+                stop_token_ids=stop_token_ids,
+                max_tokens=self._max_tokens_for_round(round_num=round_num),
+                temperature=float(self.debate_config.temperature),
+            )
+            raw_texts = [result[2] for result in results]
+            visible_texts, visible_metrics = self._postprocess_visible_texts(
+                instances=[instances_repeated[index] for index in active_agents],
+                texts=raw_texts,
+                strip_stop_sentinel=self.runtime_config.stop_on_concluded,
+                preserve_sampled_text=(
+                    use_base_text_prefill and not self.runtime_config.stop_on_concluded
+                ),
+            )
+            argument_texts = (
+                [
+                    prefill + text
+                    for prefill, text in zip(prefills, visible_texts, strict=True)
+                ]
+                if use_base_text_prefill
+                else visible_texts
+            )
+            for local_index, agent_index in enumerate(active_agents):
+                completion_tokens, completion_lps, raw_text, raw_response = results[local_index]
+                transitions[agent_index].append(
+                    Transition(
+                        prompt_tokens=prompt_tokens_list[local_index],
+                        completion_tokens=completion_tokens,
+                        completion_logprobs=completion_lps,
+                        round_num=round_num,
+                        metrics={"visible_text_metrics": visible_metrics[local_index]},
+                        raw_response=raw_response,
+                    )
+                )
+                visible_rounds[agent_index].append(argument_texts[local_index])
+                trajectory_metrics[agent_index][f"r{round_num}"] = argument_texts[local_index]
+                trajectory_metrics[agent_index][f"r{round_num}_completion_raw"] = raw_text
+
+        transcripts = [
+            JudgeTranscript(
+                question=self.task.judge_context_text(inst=inst_a),
+                constitution=self.task.judge_constitution_text(inst=inst_a),
+                agent_a=AgentDebateText(rounds=visible_rounds[2 * index]),
+                agent_b=AgentDebateText(rounds=visible_rounds[2 * index + 1]),
+            )
+            for index, (inst_a, _inst_b) in enumerate(inst_pairs)
+        ]
+        if self.judge_fn is not None:
+            judge_outputs = self._run_external_judge_transcripts(transcripts=transcripts)
         else:
-            verdicts, judge_reasonings, judge_prompt_tokens, judge_completion_tokens, judge_completion_logprobs, judge_raw_responses, judge_retry_flags = self._run_llm_judge_three_rounds(
-                inst_pairs=inst_pairs,
-                r1_visible_text=r1_visible_text,
-                r2_visible_text=r2_argument_text,
-                r3_visible_text=r3_argument_text,
+            judge_outputs = self._run_llm_judge_transcripts(
+                transcripts=transcripts,
                 step_seed=step_seed,
             )
+        (
+            verdicts,
+            judge_reasonings,
+            judge_prompt_tokens,
+            judge_completion_tokens,
+            judge_completion_logprobs,
+            judge_raw_responses,
+            judge_retry_flags,
+        ) = judge_outputs
+
         debates: list[DebateResult] = []
-        for idx, (inst_a, inst_b) in enumerate(inst_pairs):
-            a_idx = 2 * idx
-            b_idx = 2 * idx + 1
-            traj_a = DebateTrajectory(
-                agent="A",
-                transitions=[
-                    Transition(prompt_tokens=base_r1_prompt_tokens[a_idx], completion_tokens=r1_tokens[a_idx], completion_logprobs=r1_lps[a_idx], round_num=1, metrics={"solution": r1_sol[a_idx], "instance_id": inst_a.instance_id, "visible_text_metrics": r1_visible_metrics[a_idx]}, raw_response=r1_raw[a_idx]),
-                    Transition(prompt_tokens=r2_prompt_tokens[a_idx], completion_tokens=r2_tokens[a_idx], completion_logprobs=r2_lps[a_idx], round_num=2, metrics={"visible_text_metrics": r2_visible_metrics[a_idx]}, raw_response=r2_raw[a_idx]),
-                    Transition(prompt_tokens=r3_prompt_tokens[a_idx], completion_tokens=r3_tokens[a_idx], completion_logprobs=r3_lps[a_idx], round_num=3, metrics={"visible_text_metrics": r3_visible_metrics[a_idx]}, raw_response=r3_raw[a_idx]),
-                ],
-                frozen_solution=r1_sol[a_idx],
-                metrics={"r1": r1_text[a_idx], "r2": r2_argument_text[a_idx], "r3": r3_argument_text[a_idx], "r2_completion_raw": r2_text[a_idx], "r3_completion_raw": r3_text[a_idx], "instance_id": inst_a.instance_id, "task_reward": r1_task_rewards[a_idx], "task_reward_metrics": r1_task_reward_metrics[a_idx]},
-            )
-            traj_b = DebateTrajectory(
-                agent="B",
-                transitions=[
-                    Transition(prompt_tokens=base_r1_prompt_tokens[b_idx], completion_tokens=r1_tokens[b_idx], completion_logprobs=r1_lps[b_idx], round_num=1, metrics={"solution": r1_sol[b_idx], "instance_id": inst_b.instance_id, "visible_text_metrics": r1_visible_metrics[b_idx]}, raw_response=r1_raw[b_idx]),
-                    Transition(prompt_tokens=r2_prompt_tokens[b_idx], completion_tokens=r2_tokens[b_idx], completion_logprobs=r2_lps[b_idx], round_num=2, metrics={"visible_text_metrics": r2_visible_metrics[b_idx]}, raw_response=r2_raw[b_idx]),
-                    Transition(prompt_tokens=r3_prompt_tokens[b_idx], completion_tokens=r3_tokens[b_idx], completion_logprobs=r3_lps[b_idx], round_num=3, metrics={"visible_text_metrics": r3_visible_metrics[b_idx]}, raw_response=r3_raw[b_idx]),
-                ],
-                frozen_solution=r1_sol[b_idx],
-                metrics={"r1": r1_text[b_idx], "r2": r2_argument_text[b_idx], "r3": r3_argument_text[b_idx], "r2_completion_raw": r2_text[b_idx], "r3_completion_raw": r3_text[b_idx], "instance_id": inst_b.instance_id, "task_reward": r1_task_rewards[b_idx], "task_reward_metrics": r1_task_reward_metrics[b_idx]},
-            )
+        debates_per_group = self.runtime_config.group_size // 2
+        for index, (inst_a, inst_b) in enumerate(inst_pairs):
+            a_index = 2 * index
+            b_index = a_index + 1
             debates.append(
                 DebateResult(
                     question=self.task.judge_context_text(inst=inst_a),
                     ground_truth=inst_a.payload.get("ground_truth"),
-                    trajectory_a=traj_a,
-                    trajectory_b=traj_b,
-                    verdict=verdicts[idx],
-                    judge_reasoning=judge_reasonings[idx],
-                    metrics={"token_only_rollout": True, "task": self.task.name, "judge_retry": judge_retry_flags[idx]},
-                    judge_prompt_tokens=judge_prompt_tokens[idx],
-                    judge_completion_tokens=judge_completion_tokens[idx],
-                    judge_completion_logprobs=judge_completion_logprobs[idx],
-                    judge_raw_response=judge_raw_responses[idx],
+                    trajectory_a=DebateTrajectory(
+                        agent="A",
+                        transitions=transitions[a_index],
+                        frozen_solution=r1_solutions[a_index],
+                        metrics=trajectory_metrics[a_index],
+                    ),
+                    trajectory_b=DebateTrajectory(
+                        agent="B",
+                        transitions=transitions[b_index],
+                        frozen_solution=r1_solutions[b_index],
+                        metrics=trajectory_metrics[b_index],
+                    ),
+                    verdict=verdicts[index],
+                    judge_reasoning=judge_reasonings[index],
+                    metrics={
+                        "token_only_rollout": True,
+                        "task": self.task.name,
+                        "judge_retry": judge_retry_flags[index],
+                        "num_rounds": target_round_counts[index],
+                        "depth_policy": self.runtime_config.depth_policy_name,
+                        "group_index": index // debates_per_group,
+                        "debate_index_in_group": index % debates_per_group,
+                    },
+                    judge_prompt_tokens=judge_prompt_tokens[index],
+                    judge_completion_tokens=judge_completion_tokens[index],
+                    judge_completion_logprobs=judge_completion_logprobs[index],
+                    judge_raw_response=judge_raw_responses[index],
                 )
             )
-        return DebateRolloutOutput(debates=debates, info_lines=[f"Debates={len(debates)} rounds=3"])
+        depth_counts = {
+            depth: target_round_counts.count(depth)
+            for depth in sorted(set(target_round_counts))
+        }
+        assignments_by_group = [
+            target_round_counts[start : start + debates_per_group]
+            for start in range(0, len(target_round_counts), debates_per_group)
+        ]
+        return DebateRolloutOutput(
+            debates=debates,
+            info_lines=[
+                f"Debates={len(debates)} round_range="
+                f"{min(target_round_counts)}-{max(target_round_counts)} "
+                f"depth_policy={self.runtime_config.depth_policy_name} "
+                f"depth_counts={depth_counts} assignments_by_group={assignments_by_group}"
+            ],
+        )
 
-    def _rollout_two_rounds(self, *, instances_repeated: list[TaskInstance], step_seed: int | None) -> DebateRolloutOutput:
-        three_round_output = self._rollout_three_rounds(instances_repeated=instances_repeated, step_seed=step_seed)
-        debates = []
-        for debate in three_round_output.debates:
-            debates.append(
-                DebateResult(
-                    question=debate.question,
-                    ground_truth=debate.ground_truth,
-                    trajectory_a=DebateTrajectory(agent="A", transitions=debate.trajectory_a.transitions[:2], frozen_solution=debate.trajectory_a.frozen_solution, metrics=dict(debate.trajectory_a.metrics)),
-                    trajectory_b=DebateTrajectory(agent="B", transitions=debate.trajectory_b.transitions[:2], frozen_solution=debate.trajectory_b.frozen_solution, metrics=dict(debate.trajectory_b.metrics)),
-                    verdict=debate.verdict,
-                    judge_reasoning=debate.judge_reasoning,
-                    metrics=dict(debate.metrics),
-                    judge_prompt_tokens=debate.judge_prompt_tokens,
-                    judge_completion_tokens=debate.judge_completion_tokens,
-                    judge_completion_logprobs=debate.judge_completion_logprobs,
-                    judge_raw_response=debate.judge_raw_response,
-                )
-            )
-        return DebateRolloutOutput(debates=debates, info_lines=[f"Debates={len(debates)} rounds=2"])
-
-    def _rollout_r1_only(self, *, instances_repeated: list[TaskInstance], step_seed: int | None) -> DebateRolloutOutput:
+    def _rollout_r1_only(
+        self,
+        *,
+        instances_repeated: list[TaskInstance],
+        step_seed: int | None,
+        target_round_counts: list[int],
+    ) -> DebateRolloutOutput:
         use_base_text_prefill = self._use_base_text_prefill()
         base_r1_prompt_tokens = [
             (
@@ -1088,12 +1246,8 @@ class DebateRuntime:
                 verdict, reasoning = self._run_external_judge(
                     question=self.task.judge_context_text(inst=inst_a),
                     constitution=self.task.judge_constitution_text(inst=inst_a),
-                    r1_a=r1_visible_text[a_idx],
-                    r1_b=r1_visible_text[b_idx],
-                    r2_a="",
-                    r2_b="",
-                    r3_a="",
-                    r3_b="",
+                    rounds_a=[r1_visible_text[a_idx]],
+                    rounds_b=[r1_visible_text[b_idx]],
                 )
                 verdicts.append(verdict)
                 judge_reasonings.append(reasoning)
@@ -1102,7 +1256,15 @@ class DebateRuntime:
                 judge_completion_logprobs.append([])
                 judge_raw_responses.append({"external_judge": True, "raw_text": reasoning})
         elif self.runtime_config.judge_bidirectional:
-            empty_round_text = [""] * len(r1_visible_text)
+            transcripts = [
+                JudgeTranscript(
+                    question=self.task.judge_context_text(inst=inst_a),
+                    constitution=self.task.judge_constitution_text(inst=inst_a),
+                    agent_a=AgentDebateText(rounds=[r1_visible_text[2 * idx]]),
+                    agent_b=AgentDebateText(rounds=[r1_visible_text[2 * idx + 1]]),
+                )
+                for idx, (inst_a, _inst_b) in enumerate(inst_pairs)
+            ]
             (
                 verdicts,
                 judge_reasonings,
@@ -1111,11 +1273,8 @@ class DebateRuntime:
                 judge_completion_logprobs,
                 judge_raw_responses,
                 _judge_retry_flags,
-            ) = self._run_llm_judge_three_rounds(
-                inst_pairs=inst_pairs,
-                r1_visible_text=r1_visible_text,
-                r2_visible_text=empty_round_text,
-                r3_visible_text=empty_round_text,
+            ) = self._run_llm_judge_transcripts(
+                transcripts=transcripts,
                 step_seed=step_seed,
             )
         else:
@@ -1162,6 +1321,7 @@ class DebateRuntime:
                 judge_completion_logprobs.append(lps)
                 judge_raw_responses.append(raw)
         debates = []
+        debates_per_group = self.runtime_config.group_size // 2
         for idx, (inst_a, inst_b) in enumerate(inst_pairs):
             a_idx = 2 * idx
             b_idx = 2 * idx + 1
@@ -1173,36 +1333,38 @@ class DebateRuntime:
                     trajectory_b=DebateTrajectory(agent="B", transitions=[Transition(prompt_tokens=base_r1_prompt_tokens[b_idx], completion_tokens=r1_tokens[b_idx], completion_logprobs=r1_lps[b_idx], round_num=1, metrics={"solution": r1_sol[b_idx], "instance_id": inst_b.instance_id, "visible_text_metrics": r1_visible_metrics[b_idx]}, raw_response=r1_raw[b_idx])], frozen_solution=r1_sol[b_idx], metrics={"r1": r1_text[b_idx], "instance_id": inst_b.instance_id, "task_reward": r1_task_rewards[b_idx], "task_reward_metrics": r1_task_reward_metrics[b_idx]}),
                     verdict=verdicts[idx],
                     judge_reasoning=judge_reasonings[idx],
-                    metrics={"token_only_rollout": True, "task": self.task.name, "judge_retry": False},
+                    metrics={
+                        "token_only_rollout": True,
+                        "task": self.task.name,
+                        "judge_retry": False,
+                        "num_rounds": target_round_counts[idx],
+                        "depth_policy": self.runtime_config.depth_policy_name,
+                        "group_index": idx // debates_per_group,
+                        "debate_index_in_group": idx % debates_per_group,
+                    },
                     judge_prompt_tokens=judge_prompt_tokens[idx],
                     judge_completion_tokens=judge_completion_tokens[idx],
                     judge_completion_logprobs=judge_completion_logprobs[idx],
                     judge_raw_response=judge_raw_responses[idx],
                 )
             )
-        return DebateRolloutOutput(debates=debates, info_lines=[f"Debates={len(debates)} rounds=1"])
+        return DebateRolloutOutput(
+            debates=debates,
+            info_lines=[f"Debates={len(debates)} rounds=1"],
+        )
 
-    def _run_llm_judge_three_rounds(
+    def _run_llm_judge_transcripts(
         self,
         *,
-        inst_pairs: list[tuple[TaskInstance, TaskInstance]],
-        r1_visible_text: list[str],
-        r2_visible_text: list[str],
-        r3_visible_text: list[str],
+        transcripts: list[JudgeTranscript],
         step_seed: int | None,
     ) -> tuple[list[Verdict], list[str], list[list[int]], list[list[int]], list[list[float]], list[dict], list[bool]]:
         forward_prompt_tokens = self._judge_prompts(
-            inst_pairs=inst_pairs,
-            r1_visible_text=r1_visible_text,
-            r2_visible_text=r2_visible_text,
-            r3_visible_text=r3_visible_text,
+            transcripts=transcripts,
         )
         reverse_prompt_tokens = (
             self._judge_prompts(
-                inst_pairs=inst_pairs,
-                r1_visible_text=r1_visible_text,
-                r2_visible_text=r2_visible_text,
-                r3_visible_text=r3_visible_text,
+                transcripts=transcripts,
                 reverse_order=True,
             )
             if self.runtime_config.judge_bidirectional
@@ -1244,7 +1406,7 @@ class DebateRuntime:
                 tokenizer=self.tokenizer,
                 contract_name=self.runtime_config.judge_label_token_contract,
             )
-            debate_count = len(inst_pairs)
+            debate_count = len(transcripts)
             final_verdicts: list[Verdict] = []
             final_reasonings: list[str] = []
             final_raw_responses: list[dict] = []
@@ -1371,7 +1533,7 @@ class DebateRuntime:
         if not self.runtime_config.judge_bidirectional:
             return verdicts, reasonings, prompt_tokens, completion_tokens, completion_logprobs, raw_responses, retry_flags
 
-        debate_count = len(inst_pairs)
+        debate_count = len(transcripts)
         final_verdicts: list[Verdict] = []
         final_reasonings: list[str] = []
         final_raw_responses: list[dict] = []

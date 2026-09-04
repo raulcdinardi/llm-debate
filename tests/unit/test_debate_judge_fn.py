@@ -5,13 +5,17 @@ from dataclasses import dataclass, field
 import pytest
 
 from llm_local_rl.behavior_policy import BEHAVIOR_POLICY_LOGPROBS, BehaviorPolicySpec
+from llm_local_rl.debate_depth import register_debate_depth_policy
 from llm_local_rl.debate_parity import DebateConfig
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
 from llm_local_rl.debate_tasks import HTSequenceDebateTask
 from llm_local_rl.judge_harness import (
+    AgentDebateText,
+    CHAT_SOLUTION_TAGGED_V1,
     CONSTITUTION_SINGLE_TOKEN_V1,
     PAIRWISE_SINGLE_TOKEN_V1,
     SOLUTION_R1_RATIONALE_V1,
+    JudgeTranscript,
 )
 from llm_local_rl.types import SamplingRequest, SamplingResult
 
@@ -189,6 +193,150 @@ def test_external_judge_fn_short_circuits_three_round_policy_judge_sampling() ->
         "debate",
         "debate",
     ]
+
+
+def test_four_round_rollout_routes_r4_and_judges_the_complete_transcript() -> None:
+    tokenizer = TinyChatTokenizer()
+    sampler = RecordingSampler(tokenizer=tokenizer, requests=[])
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=4,
+            num_groups=1,
+            group_size=2,
+            judge_adapter="judge",
+            judge_harness_id=CHAT_SOLUTION_TAGGED_V1,
+        ),
+        adapter_layout="split",
+    )
+
+    debate = runtime.rollout(step_seed=0).debates[0]
+
+    assert [turn.round_num for turn in debate.trajectory_a.transitions] == [1, 2, 3, 4]
+    assert [request.adapter_name for request in sampler.requests] == [
+        "solution",
+        "solution",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+        "judge",
+    ]
+    judge_prompt = tokenizer.decode(debate.judge_prompt_tokens, skip_special_tokens=False)
+    assert "Round 4 (Response):" in judge_prompt
+    assert debate.trajectory_a.metrics["r4_completion_raw"]
+
+
+def test_one_rollout_can_mix_arbitrary_debate_depths_without_sampling_inactive_pairs() -> None:
+    tokenizer = TinyChatTokenizer()
+    sampler = RecordingSampler(tokenizer=tokenizer, requests=[])
+    seen_contexts = []
+
+    def generate_depths(context, params):
+        seen_contexts.append(context)
+        split = int(params["split"])
+        depths = [3, split] if context.group_index == 0 else [5, 6]
+        context.rng.shuffle(depths)
+        return depths
+
+    register_debate_depth_policy(
+        "test_group_conditional",
+        generate_depths,
+        minimum_rounds=3,
+    )
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=sampler,
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=6,
+            depth_policy_name="test_group_conditional",
+            depth_policy_params={"split": 4},
+            num_groups=2,
+            group_size=4,
+            judge_adapter="judge",
+            judge_harness_id=CHAT_SOLUTION_TAGGED_V1,
+        ),
+        adapter_layout="split",
+    )
+
+    output = runtime.rollout(step_seed=0, optimizer_step=9, rollout_index=2)
+
+    depths = [len(debate.trajectory_a.transitions) for debate in output.debates]
+    assert depths == [3, 4, 6, 5]
+    assert sorted(depths[:2]) == [3, 4]
+    assert sorted(depths[2:]) == [5, 6]
+    assert [context.group_index for context in seen_contexts] == [0, 1]
+    assert all(context.rollout_seed == 0 for context in seen_contexts)
+    assert all(context.optimizer_step == 9 for context in seen_contexts)
+    assert all(context.rollout_index == 2 for context in seen_contexts)
+    assert all(context.debates_per_group == 2 for context in seen_contexts)
+    assert all(context.max_rounds == 6 for context in seen_contexts)
+    assert all(context.group_instance_id for context in seen_contexts)
+    assert all(
+        debate.metrics["depth_policy"] == "test_group_conditional"
+        for debate in output.debates
+    )
+    assert [debate.metrics["group_index"] for debate in output.debates] == [0, 0, 1, 1]
+    assert [debate.metrics["debate_index_in_group"] for debate in output.debates] == [0, 1, 0, 1]
+    assert "assignments_by_group=[[3, 4], [6, 5]]" in output.info_lines[0]
+    assert [len(debate.trajectory_b.transitions) for debate in output.debates] == depths
+    assert sum(request.adapter_name == "solution" for request in sampler.requests) == 8
+    assert sum(request.adapter_name == "debate" for request in sampler.requests) == 28
+    assert sum(request.adapter_name == "judge" for request in sampler.requests) == 4
+    deep = output.debates[2].trajectory_a
+    r3_prompt = tokenizer.decode(deep.transitions[2].prompt_tokens, skip_special_tokens=False)
+    r4_prompt = tokenizer.decode(deep.transitions[3].prompt_tokens, skip_special_tokens=False)
+    assert "Round 3 (Response)" in r3_prompt
+    assert "Round 4 (Response)" in r4_prompt
+    assert "closing rebuttal" not in r4_prompt.lower()
+    deep_judge_prompt = tokenizer.decode(
+        output.debates[2].judge_prompt_tokens,
+        skip_special_tokens=False,
+    )
+    assert "Round 6 (Response):" in deep_judge_prompt
+
+
+def test_depth_multiset_is_repeated_per_group_then_deterministically_reshuffled() -> None:
+    tokenizer = TinyChatTokenizer()
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=RecordingSampler(tokenizer=tokenizer, requests=[]),
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=6,
+            depth_policy_name="shuffled_multiset",
+            depth_policy_params={"depths": [3, 4, 5, 6]},
+            num_groups=2,
+            group_size=8,
+            judge_adapter="judge",
+            judge_harness_id=CHAT_SOLUTION_TAGGED_V1,
+        ),
+        adapter_layout="split",
+    )
+
+    groups_zero = runtime.task.sample_instances(n=2, seed=0)
+    groups_one = runtime.task.sample_instances(n=2, seed=1)
+    seed_zero = runtime._target_round_counts(group_instances=groups_zero, step_seed=0)
+    repeated_seed_zero = runtime._target_round_counts(
+        group_instances=groups_zero,
+        step_seed=0,
+    )
+    seed_one = runtime._target_round_counts(group_instances=groups_one, step_seed=1)
+
+    assert seed_zero == [4, 5, 3, 6, 5, 6, 3, 4]
+    assert repeated_seed_zero == seed_zero
+    assert seed_one == [4, 5, 3, 6, 6, 5, 4, 3]
+    for assignment in (seed_zero, seed_one):
+        assert sorted(assignment[:4]) == [3, 4, 5, 6]
+        assert sorted(assignment[4:]) == [3, 4, 5, 6]
 
 
 def test_r1_only_bidirectional_judge_samples_both_orders_and_records_audit() -> None:
@@ -414,17 +562,17 @@ def test_base_sft_reverse_order_swaps_every_a_b_round_argument() -> None:
     instances = task.sample_instances(n=2, seed=3)
     inst_pairs = [(instances[0], instances[1])]
 
+    transcripts = [JudgeTranscript(
+        question=task.judge_context_text(inst=instances[0]),
+        constitution=task.judge_constitution_text(inst=instances[0]),
+        agent_a=AgentDebateText(rounds=["A1", "A2", "A3"]),
+        agent_b=AgentDebateText(rounds=["B1", "B2", "B3"]),
+    )]
     [forward_tokens] = runtime._judge_prompts(
-        inst_pairs=inst_pairs,
-        r1_visible_text=["A1", "B1"],
-        r2_visible_text=["A2", "B2"],
-        r3_visible_text=["A3", "B3"],
+        transcripts=transcripts,
     )
     [reverse_tokens] = runtime._judge_prompts(
-        inst_pairs=inst_pairs,
-        r1_visible_text=["A1", "B1"],
-        r2_visible_text=["A2", "B2"],
-        r3_visible_text=["A3", "B3"],
+        transcripts=transcripts,
         reverse_order=True,
     )
     forward = tokenizer.decode(forward_tokens)

@@ -851,8 +851,8 @@ class ConstrainedWritingDebateTask:
         opponent_round: int,
         opponent_answer: str,
     ) -> BaseTextDebateExtension:
-        if opponent_round not in {1, 2}:
-            raise ValueError(f"opponent_round must be 1 or 2, got {opponent_round}")
+        if opponent_round < 1:
+            raise ValueError(f"opponent_round must be at least 1, got {opponent_round}")
         constitution = self.judge_constitution_text(inst=inst)
         if opponent_round == 1:
             system_text = (
@@ -868,15 +868,16 @@ class ConstrainedWritingDebateTask:
             )
             assistant_prefill = "The reasons that my solution is better than my opponent's are:\n1)"
         else:
+            round_num = opponent_round + 1
             system_text = (
-                "You are participating in Round 3 of a debate about which story best satisfies the user.\n"
+                f"You are participating in Round {round_num} of a debate about which story best satisfies the user.\n"
                 "Your Round 1 story is fixed and cannot change.\n"
-                "Respond to the opponent's Round 2 argument and make your final case.\n"
+                f"Respond to the opponent's Round {opponent_round} argument and reinforce your case.\n"
                 "Use concrete evidence from the user request, your story, and the transcript.\n"
                 "Do not emit <think> tags."
             )
             instruction = (
-                "Make your final case that your fixed story best satisfies the user under the constitution. "
+                "Continue the case that your fixed story best satisfies the user under the constitution. "
                 "Focus on the strongest evidence and the opponent's weakest point."
             )
             assistant_prefill = "Responding to my opponent's criticism:\n1)"

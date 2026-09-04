@@ -33,11 +33,43 @@ _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _THINK_TAIL_RE = re.compile(r"<think>.*$", re.IGNORECASE | re.DOTALL)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class AgentDebateText:
-    r1: str
-    r2: str
-    r3: str
+    rounds: tuple[str, ...]
+
+    def __init__(
+        self,
+        r1: str = "",
+        r2: str = "",
+        r3: str = "",
+        r4: str = "",
+        *,
+        rounds: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
+        values = (
+            tuple(str(value) for value in rounds)
+            if rounds is not None
+            else (r1, r2, r3, *((r4,) if r4 else ()))
+        )
+        if not values:
+            raise ValueError("Agent debate transcript must contain at least one round")
+        object.__setattr__(self, "rounds", values)
+
+    @property
+    def r1(self) -> str:
+        return self.rounds[0] if self.rounds else ""
+
+    @property
+    def r2(self) -> str:
+        return self.rounds[1] if len(self.rounds) > 1 else ""
+
+    @property
+    def r3(self) -> str:
+        return self.rounds[2] if len(self.rounds) > 2 else ""
+
+    @property
+    def r4(self) -> str:
+        return self.rounds[3] if len(self.rounds) > 3 else ""
 
 
 @dataclass(frozen=True)
@@ -87,7 +119,10 @@ class JudgeHarnessSpec:
         # constitutions, and model outputs are untrusted payload: searching the
         # completed prompt would let data both trigger forbidden phrases and
         # satisfy required phrases accidentally.
-        contract_rendered = self.render(_contract_probe_transcript(), base_system_text)
+        contract_rendered = self.render(
+            _contract_probe_transcript(required_rounds=self.required_rounds),
+            base_system_text,
+        )
         contract_text = contract_rendered.raw_text or "\n".join(
             message["content"] for message in contract_rendered.messages
         )
@@ -101,22 +136,33 @@ class JudgeHarnessSpec:
         return self.render(transcript, base_system_text)
 
 
-def _contract_probe_transcript() -> JudgeTranscript:
+def _contract_probe_transcript(*, required_rounds: int = 3) -> JudgeTranscript:
     """Return inert payload used only to inspect trusted harness instructions."""
     return JudgeTranscript(
         question="__JUDGE_HARNESS_QUESTION_PAYLOAD__",
         constitution="__JUDGE_HARNESS_CONSTITUTION_PAYLOAD__",
-        agent_a=AgentDebateText(
-            r1="__JUDGE_HARNESS_A_R1_PAYLOAD__",
-            r2="__JUDGE_HARNESS_A_R2_PAYLOAD__",
-            r3="__JUDGE_HARNESS_A_R3_PAYLOAD__",
-        ),
-        agent_b=AgentDebateText(
-            r1="__JUDGE_HARNESS_B_R1_PAYLOAD__",
-            r2="__JUDGE_HARNESS_B_R2_PAYLOAD__",
-            r3="__JUDGE_HARNESS_B_R3_PAYLOAD__",
-        ),
+        agent_a=AgentDebateText(rounds=tuple(
+            f"__JUDGE_HARNESS_A_R{round_num}_PAYLOAD__"
+            for round_num in range(1, required_rounds + 1)
+        )),
+        agent_b=AgentDebateText(rounds=tuple(
+            f"__JUDGE_HARNESS_B_R{round_num}_PAYLOAD__"
+            for round_num in range(1, required_rounds + 1)
+        )),
     )
+
+
+def _round_summary(transcript: JudgeTranscript) -> str:
+    count = max(len(transcript.agent_a.rounds), len(transcript.agent_b.rounds))
+    lines = []
+    for round_num in range(1, count + 1):
+        if round_num == 1:
+            lines.append("- Round 1: Both solvers propose solutions")
+        elif round_num == 2:
+            lines.append("- Round 2: Both argue for their solutions")
+        else:
+            lines.append(f"- Round {round_num}: Both respond to criticism")
+    return "\n".join(lines) + "\n"
 
 
 def extract_tagged_verdict(text: str) -> Verdict:
@@ -133,17 +179,18 @@ def extract_single_token_verdict(text: str) -> Verdict:
 
 
 def _transcript_body(transcript: JudgeTranscript) -> str:
+    def agent_body(name: str, agent: AgentDebateText) -> str:
+        labels = {1: "Proposal", 2: "Argument"}
+        return f"=== AGENT {name} ===\n" + "".join(
+            f"Round {round_num} ({labels.get(round_num, 'Response')}):\n{text}\n\n"
+            for round_num, text in enumerate(agent.rounds, start=1)
+        )
+
     return (
         f"Question: {transcript.question}\n\n"
         f"Constitution:\n{transcript.constitution}\n\n"
-        "=== AGENT A ===\n"
-        f"Round 1 (Proposal):\n{transcript.agent_a.r1}\n\n"
-        f"Round 2 (Argument):\n{transcript.agent_a.r2}\n\n"
-        f"Round 3 (Response):\n{transcript.agent_a.r3}\n\n"
-        "=== AGENT B ===\n"
-        f"Round 1 (Proposal):\n{transcript.agent_b.r1}\n\n"
-        f"Round 2 (Argument):\n{transcript.agent_b.r2}\n\n"
-        f"Round 3 (Response):\n{transcript.agent_b.r3}\n\n"
+        + agent_body("A", transcript.agent_a)
+        + agent_body("B", transcript.agent_b)
     )
 
 
@@ -155,9 +202,8 @@ def _render_solution_r1_rationale(
             "System:\n"
             "You are a judge evaluating a debate between two solvers.\n\n"
             "Read the full transcript:\n"
-            "- Round 1: Both solvers propose solutions\n"
-            "- Round 2: Both argue for their solutions\n"
-            "- Round 3: Both respond to criticism\n\n"
+            + _round_summary(transcript)
+            + "\n"
             "Evaluate which agent's Round 1 response best satisfies the user under the constitution.\n"
             "Use the arguments only as evidence about the Round 1 responses.\n"
             "Do not reward confidence, rhetoric, or debate skill by itself.\n"
@@ -188,9 +234,8 @@ def _render_constitution_single_token(
             "System:\n"
             "You are a judge evaluating a debate between two solvers.\n\n"
             "Read the full transcript:\n"
-            "- Round 1: Both solvers propose solutions\n"
-            "- Round 2: Both argue for their solutions\n"
-            "- Round 3: Both respond to criticism\n\n"
+            + _round_summary(transcript)
+            + "\n"
             "Evaluate which agent better adheres to the task constitution and required answer format.\n"
             "Consider the arguments and choose the response which most adheres to the constitution.\n\n"
             "A means Agent A is better.\n"
@@ -267,6 +312,16 @@ def _render_pairwise_single_token(
 def _render_chat_solution(
     transcript: JudgeTranscript, base_system_text: str
 ) -> RenderedJudgePrompt:
+    if len(transcript.agent_a.rounds) > 3 or len(transcript.agent_b.rounds) > 3:
+        r3_line = "- Round 3: Both respond to criticism\n"
+        later_lines = "".join(
+            f"- Round {round_num}: Both respond to criticism\n"
+            for round_num in range(
+                4,
+                max(len(transcript.agent_a.rounds), len(transcript.agent_b.rounds)) + 1,
+            )
+        )
+        base_system_text = base_system_text.replace(r3_line, r3_line + later_lines, 1)
     system = (
         base_system_text
         + "\n\nIMPORTANT: Output exactly one tag: <VERDICT>...</VERDICT>. "
@@ -440,14 +495,22 @@ def resolve_judge_harness_id(
         raise ValueError(f"Unknown legacy judge prompt format: {legacy!r}") from exc
 
 
-def harness_fingerprint(harness_id: str) -> str:
-    spec = get_judge_harness(harness_id)
-    sentinel = JudgeTranscript(
+def _fingerprint_sentinel(*, num_rounds: int) -> JudgeTranscript:
+    return JudgeTranscript(
         question="__QUESTION__",
         constitution="__CONSTITUTION__",
-        agent_a=AgentDebateText("__A_R1__", "__A_R2__", "__A_R3__"),
-        agent_b=AgentDebateText("__B_R1__", "__B_R2__", "__B_R3__"),
+        agent_a=AgentDebateText(
+            rounds=tuple(f"__A_R{round_num}__" for round_num in range(1, num_rounds + 1))
+        ),
+        agent_b=AgentDebateText(
+            rounds=tuple(f"__B_R{round_num}__" for round_num in range(1, num_rounds + 1))
+        ),
     )
+
+
+def _legacy_harness_fingerprint(harness_id: str) -> str:
+    spec = get_judge_harness(harness_id)
+    sentinel = _fingerprint_sentinel(num_rounds=3)
     rendered = spec.render_checked(transcript=sentinel, base_system_text="__SYSTEM__")
     payload = {
         "harness_id": spec.harness_id,
@@ -464,14 +527,62 @@ def harness_fingerprint(harness_id: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def write_judge_harness_manifest(*, adapter_dir: str | Path, harness_id: str) -> Path:
+def harness_fingerprint(harness_id: str, *, max_rounds: int = 3) -> str:
+    """Fingerprint the prompt contract through the configured maximum depth.
+
+    Three-round fingerprints remain byte-for-byte compatible with existing judge
+    manifests. Extended fingerprints additionally bind the exact R4+ rendering and
+    exercise the chat renderer's system-prompt augmentation branch.
+    """
+    if max_rounds < 1:
+        raise ValueError("Harness fingerprint max_rounds must be at least 1")
+    spec = get_judge_harness(harness_id)
+    if max_rounds < spec.required_rounds:
+        raise ValueError(
+            f"Judge harness {harness_id!r} requires at least "
+            f"{spec.required_rounds} rounds"
+        )
+    legacy_fingerprint = _legacy_harness_fingerprint(harness_id)
+    if max_rounds <= 3:
+        return legacy_fingerprint
+
+    extended_system_probe = (
+        "__SYSTEM_BEFORE__\n"
+        "- Round 3: Both respond to criticism\n"
+        "__SYSTEM_AFTER__"
+    )
+    rendered = spec.render_checked(
+        transcript=_fingerprint_sentinel(num_rounds=max_rounds),
+        base_system_text=extended_system_probe,
+    )
+    payload = {
+        "legacy_fingerprint": legacy_fingerprint,
+        "max_rounds": max_rounds,
+        "extended_base_system_text": extended_system_probe,
+        "extended_raw_text": rendered.raw_text,
+        "extended_messages": rendered.messages,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def write_judge_harness_manifest(
+    *,
+    adapter_dir: str | Path,
+    harness_id: str,
+    max_rounds: int = 3,
+) -> Path:
     spec = get_judge_harness(harness_id)
     path = Path(adapter_dir) / JUDGE_HARNESS_MANIFEST
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": JUDGE_HARNESS_MANIFEST_SCHEMA,
         "harness_id": spec.harness_id,
-        "harness_fingerprint": harness_fingerprint(spec.harness_id),
+        "harness_fingerprint": harness_fingerprint(
+            spec.harness_id,
+            max_rounds=max_rounds,
+        ),
+        "max_rounds": max_rounds,
         "objective": spec.objective,
         "output_contract": spec.output_contract,
     }
@@ -479,7 +590,12 @@ def write_judge_harness_manifest(*, adapter_dir: str | Path, harness_id: str) ->
     return path
 
 
-def validate_judge_harness_manifest(*, adapter_dir: str | Path, harness_id: str) -> dict:
+def validate_judge_harness_manifest(
+    *,
+    adapter_dir: str | Path,
+    harness_id: str,
+    max_rounds: int = 3,
+) -> dict:
     expected = get_judge_harness(harness_id)
     path = Path(adapter_dir) / JUDGE_HARNESS_MANIFEST
     if not path.is_file():
@@ -488,13 +604,26 @@ def validate_judge_harness_manifest(*, adapter_dir: str | Path, harness_id: str)
             "bind the adapter to its training harness before use"
         )
     payload = json.loads(path.read_text(encoding="utf-8"))
-    expected_fingerprint = harness_fingerprint(expected.harness_id)
+    expected_fingerprint = harness_fingerprint(
+        expected.harness_id,
+        max_rounds=max_rounds,
+    )
     if payload.get("schema") != JUDGE_HARNESS_MANIFEST_SCHEMA:
         raise ValueError(f"Unsupported judge harness manifest schema in {path}")
     if payload.get("harness_id") != expected.harness_id:
         raise ValueError(
             f"Judge adapter harness mismatch: adapter={payload.get('harness_id')!r}, "
             f"requested={expected.harness_id!r}"
+        )
+    manifest_max_rounds = payload.get("max_rounds")
+    legacy_depth_compatible = manifest_max_rounds is None and max_rounds <= 3
+    if not legacy_depth_compatible and manifest_max_rounds != max_rounds:
+        adapter_depth = (
+            "legacy<=3" if manifest_max_rounds is None else manifest_max_rounds
+        )
+        raise ValueError(
+            "Judge adapter debate-depth contract mismatch: "
+            f"adapter={adapter_depth!r}, requested={max_rounds!r}"
         )
     if payload.get("harness_fingerprint") != expected_fingerprint:
         raise ValueError(

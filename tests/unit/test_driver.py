@@ -55,6 +55,7 @@ def test_driver_binds_saved_judge_and_rejects_unbound_initial_judge(tmp_path) ->
         model_path="/tmp/nonexistent_model_for_shape_only",
         output_dir=str(tmp_path / "out"),
         adapter_layout="split",
+        debate_rounds=4,
         debate_judge_adapter="judge",
         debate_judge_harness=SOLUTION_R1_RATIONALE_V1,
     )
@@ -68,8 +69,10 @@ def test_driver_binds_saved_judge_and_rejects_unbound_initial_judge(tmp_path) ->
     payload = validate_judge_harness_manifest(
         adapter_dir=judge_dir,
         harness_id=SOLUTION_R1_RATIONALE_V1,
+        max_rounds=4,
     )
     assert payload["harness_id"] == SOLUTION_R1_RATIONALE_V1
+    assert payload["max_rounds"] == 4
 
 
 def test_config_and_manifest_roundtrip() -> None:

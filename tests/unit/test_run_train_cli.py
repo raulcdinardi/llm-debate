@@ -6,12 +6,19 @@ import shlex
 
 import pytest
 
-from scripts.run_train import _parse_csv_tuple, _parse_init_adapter_dirs, parse_args
+from scripts.run_train import (
+    _parse_csv_tuple,
+    _parse_init_adapter_dirs,
+    _resolve_debate_depth_policy_args,
+    parse_args,
+)
 from llm_local_rl.config import RolloutConfig, TrainRunConfig
 from llm_local_rl.judge_harness import (
+    CHAT_SOLUTION_TAGGED_V1,
     CONSTITUTION_SINGLE_TOKEN_V1,
     CONSULTANCY_SINGLE_TOKEN_V1,
     SOLUTION_R1_RATIONALE_V1,
+    resolve_judge_harness_id,
 )
 
 
@@ -70,6 +77,141 @@ def test_cli_defaults_all_sampling_temperatures_to_one() -> None:
     assert args.debate_judge_bidirectional is False
     assert args.debate_judge_constrain_single_token is False
     assert args.judge_grpo_reward_mode == "coherence"
+    assert args.debate_rounds_per_group == []
+    assert args.debate_depth_policy == "fixed"
+    assert args.debate_depth_policy_params_json == "{}"
+
+
+def test_cli_accepts_arbitrary_heterogeneous_debate_depth() -> None:
+    args = parse_args(
+        [
+            "--model-path",
+            "/tmp/model",
+            "--output-dir",
+            "/tmp/out",
+            "--debate-rounds",
+            "7",
+            "--debate-rounds-per-group",
+            "3",
+            "7",
+            "4",
+            "6",
+        ]
+    )
+
+    assert args.debate_rounds_per_group == [3, 7, 4, 6]
+    assert _resolve_debate_depth_policy_args(args) == (
+        "shuffled_multiset",
+        {"depths": [3, 7, 4, 6]},
+    )
+
+    assert resolve_judge_harness_id(harness_id=None, num_rounds=7) == CHAT_SOLUTION_TAGGED_V1
+    assert args.debate_round_adapter_names == ["solution", "debate", "debate"]
+
+
+def test_config_repeats_last_adapter_for_arbitrary_round_depth() -> None:
+    config = TrainRunConfig(
+        model_path="/tmp/model",
+        output_dir="/tmp/out",
+        debate_rounds=7,
+        debate_depth_policy="shuffled_multiset",
+        debate_depth_policy_params={"depths": [3, 7, 4, 6]},
+    )
+
+    assert config.effective_debate_min_rounds() == 3
+    assert config.effective_debate_max_rounds() == 7
+    restored = TrainRunConfig.from_dict(config.to_dict())
+    assert restored.debate_depth_policy == "shuffled_multiset"
+    assert restored.debate_depth_policy_params == {"depths": [3, 7, 4, 6]}
+    assert config.resolved_debate_round_adapter_names() == (
+        "solution",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+    )
+
+
+def test_config_rejects_depth_array_that_does_not_match_debates_per_group() -> None:
+    with pytest.raises(ValueError, match="exactly one value per debate"):
+        TrainRunConfig(
+            model_path="/tmp/model",
+            output_dir="/tmp/out",
+            debate_rounds=6,
+            debate_depth_policy="shuffled_multiset",
+            debate_depth_policy_params={"depths": [3, 4, 5]},
+        )
+
+
+def test_config_rejects_nonpositive_depth_in_group_array() -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        TrainRunConfig(
+            model_path="/tmp/model",
+            output_dir="/tmp/out",
+            debate_rounds=6,
+            debate_depth_policy="shuffled_multiset",
+            debate_depth_policy_params={"depths": [3, 4, 0, 6]},
+        )
+
+
+def test_cli_resolves_registered_policy_name_and_json_params() -> None:
+    args = parse_args(
+        [
+            "--model-path",
+            "/tmp/model",
+            "--output-dir",
+            "/tmp/out",
+            "--debate-depth-policy",
+            "categorical",
+            "--debate-depth-policy-params-json",
+            '{"depths":[3,4],"weights":[1,2]}',
+        ]
+    )
+
+    assert _resolve_debate_depth_policy_args(args) == (
+        "categorical",
+        {"depths": [3, 4], "weights": [1, 2]},
+    )
+
+
+def test_cli_rejects_conflicting_depth_policy_surfaces() -> None:
+    args = parse_args(
+        [
+            "--model-path",
+            "/tmp/model",
+            "--output-dir",
+            "/tmp/out",
+            "--debate-depth-policy",
+            "categorical",
+            "--debate-rounds-per-group",
+            "3",
+            "3",
+            "4",
+            "4",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _resolve_debate_depth_policy_args(args)
+
+
+def test_previous_depth_array_config_migrates_to_registered_policy() -> None:
+    payload = TrainRunConfig(
+        model_path="/tmp/model",
+        output_dir="/tmp/out",
+    ).to_dict()
+    payload.pop("debate_depth_policy")
+    payload.pop("debate_depth_policy_params")
+    payload["debate_rounds"] = 3
+    payload["debate_rounds_per_group"] = [3, 7, 4, 6]
+
+    restored = TrainRunConfig.from_dict(payload)
+
+    assert restored.debate_rounds == 7
+    assert restored.debate_depth_policy == "shuffled_multiset"
+    assert restored.debate_depth_policy_params == {"depths": [3, 7, 4, 6]}
 
 
 def test_cli_accepts_frozen_single_token_judge_constraint() -> None:

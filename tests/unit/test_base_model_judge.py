@@ -124,6 +124,25 @@ def test_versioned_harness_fingerprints_are_golden() -> None:
     assert harness_fingerprint(CONSTITUTION_SINGLE_TOKEN_V1) == (
         "2b8f61287b142bf6c82251d146b470b017cab6ea321fba8421e20490bdada930"
     )
+    assert harness_fingerprint(CHAT_SOLUTION_TAGGED_V1, max_rounds=4) == (
+        "a29bee8de7864beef424d998d712eca7099c41db66e49acad5eabc36f446fbe9"
+    )
+    assert harness_fingerprint(SOLUTION_R1_RATIONALE_V1, max_rounds=4) == (
+        "ce0b8715b6276eed47c5d369f99d2f2aefc49d4437eb1be194bac1cb5c56c6c7"
+    )
+    assert harness_fingerprint(CONSTITUTION_SINGLE_TOKEN_V1, max_rounds=4) == (
+        "834a868857ef85924906ec593fa939a659ef9934053f9488aeeb023f7aded03b"
+    )
+
+
+def test_extended_harness_fingerprint_binds_exact_maximum_depth() -> None:
+    legacy = harness_fingerprint(CHAT_SOLUTION_TAGGED_V1)
+    round_four = harness_fingerprint(CHAT_SOLUTION_TAGGED_V1, max_rounds=4)
+    round_six = harness_fingerprint(CHAT_SOLUTION_TAGGED_V1, max_rounds=6)
+
+    assert len({legacy, round_four, round_six}) == 3
+    with pytest.raises(ValueError, match="requires at least 3 rounds"):
+        harness_fingerprint(CHAT_SOLUTION_TAGGED_V1, max_rounds=2)
 
 
 def test_single_token_harness_owns_its_parser_and_output_budget() -> None:
@@ -170,6 +189,51 @@ def test_adapter_manifest_binds_exact_harness_and_fingerprint(tmp_path) -> None:
             adapter_dir=adapter,
             harness_id=SOLUTION_R1_RATIONALE_V1,
         )
+
+
+def test_extended_adapter_manifest_binds_debate_depth_contract(tmp_path) -> None:
+    adapter = tmp_path / "judge"
+    adapter.mkdir()
+    write_judge_harness_manifest(
+        adapter_dir=adapter,
+        harness_id=SOLUTION_R1_RATIONALE_V1,
+        max_rounds=4,
+    )
+
+    payload = validate_judge_harness_manifest(
+        adapter_dir=adapter,
+        harness_id=SOLUTION_R1_RATIONALE_V1,
+        max_rounds=4,
+    )
+    assert payload["max_rounds"] == 4
+    assert payload["harness_fingerprint"] == harness_fingerprint(
+        SOLUTION_R1_RATIONALE_V1,
+        max_rounds=4,
+    )
+    with pytest.raises(ValueError, match="debate-depth contract mismatch"):
+        validate_judge_harness_manifest(
+            adapter_dir=adapter,
+            harness_id=SOLUTION_R1_RATIONALE_V1,
+            max_rounds=5,
+        )
+
+
+def test_pre_depth_manifest_remains_valid_for_legacy_three_round_contract(tmp_path) -> None:
+    adapter = tmp_path / "judge"
+    adapter.mkdir()
+    manifest_path = write_judge_harness_manifest(
+        adapter_dir=adapter,
+        harness_id=SOLUTION_R1_RATIONALE_V1,
+    )
+    payload = json.loads(manifest_path.read_text())
+    payload.pop("max_rounds")
+    manifest_path.write_text(json.dumps(payload))
+
+    validate_judge_harness_manifest(
+        adapter_dir=adapter,
+        harness_id=SOLUTION_R1_RATIONALE_V1,
+        max_rounds=3,
+    )
 
 
 def test_adapter_manifest_is_required(tmp_path) -> None:

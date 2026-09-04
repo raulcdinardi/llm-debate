@@ -20,6 +20,7 @@ class RemoteBaseJudgeConfig:
     url: str
     harness_id: str
     timeout_s: float = 600.0
+    max_rounds: int = 3
 
     def __post_init__(self) -> None:
         harness = get_judge_harness(self.harness_id)
@@ -28,27 +29,37 @@ class RemoteBaseJudgeConfig:
                 "External HTTP judge supports only "
                 f"{SOLUTION_R1_RATIONALE_V1!r}; got {harness.harness_id!r}"
             )
+        if self.max_rounds < harness.required_rounds:
+            raise ValueError(
+                f"External judge harness requires at least {harness.required_rounds} rounds"
+            )
 
 
 def build_remote_base_judge(config: RemoteBaseJudgeConfig):
     harness = get_judge_harness(config.harness_id)
-    fingerprint = harness_fingerprint(harness.harness_id)
+    fingerprint = harness_fingerprint(
+        harness.harness_id,
+        max_rounds=config.max_rounds,
+    )
 
     def judge(
         question: str,
         constitution: str,
-        r1_a: str,
-        r1_b: str,
-        r2_a: str,
-        r2_b: str,
-        r3_a: str,
-        r3_b: str,
+        *interleaved_round_texts: str,
     ) -> tuple[Verdict, str]:
+        if len(interleaved_round_texts) % 2 != 0 or not interleaved_round_texts:
+            raise ValueError("Judge requires one A/B text pair per debate round")
+        actual_rounds = len(interleaved_round_texts) // 2
+        if actual_rounds > config.max_rounds:
+            raise ValueError(
+                f"Judge received {actual_rounds} rounds above configured maximum "
+                f"{config.max_rounds}"
+            )
         transcript = JudgeTranscript(
             question=question,
             constitution=constitution,
-            agent_a=AgentDebateText(r1=r1_a, r2=r2_a, r3=r3_a),
-            agent_b=AgentDebateText(r1=r1_b, r2=r2_b, r3=r3_b),
+            agent_a=AgentDebateText(rounds=interleaved_round_texts[0::2]),
+            agent_b=AgentDebateText(rounds=interleaved_round_texts[1::2]),
         )
         rendered = harness.render_checked(transcript=transcript, base_system_text="")
         assert rendered.raw_text is not None

@@ -17,6 +17,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--adapter-dir", required=True)
     parser.add_argument("--harness", required=True, choices=judge_harness_ids())
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=3,
+        help="Maximum debate depth whose prompt contract the adapter was trained with.",
+    )
     return parser.parse_args(argv)
 
 
@@ -32,16 +38,19 @@ def main() -> int:
         validate_judge_harness_manifest(
             adapter_dir=adapter_dir,
             harness_id=args.harness,
+            max_rounds=args.max_rounds,
         )
         print(existing)
         return 0
     path = write_judge_harness_manifest(
         adapter_dir=adapter_dir,
         harness_id=args.harness,
+        max_rounds=args.max_rounds,
     )
     validate_judge_harness_manifest(
         adapter_dir=adapter_dir,
         harness_id=args.harness,
+        max_rounds=args.max_rounds,
     )
     print(path)
     return 0

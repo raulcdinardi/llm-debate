@@ -14,6 +14,7 @@ from llm_local_rl.debate_parity import (
     assemble_split_train_examples,
     assemble_training_data_by_mode,
     assemble_training_data_r1_r23,
+    summarize_generated_debate_format,
     summarize_judge_rejection_r1_projection,
 )
 
@@ -192,6 +193,161 @@ def _formatted_round(round_num: int) -> str:
         else "Responding to my opponent's criticism:\n1)"
     )
     return header + " first\n2) second\n3) third\nCONCLUDED"
+
+
+def _append_fourth_round(debate: DebateResult) -> DebateResult:
+    for trajectory, offset in ((debate.trajectory_a, 0), (debate.trajectory_b, 20)):
+        trajectory.transitions.append(
+            Transition(
+                prompt_tokens=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                completion_tokens=[21 + offset, 22 + offset],
+                completion_logprobs=[-0.7, -0.8],
+                round_num=4,
+            )
+        )
+    return debate
+
+
+def test_four_round_split_projection_merges_shared_later_adapter_reward_mass() -> None:
+    debate = _append_fourth_round(
+        _make_debate(
+            judge_raw_response={"bidirectional_judge": True, "order_invariant": True}
+        )
+    )
+
+    split = assemble_split_train_examples(
+        debates=[debate],
+        num_rounds=4,
+        round_adapter_names=("solution", "debate", "debate", "debate"),
+        r1_reward_mode="task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        r23_advantage_scope="merged_r23",
+    )
+
+    assert len(split["solution"]) == 2
+    assert len(split["debate"]) == 2
+    winner, loser = split["debate"]
+    assert winner.metadata["round_nums"] == [2, 3, 4]
+    assert winner.metadata["rounds_merged"] == 3
+    assert sum(winner.advantages) == pytest.approx(1.0)
+    assert sum(loser.advantages) == pytest.approx(-1.0)
+    assert all(
+        value == pytest.approx(1.0 / 6.0)
+        for value in winner.advantages
+        if value
+    )
+
+
+def test_projection_uses_each_debates_actual_depth_below_configured_maximum() -> None:
+    three_round = _make_debate(
+        question="three",
+        judge_raw_response={"bidirectional_judge": True, "order_invariant": True},
+    )
+    four_round = _append_fourth_round(
+        _make_debate(
+            question="four",
+            token_offset=50,
+            judge_raw_response={"bidirectional_judge": True, "order_invariant": True},
+        )
+    )
+
+    split = assemble_split_train_examples(
+        debates=[three_round, four_round],
+        num_rounds=6,
+        round_adapter_names=("solution", "debate"),
+        r1_reward_mode="task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        r23_advantage_scope="merged_r23",
+    )
+    assert [example.metadata["round_nums"] for example in split["debate"]] == [
+        [2, 3],
+        [2, 3],
+        [2, 3, 4],
+        [2, 3, 4],
+    ]
+
+    shared = assemble_training_data_by_mode(
+        debates=[three_round, four_round],
+        num_rounds=6,
+        r1_reward_mode="task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        r23_advantage_scope="merged_r23",
+    )
+    assert [datum.metadata["actual_num_rounds"] for datum in shared] == [3, 3, 4, 4]
+
+
+def test_format_summary_audits_every_generated_round_at_mixed_depths() -> None:
+    three_round = _make_debate(question="three")
+    four_round = _append_fourth_round(_make_debate(question="four", token_offset=50))
+    for debate in (three_round, four_round):
+        for trajectory in (debate.trajectory_a, debate.trajectory_b):
+            trajectory.metrics["r2"] = _formatted_round(2)
+            trajectory.metrics["r3"] = _formatted_round(3)
+    four_round.trajectory_a.metrics["r4"] = "malformed"
+    four_round.trajectory_b.metrics["r4"] = _formatted_round(4)
+
+    summary = summarize_generated_debate_format([three_round, four_round])
+
+    assert summary["schema"] == "base_text_raw_exact_generated_rounds_terminal_concluded_v3"
+    assert summary["generated_round_numbers"] == [2, 3, 4]
+    assert summary["generated_round_min"] == 2
+    assert summary["generated_round_max"] == 4
+    assert summary["round_outputs"] == 10
+    assert summary["trajectories_with_later_rounds"] == 4
+    assert summary["r2_outputs"] == 4
+    assert summary["r3_outputs"] == 4
+    assert summary["r4_outputs"] == 2
+    assert summary["r2_strict_rate"] == pytest.approx(1.0)
+    assert summary["r3_strict_rate"] == pytest.approx(1.0)
+    assert summary["r4_strict_rate"] == pytest.approx(0.5)
+    assert summary["all_round_outputs_strict_rate"] == pytest.approx(0.9)
+    assert summary["all_generated_rounds_strict_rate"] == pytest.approx(0.75)
+    assert "r5_strict_rate" not in summary
+    assert summary["rounds"]["r4"]["outputs"] == 2
+
+
+def test_r4_format_failure_penalty_reaches_only_generated_r4_tokens() -> None:
+    debate = _append_fourth_round(
+        _make_debate(
+            judge_raw_response={"bidirectional_judge": True, "order_invariant": True}
+        )
+    )
+    for trajectory in (debate.trajectory_a, debate.trajectory_b):
+        trajectory.metrics["r2"] = _formatted_round(2)
+        trajectory.metrics["r3"] = _formatted_round(3)
+        trajectory.metrics["r4"] = _formatted_round(4)
+    debate.trajectory_a.metrics["r4"] = "malformed"
+
+    split = assemble_split_train_examples(
+        debates=[debate],
+        num_rounds=6,
+        round_adapter_names=("solution", "debate"),
+        r1_reward_mode="task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        r23_advantage_scope="merged_r23",
+        r23_format_failure_penalty=-1.0,
+    )
+
+    winner, loser = split["debate"]
+    assert winner.metadata["round_nums"] == [2, 3, 4]
+    assert winner.metadata["r2_format_failure_penalty"] == 0.0
+    assert winner.metadata["r3_format_failure_penalty"] == 0.0
+    assert winner.metadata["r4_format_failure_penalty"] == -1.0
+    assert winner.metadata["r4_format_strict"] is False
+    assert loser.metadata["r4_format_failure_penalty"] == 0.0
+    assert loser.metadata["r4_format_strict"] is True
 
 
 def _soft_judge_audit(score: float, *, js: float = 0.0) -> dict[str, object]:
