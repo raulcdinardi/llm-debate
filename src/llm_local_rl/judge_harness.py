@@ -616,6 +616,22 @@ def validate_judge_harness_manifest(
             f"requested={expected.harness_id!r}"
         )
     manifest_max_rounds = payload.get("max_rounds")
+    # Inference extension is an explicit binding, not a claim that these
+    # weights were trained at the requested depth. Verify the original
+    # training identity before accepting an exact inference-format binding.
+    bindings = payload.get("inference_bindings", [])
+    if bindings:
+        training_depth = 3 if manifest_max_rounds is None else manifest_max_rounds
+        if payload.get("harness_fingerprint") != harness_fingerprint(
+            expected.harness_id, max_rounds=training_depth
+        ):
+            raise ValueError("Judge training harness fingerprint mismatch")
+        if any(
+            binding.get("max_rounds") == max_rounds
+            and binding.get("harness_fingerprint") == expected_fingerprint
+            for binding in bindings
+        ):
+            return payload
     legacy_depth_compatible = manifest_max_rounds is None and max_rounds <= 3
     if not legacy_depth_compatible and manifest_max_rounds != max_rounds:
         adapter_depth = (

@@ -356,7 +356,7 @@ def r3_continuation(
     system_text = (
         "You are participating in Round 3 of a debate about which story best satisfies the user.\n"
         "Your Round 1 story is fixed and cannot change.\n"
-        "Respond to the opponent's Round 2 argument and reinforce your case.\n"
+        "Respond to the opponent's Round 2 argument and make your final case.\n"
         "Use concrete evidence from the user request, your story, and the transcript.\n"
         "Do not emit <think> tags."
     )
@@ -364,7 +364,7 @@ def r3_continuation(
         f"Constitution:\n{constitution}\n\n"
         "Opponent Round 2 answer:\n"
         f"{opponent_r2}\n\n"
-        "Continue the case that your fixed story best satisfies the user under the constitution. "
+        "Make your final case that your fixed story best satisfies the user under the constitution. "
         "Focus on the strongest evidence and the opponent's weakest point.\n\n"
         f"Write exactly 3 short numbered points. After point 3, immediately output {SENTINEL} and nothing else.\n"
     )

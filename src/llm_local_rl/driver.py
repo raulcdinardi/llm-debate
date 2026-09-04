@@ -321,6 +321,21 @@ class TrainingDriver:
     def _write_saved_judge_harness(self, *, adapter_name: str, adapter_dir: str) -> None:
         if adapter_name != "judge" or self.config.debate_judge_adapter != "judge":
             return
+        if not self.config.train_judge and self.config.init_adapter_dirs:
+            source = self.config.init_adapter_dirs.get("judge")
+            if source:
+                # Frozen weights retain their training provenance, including
+                # any explicit exact-depth inference bindings.
+                validate_judge_harness_manifest(
+                    adapter_dir=source,
+                    harness_id=self.config.judge_harness().harness_id,
+                    max_rounds=self.config.effective_debate_max_rounds(),
+                )
+                destination = Path(adapter_dir) / "judge_harness.json"
+                original = Path(source) / "judge_harness.json"
+                if original.resolve() != destination.resolve():
+                    shutil.copyfile(original, destination)
+                return
         write_judge_harness_manifest(
             adapter_dir=adapter_dir,
             harness_id=self.config.judge_harness().harness_id,
@@ -1176,6 +1191,15 @@ class TrainingDriver:
                 "incoherent_r1": "seeded_coin_flip_winner_task_reward_plus_minus_q_delta",
                 "incoherent_r23_reward_per_trajectory": self.config.debate_incoherent_r23_reward,
             }
+        elif self.config.debate_r1_reward == "judge_soft_delta_task":
+            projection_record["r1_projection"] = {
+                "mode": "judge_soft_delta_task",
+                "formula": "task_reward_i +/- q*s*abs(task_reward_a-task_reward_b)",
+                "q": self.config.debate_r1_judge_delta_q,
+                "normalization_source": "modulated_task_rewards",
+                "judge_reliability_applied": False,
+                "task_order_cannot_reverse": self.config.debate_r1_judge_delta_q <= 0.5,
+            }
         elif self.config.debate_r1_reward == "judge_soft_task_gap":
             projection_record["r1_projection"] = {
                 "mode": "judge_soft_task_gap",
@@ -1195,6 +1219,15 @@ class TrainingDriver:
                 "mode": "soft_judge",
                 "formula": "reward_a=(1-J)*s; reward_b=-(1-J)*s",
                 "judge_reliability": "1 - referent_js_divergence/ln(2)",
+                "exact_zero_sum_per_debate": True,
+                "r23_constant_ignored": True,
+            }
+        if self.config.debate_r23_reward == "soft_judge_raw":
+            projection_record["r23_projection"] = {
+                "mode": "soft_judge_raw",
+                "formula": "reward_a=s; reward_b=-s",
+                "judge_reliability_applied": False,
+                "group_normalization_applied": False,
                 "exact_zero_sum_per_debate": True,
                 "r23_constant_ignored": True,
             }

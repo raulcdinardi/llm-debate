@@ -363,6 +363,43 @@ def _soft_judge_audit(score: float, *, js: float = 0.0) -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("rounds", [3, 4, 6])
+@pytest.mark.parametrize("q", [0.5, 1.0])
+@pytest.mark.parametrize("js", [0.0, 1.0])
+def test_cw_task_delta_normalization_and_raw_later_mass(rounds, q, js):
+    debates = [
+        _make_debate(reward_a=a, reward_b=b, judge_raw_response=_soft_judge_audit(s, js=js))
+        for a, b, s in [(1.0, 0.0, -0.75), (0.8, 0.4, 0.25), (0.5, 0.5, 1.0)]
+    ]
+    expected = []
+    for debate in debates:
+        a, b = (t.metrics["task_reward"] for t in (debate.trajectory_a, debate.trajectory_b))
+        s = debate.judge_raw_response["soft_score"]["score"]
+        expected.extend([a + q*s*abs(a-b), b - q*s*abs(a-b)])
+        for traj in (debate.trajectory_a, debate.trajectory_b):
+            for rn in range(4, rounds + 1):
+                last = traj.transitions[-1]
+                traj.transitions.append(Transition(
+                    prompt_tokens=last.prompt_tokens + last.completion_tokens + [99],
+                    completion_tokens=[31, 32], completion_logprobs=[-0.1, -0.2], round_num=rn,
+                ))
+            traj.metrics.update({f"r{rn}": _formatted_round(rn) for rn in range(2, rounds+1)})
+    result = assemble_split_train_examples(
+        debates=debates, num_rounds=rounds, round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="judge_soft_delta_task", r1_judge_delta_q=q,
+        r23_reward_mode="soft_judge_raw", r23_constant=99.0, r23_symmetric=True,
+        r23_advantage_scope="merged_r23", r23_format_failure_penalty=-1.0,
+        task_reward_fn=lambda t, d: t.metrics["task_reward"],
+    )
+    mean = sum(expected)/len(expected)
+    std = (sum((v-mean)**2 for v in expected)/len(expected))**0.5
+    assert [e.metadata["r1_modulated_reward"] for e in result["solution"]] == pytest.approx(expected)
+    assert [sum(e.advantages) for e in result["solution"]] == pytest.approx([(v-mean)/std for v in expected])
+    assert [sum(e.advantages) for e in result["debate"]] == pytest.approx([-0.75, 0.75, 0.25, -0.25, 1.0, -1.0])
+    assert (expected[0] < expected[1]) is (q == 1.0)
+    assert expected[4:6] == [0.5, 0.5]
+
+
 @pytest.mark.parametrize("js", [0.0, 0.5, 0.999, 1.0])
 def test_soft_judge_r1_preserves_task_baseline_and_scales_only_adjustment(js: float) -> None:
     debate = _make_debate(

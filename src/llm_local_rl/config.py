@@ -333,8 +333,8 @@ class TrainRunConfig:
                 )
         uses_soft_score = self.debate_judge_score_mode == "order_sym_soft_logit"
         uses_soft_reward = (
-            self.debate_r1_reward == "judge_soft_task_gap"
-            or self.debate_r23_reward == "soft_judge"
+            self.debate_r1_reward in ("judge_soft_task_gap", "judge_soft_delta_task")
+            or self.debate_r23_reward in ("soft_judge", "soft_judge_raw")
         )
         if uses_soft_score:
             if self.judge_label_token_contract not in (
@@ -383,9 +383,9 @@ class TrainRunConfig:
             )
         if uses_soft_reward and not uses_soft_score:
             raise ValueError("soft judge rewards require debate_judge_score_mode='order_sym_soft_logit'")
-        if self.debate_r1_reward == "judge_soft_task_gap" and self.rollout.mode != "debate":
+        if self.debate_r1_reward in ("judge_soft_task_gap", "judge_soft_delta_task") and self.rollout.mode != "debate":
             raise ValueError("judge_soft_task_gap is only valid for debate rollouts")
-        if self.debate_r23_reward == "soft_judge":
+        if self.debate_r23_reward in ("soft_judge", "soft_judge_raw"):
             if self.effective_debate_max_rounds() < 2:
                 raise ValueError("soft_judge R2/R3 reward requires at least two debate rounds")
             if self.debate_r23_mode != "symmetric":

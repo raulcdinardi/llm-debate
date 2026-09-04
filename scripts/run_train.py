@@ -118,11 +118,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="task",
         choices=[
             "task", "judge_pointwise", "judge", "judge_rejection_task",
-            "judge_delta_task", "judge_soft_task_gap", "none",
+            "judge_delta_task", "judge_soft_task_gap", "judge_soft_delta_task", "none",
         ],
     )
     parser.add_argument(
-        "--debate-r23-reward", default="constant", choices=["constant", "soft_judge", "none"]
+        "--debate-r23-reward", default="constant", choices=["constant", "soft_judge", "soft_judge_raw", "none"]
     )
     parser.add_argument("--debate-r23-constant", type=float, default=1.0)
     parser.add_argument("--debate-r1-judge-delta-q", type=float, default=1.0)

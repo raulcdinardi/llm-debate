@@ -872,12 +872,12 @@ class ConstrainedWritingDebateTask:
             system_text = (
                 f"You are participating in Round {round_num} of a debate about which story best satisfies the user.\n"
                 "Your Round 1 story is fixed and cannot change.\n"
-                f"Respond to the opponent's Round {opponent_round} argument and reinforce your case.\n"
+                f"Respond to the opponent's Round {opponent_round} argument and make your final case.\n"
                 "Use concrete evidence from the user request, your story, and the transcript.\n"
                 "Do not emit <think> tags."
             )
             instruction = (
-                "Continue the case that your fixed story best satisfies the user under the constitution. "
+                "Make your final case that your fixed story best satisfies the user under the constitution. "
                 "Focus on the strongest evidence and the opponent's weakest point."
             )
             assistant_prefill = "Responding to my opponent's criticism:\n1)"
