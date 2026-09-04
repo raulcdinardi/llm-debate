@@ -20,6 +20,7 @@ class RemoteBaseJudgeConfig:
     url: str
     harness_id: str
     timeout_s: float = 600.0
+    max_rounds: int = 3
 
     def __post_init__(self) -> None:
         harness = get_judge_harness(self.harness_id)
@@ -28,11 +29,18 @@ class RemoteBaseJudgeConfig:
                 "External HTTP judge supports only "
                 f"{SOLUTION_R1_RATIONALE_V1!r}; got {harness.harness_id!r}"
             )
+        if self.max_rounds < harness.required_rounds:
+            raise ValueError(
+                f"External judge harness requires at least {harness.required_rounds} rounds"
+            )
 
 
 def build_remote_base_judge(config: RemoteBaseJudgeConfig):
     harness = get_judge_harness(config.harness_id)
-    fingerprint = harness_fingerprint(harness.harness_id)
+    fingerprint = harness_fingerprint(
+        harness.harness_id,
+        max_rounds=config.max_rounds,
+    )
 
     def judge(
         question: str,
@@ -41,6 +49,12 @@ def build_remote_base_judge(config: RemoteBaseJudgeConfig):
     ) -> tuple[Verdict, str]:
         if len(interleaved_round_texts) % 2 != 0 or not interleaved_round_texts:
             raise ValueError("Judge requires one A/B text pair per debate round")
+        actual_rounds = len(interleaved_round_texts) // 2
+        if actual_rounds > config.max_rounds:
+            raise ValueError(
+                f"Judge received {actual_rounds} rounds above configured maximum "
+                f"{config.max_rounds}"
+            )
         transcript = JudgeTranscript(
             question=question,
             constitution=constitution,

@@ -315,6 +315,7 @@ class TrainingDriver:
         validate_judge_harness_manifest(
             adapter_dir=judge_dir,
             harness_id=self.config.judge_harness().harness_id,
+            max_rounds=self.config.effective_debate_max_rounds(),
         )
 
     def _write_saved_judge_harness(self, *, adapter_name: str, adapter_dir: str) -> None:
@@ -323,6 +324,7 @@ class TrainingDriver:
         write_judge_harness_manifest(
             adapter_dir=adapter_dir,
             harness_id=self.config.judge_harness().harness_id,
+            max_rounds=self.config.effective_debate_max_rounds(),
         )
 
     def _train_adapter_names(self) -> set[str] | None:
@@ -494,8 +496,10 @@ class TrainingDriver:
                 "tokenizer_path": self.config.tokenizer_path or self.config.model_path,
                 "behavior_policy_contract": self.config.behavior_policy().to_dict(),
                 "judge_harness_id": judge_harness.harness_id,
+                "judge_harness_max_rounds": self.config.effective_debate_max_rounds(),
                 "judge_harness_fingerprint": harness_fingerprint(
-                    judge_harness.harness_id
+                    judge_harness.harness_id,
+                    max_rounds=self.config.effective_debate_max_rounds(),
                 ),
             },
         )
@@ -712,6 +716,7 @@ class TrainingDriver:
                     url=self.config.debate_external_judge_url,
                     harness_id=judge_harness.harness_id,
                     timeout_s=self.config.debate_external_judge_timeout_s,
+                    max_rounds=self.config.effective_debate_max_rounds(),
                 )
             )
         elif getattr(self, "mock_judge", None) is not None:
@@ -1568,8 +1573,10 @@ class TrainingDriver:
                         "adapter_dirs": dict(self.current_adapter_dirs),
                         "judge_harness": {
                             "id": self.config.judge_harness().harness_id,
+                            "max_rounds": self.config.effective_debate_max_rounds(),
                             "fingerprint": harness_fingerprint(
-                                self.config.judge_harness().harness_id
+                                self.config.judge_harness().harness_id,
+                                max_rounds=self.config.effective_debate_max_rounds(),
                             ),
                         },
                         **extra_record,

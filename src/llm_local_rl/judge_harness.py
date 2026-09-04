@@ -495,14 +495,22 @@ def resolve_judge_harness_id(
         raise ValueError(f"Unknown legacy judge prompt format: {legacy!r}") from exc
 
 
-def harness_fingerprint(harness_id: str) -> str:
-    spec = get_judge_harness(harness_id)
-    sentinel = JudgeTranscript(
+def _fingerprint_sentinel(*, num_rounds: int) -> JudgeTranscript:
+    return JudgeTranscript(
         question="__QUESTION__",
         constitution="__CONSTITUTION__",
-        agent_a=AgentDebateText("__A_R1__", "__A_R2__", "__A_R3__"),
-        agent_b=AgentDebateText("__B_R1__", "__B_R2__", "__B_R3__"),
+        agent_a=AgentDebateText(
+            rounds=tuple(f"__A_R{round_num}__" for round_num in range(1, num_rounds + 1))
+        ),
+        agent_b=AgentDebateText(
+            rounds=tuple(f"__B_R{round_num}__" for round_num in range(1, num_rounds + 1))
+        ),
     )
+
+
+def _legacy_harness_fingerprint(harness_id: str) -> str:
+    spec = get_judge_harness(harness_id)
+    sentinel = _fingerprint_sentinel(num_rounds=3)
     rendered = spec.render_checked(transcript=sentinel, base_system_text="__SYSTEM__")
     payload = {
         "harness_id": spec.harness_id,
@@ -519,14 +527,62 @@ def harness_fingerprint(harness_id: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def write_judge_harness_manifest(*, adapter_dir: str | Path, harness_id: str) -> Path:
+def harness_fingerprint(harness_id: str, *, max_rounds: int = 3) -> str:
+    """Fingerprint the prompt contract through the configured maximum depth.
+
+    Three-round fingerprints remain byte-for-byte compatible with existing judge
+    manifests. Extended fingerprints additionally bind the exact R4+ rendering and
+    exercise the chat renderer's system-prompt augmentation branch.
+    """
+    if max_rounds < 1:
+        raise ValueError("Harness fingerprint max_rounds must be at least 1")
+    spec = get_judge_harness(harness_id)
+    if max_rounds < spec.required_rounds:
+        raise ValueError(
+            f"Judge harness {harness_id!r} requires at least "
+            f"{spec.required_rounds} rounds"
+        )
+    legacy_fingerprint = _legacy_harness_fingerprint(harness_id)
+    if max_rounds <= 3:
+        return legacy_fingerprint
+
+    extended_system_probe = (
+        "__SYSTEM_BEFORE__\n"
+        "- Round 3: Both respond to criticism\n"
+        "__SYSTEM_AFTER__"
+    )
+    rendered = spec.render_checked(
+        transcript=_fingerprint_sentinel(num_rounds=max_rounds),
+        base_system_text=extended_system_probe,
+    )
+    payload = {
+        "legacy_fingerprint": legacy_fingerprint,
+        "max_rounds": max_rounds,
+        "extended_base_system_text": extended_system_probe,
+        "extended_raw_text": rendered.raw_text,
+        "extended_messages": rendered.messages,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def write_judge_harness_manifest(
+    *,
+    adapter_dir: str | Path,
+    harness_id: str,
+    max_rounds: int = 3,
+) -> Path:
     spec = get_judge_harness(harness_id)
     path = Path(adapter_dir) / JUDGE_HARNESS_MANIFEST
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": JUDGE_HARNESS_MANIFEST_SCHEMA,
         "harness_id": spec.harness_id,
-        "harness_fingerprint": harness_fingerprint(spec.harness_id),
+        "harness_fingerprint": harness_fingerprint(
+            spec.harness_id,
+            max_rounds=max_rounds,
+        ),
+        "max_rounds": max_rounds,
         "objective": spec.objective,
         "output_contract": spec.output_contract,
     }
@@ -534,7 +590,12 @@ def write_judge_harness_manifest(*, adapter_dir: str | Path, harness_id: str) ->
     return path
 
 
-def validate_judge_harness_manifest(*, adapter_dir: str | Path, harness_id: str) -> dict:
+def validate_judge_harness_manifest(
+    *,
+    adapter_dir: str | Path,
+    harness_id: str,
+    max_rounds: int = 3,
+) -> dict:
     expected = get_judge_harness(harness_id)
     path = Path(adapter_dir) / JUDGE_HARNESS_MANIFEST
     if not path.is_file():
@@ -543,13 +604,26 @@ def validate_judge_harness_manifest(*, adapter_dir: str | Path, harness_id: str)
             "bind the adapter to its training harness before use"
         )
     payload = json.loads(path.read_text(encoding="utf-8"))
-    expected_fingerprint = harness_fingerprint(expected.harness_id)
+    expected_fingerprint = harness_fingerprint(
+        expected.harness_id,
+        max_rounds=max_rounds,
+    )
     if payload.get("schema") != JUDGE_HARNESS_MANIFEST_SCHEMA:
         raise ValueError(f"Unsupported judge harness manifest schema in {path}")
     if payload.get("harness_id") != expected.harness_id:
         raise ValueError(
             f"Judge adapter harness mismatch: adapter={payload.get('harness_id')!r}, "
             f"requested={expected.harness_id!r}"
+        )
+    manifest_max_rounds = payload.get("max_rounds")
+    legacy_depth_compatible = manifest_max_rounds is None and max_rounds <= 3
+    if not legacy_depth_compatible and manifest_max_rounds != max_rounds:
+        adapter_depth = (
+            "legacy<=3" if manifest_max_rounds is None else manifest_max_rounds
+        )
+        raise ValueError(
+            "Judge adapter debate-depth contract mismatch: "
+            f"adapter={adapter_depth!r}, requested={max_rounds!r}"
         )
     if payload.get("harness_fingerprint") != expected_fingerprint:
         raise ValueError(
