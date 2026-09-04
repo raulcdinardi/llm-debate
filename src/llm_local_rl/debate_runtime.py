@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, field
+import json
 import random
 import re
 
 from llm_local_rl.behavior_policy import validate_sampling_result_contract
+from llm_local_rl.debate_depth import (
+    DebateDepthContext,
+    generate_debate_depths,
+    validate_debate_depth_policy,
+)
 from llm_local_rl.judge_harness import (
     AgentDebateText,
     CHAT_SOLUTION_TAGGED_V1,
@@ -29,19 +35,6 @@ from llm_local_rl.types import RolloutSampler, SamplingRequest
 
 JudgeAdapterMode = str
 JudgeFn = Callable[..., tuple[Verdict, str]]
-
-
-@dataclass(frozen=True)
-class DebateRoundCountContext:
-    rollout_seed: int | None
-    group_index: int
-    num_groups: int
-    debates_per_group: int
-    max_rounds: int
-    rng: random.Random
-
-
-DebateRoundCountGenerator = Callable[[DebateRoundCountContext], Sequence[int]]
 
 _SOLUTION_RE = re.compile(r"<SOLUTION>(.*?)</SOLUTION>", re.IGNORECASE | re.DOTALL)
 _VERDICT_RE = re.compile(r"<VERDICT>\s*([AB])\s*</VERDICT>", re.IGNORECASE)
@@ -128,7 +121,8 @@ class DebateRolloutOutput:
 @dataclass(frozen=True)
 class DebateRuntimeConfig:
     num_rounds: int = 3
-    rounds_per_group: tuple[int, ...] = ()
+    depth_policy_name: str = "fixed"
+    depth_policy_params: dict[str, object] = field(default_factory=dict)
     num_groups: int = 1
     group_size: int = 2
     enable_thinking: bool | None = None
@@ -166,36 +160,39 @@ class DebateRuntimeConfig:
     def __post_init__(self) -> None:
         if self.num_rounds < 1:
             raise ValueError("num_rounds must be at least 1")
-        object.__setattr__(self, "rounds_per_group", tuple(self.rounds_per_group))
-        if self.rounds_per_group:
-            if self.group_size < 2 or self.group_size % 2 != 0:
-                raise ValueError("Debate requires an even group_size of at least 2")
-            expected_depths = self.group_size // 2
-            if len(self.rounds_per_group) != expected_depths:
-                raise ValueError(
-                    "rounds_per_group must contain exactly one depth per debate "
-                    f"({expected_depths} entries for group_size={self.group_size})"
-                )
-            if any(
-                not isinstance(depth, int) or isinstance(depth, bool) or depth < 1
-                for depth in self.rounds_per_group
-            ):
-                raise ValueError("rounds_per_group depths must all be positive integers")
-            if max(self.rounds_per_group) > self.num_rounds:
-                raise ValueError("rounds_per_group depths must not exceed num_rounds")
+        try:
+            depth_policy_params_json = json.dumps(
+                self.depth_policy_params,
+                sort_keys=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("depth_policy_params must be JSON-serializable") from exc
+        object.__setattr__(
+            self,
+            "depth_policy_params",
+            json.loads(depth_policy_params_json),
+        )
+        if self.group_size < 2 or self.group_size % 2 != 0:
+            raise ValueError("Debate requires an even group_size of at least 2")
+        validate_debate_depth_policy(
+            name=self.depth_policy_name,
+            params=self.depth_policy_params,
+            max_rounds=self.num_rounds,
+            debates_per_group=self.group_size // 2,
+        )
         if not self.round_adapter_names:
             raise ValueError("round_adapter_names must not be empty")
 
-    def configured_depths(self) -> tuple[int, ...]:
-        if self.rounds_per_group:
-            return self.rounds_per_group
-        return (self.num_rounds,) * max(1, self.group_size // 2)
-
     def effective_min_num_rounds(self) -> int:
-        return min(self.configured_depths())
+        return validate_debate_depth_policy(
+            name=self.depth_policy_name,
+            params=self.depth_policy_params,
+            max_rounds=self.num_rounds,
+            debates_per_group=self.group_size // 2,
+        )
 
     def effective_max_num_rounds(self) -> int:
-        return max(self.configured_depths())
+        return self.num_rounds
 
 
 @dataclass
@@ -278,13 +275,10 @@ class DebateRuntime:
         self,
         *,
         step_seed: int | None,
-        round_count_generator: DebateRoundCountGenerator | None = None,
+        optimizer_step: int | None = None,
+        rollout_index: int = 0,
     ) -> DebateRolloutOutput:
-        """Roll out debates, optionally generating depths independently for each group.
-
-        The callback is invoked once per group. Its returned order maps directly to
-        that group's debate slots; it may use ``context.rng`` for reproducible sampling.
-        """
+        """Roll out debates using the configured, registered depth policy."""
         if self.runtime_config.num_groups < 1:
             raise ValueError("Debate requires at least one group.")
         if (
@@ -292,13 +286,15 @@ class DebateRuntime:
             or self.runtime_config.group_size % 2 != 0
         ):
             raise ValueError("Debate requires even group_size of at least 2.")
-        n_debates = (
-            self.runtime_config.num_groups * self.runtime_config.group_size // 2
+        instances = self.task.sample_instances(
+            n=self.runtime_config.num_groups,
+            seed=step_seed,
         )
         target_round_counts = self._target_round_counts(
-            n_debates=n_debates,
+            group_instances=instances,
             step_seed=step_seed,
-            generator=round_count_generator,
+            optimizer_step=optimizer_step,
+            rollout_index=rollout_index,
         )
         harness = get_judge_harness(self.runtime_config.judge_harness_id)
         actual_min_rounds = min(target_round_counts)
@@ -308,7 +304,6 @@ class DebateRuntime:
                 f"{harness.required_rounds} rounds; generated minimum is "
                 f"{actual_min_rounds}"
             )
-        instances = self.task.sample_instances(n=self.runtime_config.num_groups, seed=step_seed)
         instances_repeated: list[TaskInstance] = []
         expander = getattr(self.task, "expand_group_instances", None)
         for group_idx, inst in enumerate(instances):
@@ -705,53 +700,44 @@ class DebateRuntime:
     def _target_round_counts(
         self,
         *,
-        n_debates: int,
+        group_instances: list[TaskInstance],
         step_seed: int | None,
-        generator: DebateRoundCountGenerator | None = None,
+        optimizer_step: int | None = None,
+        rollout_index: int = 0,
     ) -> list[int]:
-        schedule = self.runtime_config.configured_depths()
+        if len(group_instances) != self.runtime_config.num_groups:
+            raise ValueError("Depth policy requires exactly one instance per group")
         counts: list[int] = []
         debates_per_group = self.runtime_config.group_size // 2
-        for group_index in range(self.runtime_config.num_groups):
+        for group_index, instance in enumerate(group_instances):
             seed = (
                 None
                 if step_seed is None
                 else f"{step_seed}:debate_round_counts:group={group_index}"
             )
-            context = DebateRoundCountContext(
+            context = DebateDepthContext(
                 rollout_seed=step_seed,
+                optimizer_step=optimizer_step,
+                rollout_index=rollout_index,
                 group_index=group_index,
                 num_groups=self.runtime_config.num_groups,
                 debates_per_group=debates_per_group,
                 max_rounds=self.runtime_config.num_rounds,
+                group_instance_id=instance.instance_id,
+                group_payload=dict(instance.payload),
                 rng=random.Random(seed),
             )
-            if generator is None:
-                group_counts = list(schedule)
-                context.rng.shuffle(group_counts)
-            else:
-                group_counts = list(generator(context))
-            if len(group_counts) != debates_per_group:
-                raise ValueError(
-                    "Round-count generator must return exactly one depth per debate "
-                    f"for group {group_index} ({debates_per_group} values)"
+            counts.extend(
+                generate_debate_depths(
+                    name=self.runtime_config.depth_policy_name,
+                    params=self.runtime_config.depth_policy_params,
+                    context=context,
                 )
-            if any(
-                not isinstance(depth, int) or isinstance(depth, bool) or depth < 1
-                for depth in group_counts
-            ):
-                raise ValueError(
-                    f"Round-count generator returned a non-positive-integer depth for group {group_index}"
-                )
-            if max(group_counts) > self.runtime_config.num_rounds:
-                raise ValueError(
-                    "Round-count generator returned depth above configured num_rounds "
-                    f"for group {group_index}"
-                )
-            counts.extend(group_counts)
-        if len(counts) != n_debates:
+            )
+        expected_debates = self.runtime_config.num_groups * debates_per_group
+        if len(counts) != expected_debates:
             raise ValueError(
-                f"Depth schedule produced {len(counts)} debates, but rollout built {n_debates}"
+                f"Depth policy produced {len(counts)} debates; expected {expected_debates}"
             )
         return counts
 
@@ -1176,6 +1162,7 @@ class DebateRuntime:
                         "task": self.task.name,
                         "judge_retry": judge_retry_flags[index],
                         "num_rounds": target_round_counts[index],
+                        "depth_policy": self.runtime_config.depth_policy_name,
                         "group_index": index // debates_per_group,
                         "debate_index_in_group": index % debates_per_group,
                     },
@@ -1198,6 +1185,7 @@ class DebateRuntime:
             info_lines=[
                 f"Debates={len(debates)} round_range="
                 f"{min(target_round_counts)}-{max(target_round_counts)} "
+                f"depth_policy={self.runtime_config.depth_policy_name} "
                 f"depth_counts={depth_counts} assignments_by_group={assignments_by_group}"
             ],
         )
@@ -1350,6 +1338,7 @@ class DebateRuntime:
                         "task": self.task.name,
                         "judge_retry": False,
                         "num_rounds": target_round_counts[idx],
+                        "depth_policy": self.runtime_config.depth_policy_name,
                         "group_index": idx // debates_per_group,
                         "debate_index_in_group": idx % debates_per_group,
                     },

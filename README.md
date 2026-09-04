@@ -103,3 +103,32 @@ winner rewards are population-z-scored within each task-instance group. R2/R3 re
 independent: `--debate-r23-mode symmetric` still trains both speakers with
 positive/negative constant rewards. The mode requires the round mapping
 `solution, debate, ...` and is not supported by the shared-adapter layout.
+
+## Variable debate depth
+
+`--debate-rounds` is the maximum depth for a rollout. Round 2 uses the opening
+debate prompt; round 3 and every later active round use the same rebuttal prompt
+contract. Debates that have reached their assigned depth are omitted from later
+generation batches.
+
+Depth assignment is a named, serialized policy invoked once for every task
+group. Built-ins are `fixed`, `shuffled_multiset`, and `categorical`. For
+example, this independently samples each debate's depth within every group:
+
+```bash
+--debate-rounds 6 \
+--debate-depth-policy categorical \
+--debate-depth-policy-params-json '{"depths":[3,4,6],"weights":[1,2,1]}'
+```
+
+`--debate-rounds-per-group 3 3 4 4` is a convenience alias for a
+`shuffled_multiset` policy. It preserves that exact composition and independently
+permutes it within every group.
+
+Custom policies register a callable under a stable name with
+`register_debate_depth_policy`. They receive `DebateDepthContext`, including the
+optimizer step, rollout and group indices, sampled task-instance metadata, and a
+deterministically seeded group-local RNG. Register the policy before constructing
+or restoring `TrainRunConfig`; persist only its JSON parameters in
+`debate_depth_policy_params`. The policy name and parameters are stored in the run
+manifest, while the implementation is pinned by the run's source revision.

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from llm_local_rl.behavior_policy import BEHAVIOR_POLICY_LOGPROBS, BehaviorPolicySpec
+from llm_local_rl.debate_depth import register_debate_depth_policy
 from llm_local_rl.debate_parity import DebateConfig
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
 from llm_local_rl.debate_tasks import HTSequenceDebateTask
@@ -234,6 +235,20 @@ def test_four_round_rollout_routes_r4_and_judges_the_complete_transcript() -> No
 def test_one_rollout_can_mix_arbitrary_debate_depths_without_sampling_inactive_pairs() -> None:
     tokenizer = TinyChatTokenizer()
     sampler = RecordingSampler(tokenizer=tokenizer, requests=[])
+    seen_contexts = []
+
+    def generate_depths(context, params):
+        seen_contexts.append(context)
+        split = int(params["split"])
+        depths = [3, split] if context.group_index == 0 else [5, 6]
+        context.rng.shuffle(depths)
+        return depths
+
+    register_debate_depth_policy(
+        "test_group_conditional",
+        generate_depths,
+        minimum_rounds=3,
+    )
     runtime = DebateRuntime(
         task=HTSequenceDebateTask(sequence_len=4),
         tokenizer=tokenizer,
@@ -241,6 +256,8 @@ def test_one_rollout_can_mix_arbitrary_debate_depths_without_sampling_inactive_p
         debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
         runtime_config=DebateRuntimeConfig(
             num_rounds=6,
+            depth_policy_name="test_group_conditional",
+            depth_policy_params={"split": 4},
             num_groups=2,
             group_size=4,
             judge_adapter="judge",
@@ -249,15 +266,7 @@ def test_one_rollout_can_mix_arbitrary_debate_depths_without_sampling_inactive_p
         adapter_layout="split",
     )
 
-    seen_contexts = []
-
-    def generate_depths(context):
-        seen_contexts.append(context)
-        depths = [3, 4] if context.group_index == 0 else [5, 6]
-        context.rng.shuffle(depths)
-        return depths
-
-    output = runtime.rollout(step_seed=0, round_count_generator=generate_depths)
+    output = runtime.rollout(step_seed=0, optimizer_step=9, rollout_index=2)
 
     depths = [len(debate.trajectory_a.transitions) for debate in output.debates]
     assert depths == [3, 4, 6, 5]
@@ -265,8 +274,15 @@ def test_one_rollout_can_mix_arbitrary_debate_depths_without_sampling_inactive_p
     assert sorted(depths[2:]) == [5, 6]
     assert [context.group_index for context in seen_contexts] == [0, 1]
     assert all(context.rollout_seed == 0 for context in seen_contexts)
+    assert all(context.optimizer_step == 9 for context in seen_contexts)
+    assert all(context.rollout_index == 2 for context in seen_contexts)
     assert all(context.debates_per_group == 2 for context in seen_contexts)
     assert all(context.max_rounds == 6 for context in seen_contexts)
+    assert all(context.group_instance_id for context in seen_contexts)
+    assert all(
+        debate.metrics["depth_policy"] == "test_group_conditional"
+        for debate in output.debates
+    )
     assert [debate.metrics["group_index"] for debate in output.debates] == [0, 0, 1, 1]
     assert [debate.metrics["debate_index_in_group"] for debate in output.debates] == [0, 1, 0, 1]
     assert "assignments_by_group=[[3, 4], [6, 5]]" in output.info_lines[0]
@@ -285,24 +301,6 @@ def test_one_rollout_can_mix_arbitrary_debate_depths_without_sampling_inactive_p
         skip_special_tokens=False,
     )
     assert "Round 6 (Response):" in deep_judge_prompt
-    assert runtime._target_round_counts(
-        n_debates=4,
-        step_seed=0,
-        generator=generate_depths,
-    ) == depths
-
-    with pytest.raises(ValueError, match="exactly one depth per debate"):
-        runtime._target_round_counts(
-            n_debates=4,
-            step_seed=0,
-            generator=lambda _context: [3],
-        )
-    with pytest.raises(ValueError, match="above configured num_rounds"):
-        runtime._target_round_counts(
-            n_debates=4,
-            step_seed=0,
-            generator=lambda _context: [3, 7],
-        )
 
 
 def test_depth_multiset_is_repeated_per_group_then_deterministically_reshuffled() -> None:
@@ -314,7 +312,8 @@ def test_depth_multiset_is_repeated_per_group_then_deterministically_reshuffled(
         debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
         runtime_config=DebateRuntimeConfig(
             num_rounds=6,
-            rounds_per_group=(3, 4, 5, 6),
+            depth_policy_name="shuffled_multiset",
+            depth_policy_params={"depths": [3, 4, 5, 6]},
             num_groups=2,
             group_size=8,
             judge_adapter="judge",
@@ -323,9 +322,14 @@ def test_depth_multiset_is_repeated_per_group_then_deterministically_reshuffled(
         adapter_layout="split",
     )
 
-    seed_zero = runtime._target_round_counts(n_debates=8, step_seed=0)
-    repeated_seed_zero = runtime._target_round_counts(n_debates=8, step_seed=0)
-    seed_one = runtime._target_round_counts(n_debates=8, step_seed=1)
+    groups_zero = runtime.task.sample_instances(n=2, seed=0)
+    groups_one = runtime.task.sample_instances(n=2, seed=1)
+    seed_zero = runtime._target_round_counts(group_instances=groups_zero, step_seed=0)
+    repeated_seed_zero = runtime._target_round_counts(
+        group_instances=groups_zero,
+        step_seed=0,
+    )
+    seed_one = runtime._target_round_counts(group_instances=groups_one, step_seed=1)
 
     assert seed_zero == [4, 5, 3, 6, 5, 6, 3, 4]
     assert repeated_seed_zero == seed_zero

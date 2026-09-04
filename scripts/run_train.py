@@ -24,6 +24,20 @@ def _parse_csv_tuple(value: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in value.split(",") if part.strip())
 
 
+def _resolve_debate_depth_policy_args(args: argparse.Namespace) -> tuple[str, dict]:
+    params = json.loads(args.debate_depth_policy_params_json)
+    if not isinstance(params, dict):
+        raise ValueError("--debate-depth-policy-params-json must decode to an object")
+    if args.debate_rounds_per_group:
+        if args.debate_depth_policy != "fixed" or params:
+            raise ValueError(
+                "--debate-rounds-per-group cannot be combined with an explicit "
+                "--debate-depth-policy or non-empty policy params"
+            )
+        return "shuffled_multiset", {"depths": args.debate_rounds_per_group}
+    return args.debate_depth_policy, params
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generic rollout+train driver for the rewrite stack.")
     parser.add_argument("--model-path", required=True)
@@ -85,8 +99,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="N",
         help=(
             "One round count per debate in a prompt group. The complete array is "
-            "reshuffled independently inside every group on each rollout."
+            "reshuffled independently inside every group on each rollout; every value "
+            "must be no greater than --debate-rounds."
         ),
+    )
+    parser.add_argument(
+        "--debate-depth-policy",
+        default="fixed",
+        help="Registered serializable debate-depth policy name.",
+    )
+    parser.add_argument(
+        "--debate-depth-policy-params-json",
+        default="{}",
+        help="JSON object passed to the registered debate-depth policy.",
     )
     parser.add_argument(
         "--debate-r1-reward",
@@ -345,10 +370,6 @@ def main() -> int:
     from llm_local_rl.driver import TrainingDriver
 
     args = parse_args()
-    effective_debate_rounds = max(
-        args.debate_rounds_per_group,
-        default=args.debate_rounds,
-    )
     if args.sampler_teardown_before_training and args.sampler_sleep_before_training:
         raise ValueError("Use either --sampler-teardown-before-training or --sampler-sleep-before-training, not both.")
     if args.resume:
@@ -373,6 +394,7 @@ def main() -> int:
             init_adapter_dirs = json.loads(args.init_adapter_dirs_json)
         elif args.init_adapter_dir:
             init_adapter_dirs = _parse_init_adapter_dirs(args.init_adapter_dir)
+        depth_policy, depth_policy_params = _resolve_debate_depth_policy_args(args)
         driver = TrainingDriver(
             config=TrainRunConfig(
                 model_path=args.model_path,
@@ -410,7 +432,8 @@ def main() -> int:
                 advantage_mode=args.advantage_mode,
                 ppo_clip_epsilon=args.ppo_clip_epsilon,
                 debate_rounds=args.debate_rounds,
-                debate_rounds_per_group=tuple(args.debate_rounds_per_group),
+                debate_depth_policy=depth_policy,
+                debate_depth_policy_params=depth_policy_params,
                 debate_r1_reward=args.debate_r1_reward,
                 debate_r23_reward=args.debate_r23_reward,
                 debate_r23_constant=args.debate_r23_constant,
@@ -428,7 +451,7 @@ def main() -> int:
                 debate_judge_harness=resolve_judge_harness_id(
                     harness_id=args.debate_judge_harness,
                     legacy_prompt_format=args.debate_judge_prompt_format,
-                    num_rounds=effective_debate_rounds,
+                    num_rounds=args.debate_rounds,
                 ),
                 debate_judge_max_tokens=args.debate_judge_max_tokens,
                 debate_judge_temperature=args.debate_judge_temperature,

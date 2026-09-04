@@ -723,7 +723,8 @@ class TrainingDriver:
             debate_config=self._debate_config(),
             runtime_config=DebateRuntimeConfig(
                 num_rounds=self.config.effective_debate_max_rounds(),
-                rounds_per_group=self.config.configured_debate_depths(),
+                depth_policy_name=self.config.debate_depth_policy,
+                depth_policy_params=self.config.debate_depth_policy_params,
                 num_groups=self.config.rollout.num_groups,
                 group_size=self.config.rollout.group_size,
                 debate_r1_reward=self.config.debate_r1_reward,
@@ -876,6 +877,7 @@ class TrainingDriver:
             "question": debate.question,
             "verdict": debate.verdict,
             "judge_reasoning": debate.judge_reasoning,
+            "metrics": dict(debate.metrics),
             "judge": {
                 "text": judge_text,
                 "prompt_tokens": len(debate.judge_prompt_tokens or []),
@@ -1390,10 +1392,15 @@ class TrainingDriver:
                                     mode="debate",
                                     num_groups=self.config.rollout.num_groups,
                                     group_size=self.config.rollout.group_size,
+                                    debate_depth_policy=self.config.debate_depth_policy,
                                     accum_idx=accum_idx,
                                     rollout_grad_accum_steps=rollout_grad_accum_steps,
                                 )
-                                micro_debates = self._debate_runtime().rollout(step_seed=micro_seed).debates
+                                micro_debates = self._debate_runtime().rollout(
+                                    step_seed=micro_seed,
+                                    optimizer_step=step_num,
+                                    rollout_index=accum_idx,
+                                ).debates
                                 debates.extend(micro_debates)
                                 self._progress(
                                     "rollout_done",
