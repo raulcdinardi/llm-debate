@@ -159,6 +159,80 @@ class DebateResult:
         return self.trajectory_a
 
 
+def summarize_generated_debate_format(
+    debates: list[DebateResult],
+) -> dict[str, Any]:
+    """Audit exactly the generated post-R1 transitions in ``debates``."""
+    audits_by_round: dict[int, list[dict[str, Any]]] = {}
+    audits_by_trajectory: list[list[dict[str, Any]]] = []
+    for debate in debates:
+        for trajectory in (debate.trajectory_a, debate.trajectory_b):
+            trajectory_audits = []
+            for transition in trajectory.transitions:
+                if transition.round_num < 2:
+                    continue
+                audit = audit_base_text_debate_format(
+                    text=str(trajectory.metrics.get(f"r{transition.round_num}", "")),
+                    round_num=transition.round_num,
+                )
+                audits_by_round.setdefault(transition.round_num, []).append(audit)
+                trajectory_audits.append(audit)
+            if trajectory_audits:
+                audits_by_trajectory.append(trajectory_audits)
+
+    round_numbers = sorted(audits_by_round)
+    all_audits = [
+        audit
+        for round_num in round_numbers
+        for audit in audits_by_round[round_num]
+    ]
+
+    def rate(audits: list[dict[str, Any]], key: str) -> float:
+        return (
+            sum(float(bool(audit.get(key))) for audit in audits) / len(audits)
+            if audits
+            else 0.0
+        )
+
+    per_round: dict[str, dict[str, float | int]] = {}
+    summary: dict[str, Any] = {
+        "schema": "base_text_raw_exact_generated_rounds_terminal_concluded_v3",
+        "generated_round_numbers": round_numbers,
+        "generated_round_min": min(round_numbers) if round_numbers else None,
+        "generated_round_max": max(round_numbers) if round_numbers else None,
+        "round_outputs": len(all_audits),
+        "trajectories_with_later_rounds": len(audits_by_trajectory),
+        "all_round_outputs_strict_rate": rate(all_audits, "strict_ok"),
+        "all_generated_rounds_strict_rate": (
+            sum(
+                float(all(bool(audit.get("strict_ok")) for audit in trajectory_audits))
+                for trajectory_audits in audits_by_trajectory
+            )
+            / len(audits_by_trajectory)
+            if audits_by_trajectory
+            else 0.0
+        ),
+        "rounds": per_round,
+    }
+    for round_num in round_numbers:
+        audits = audits_by_round[round_num]
+        stats: dict[str, float | int] = {
+            "outputs": len(audits),
+            "strict_rate": rate(audits, "strict_ok"),
+            "legacy_truncation_trigger_rate": rate(
+                audits,
+                "legacy_truncation_triggered",
+            ),
+        }
+        per_round[f"r{round_num}"] = stats
+        summary[f"r{round_num}_outputs"] = stats["outputs"]
+        summary[f"r{round_num}_strict_rate"] = stats["strict_rate"]
+        summary[f"r{round_num}_legacy_truncation_trigger_rate"] = stats[
+            "legacy_truncation_trigger_rate"
+        ]
+    return summary
+
+
 @dataclass
 class DebateConfig:
     num_rounds: int = 3

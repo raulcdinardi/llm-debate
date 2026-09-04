@@ -19,12 +19,12 @@ from llm_local_rl.checkpointing import (
 from llm_local_rl.debate_parity import (
     DebateConfig,
     DebateResult,
-    audit_base_text_debate_format,
     assemble_judge_coherence_grpo_examples,
     assemble_judge_supervised_label_examples,
     assemble_split_train_examples,
     assemble_training_data_by_mode,
     summarize_judge_rejection_r1_projection,
+    summarize_generated_debate_format,
     training_datum_to_train_example,
 )
 from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
@@ -1142,35 +1142,9 @@ class TrainingDriver:
             "num_debates": len(debates),
         }
         if self.config.debate_r23_format_failure_penalty != 0.0:
-            trajectories = [
-                trajectory
-                for debate in debates
-                for trajectory in (debate.trajectory_a, debate.trajectory_b)
-            ]
-            r2_audits = [
-                audit_base_text_debate_format(text=str(trajectory.metrics.get("r2", "")), round_num=2)
-                for trajectory in trajectories
-            ]
-            r3_audits = [
-                audit_base_text_debate_format(text=str(trajectory.metrics.get("r3", "")), round_num=3)
-                for trajectory in trajectories
-            ]
-            projection_record["debate_format"] = {
-                "schema": "base_text_raw_exact_three_points_terminal_concluded_v2",
-                "r2_strict_rate": mean(float(audit["strict_ok"]) for audit in r2_audits),
-                "r3_strict_rate": mean(float(audit["strict_ok"]) for audit in r3_audits),
-                "r2_legacy_truncation_trigger_rate": mean(
-                    float(audit["legacy_truncation_triggered"]) for audit in r2_audits
-                ),
-                "r3_legacy_truncation_trigger_rate": mean(
-                    float(audit["legacy_truncation_triggered"]) for audit in r3_audits
-                ),
-                "both_rounds_strict_rate": mean(
-                    float(r2["strict_ok"] and r3["strict_ok"])
-                    for r2, r3 in zip(r2_audits, r3_audits, strict=True)
-                ),
-                "round_outputs": len(r2_audits) + len(r3_audits),
-            }
+            projection_record["debate_format"] = summarize_generated_debate_format(
+                debates
+            )
         if judge_grpo_record is not None:
             if self.config.judge_training_objective == "supervised_label_ce_js":
                 projection_record["judge_supervised_label"] = judge_grpo_record
