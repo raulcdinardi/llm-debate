@@ -19,16 +19,9 @@ class SeededRandomJudge:
         self,
         question: str,
         constitution: str,
-        r1_a: str,
-        r1_b: str,
-        r2_a: str,
-        r2_b: str,
-        r3_a: str,
-        r3_b: str,
-        r4_a: str = "",
-        r4_b: str = "",
+        *interleaved_round_texts: str,
     ) -> tuple[str, str]:
-        _ = (question, constitution, r1_a, r1_b, r2_a, r2_b, r3_a, r3_b, r4_a, r4_b)
+        _ = (question, constitution, interleaved_round_texts)
         self._call_index += 1
         verdict = self._rng.choice(("A", "B"))
         return verdict, f"seeded_random_judge seed={self.seed} call={self._call_index} verdict={verdict}"

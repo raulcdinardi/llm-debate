@@ -345,7 +345,6 @@ class TrainingDriver:
         r23_max_tokens = self.config.debate_r23_max_tokens or self.config.rollout.max_tokens
         r2_max_tokens = self.config.debate_r2_max_tokens or r23_max_tokens
         r3_max_tokens = self.config.debate_r3_max_tokens or r23_max_tokens
-        r4_max_tokens = self.config.debate_r4_max_tokens or r23_max_tokens
         return DebateConfig(
             num_rounds=self.config.debate_rounds,
             enable_thinking=self._enable_thinking(),
@@ -354,7 +353,6 @@ class TrainingDriver:
             max_tokens_r23=r23_max_tokens,
             max_tokens_r2=r2_max_tokens,
             max_tokens_r3=r3_max_tokens,
-            max_tokens_r4=r4_max_tokens,
             temperature=self.config.rollout.temperature,
             chat_preamble=infer_chat_preamble(self.tokenizer),
         )
@@ -725,6 +723,7 @@ class TrainingDriver:
             debate_config=self._debate_config(),
             runtime_config=DebateRuntimeConfig(
                 num_rounds=self.config.debate_rounds,
+                min_num_rounds=self.config.debate_min_rounds,
                 num_groups=self.config.rollout.num_groups,
                 group_size=self.config.rollout.group_size,
                 debate_r1_reward=self.config.debate_r1_reward,
@@ -732,7 +731,7 @@ class TrainingDriver:
                 debate_r23_constant=self.config.debate_r23_constant,
                 debate_r23_mode=self.config.debate_r23_mode,
                 judge_adapter=self.config.debate_judge_adapter,
-                round_adapter_names=self.config.debate_round_adapter_names,
+                round_adapter_names=self.config.resolved_debate_round_adapter_names(),
                 rollout_batch_size=self.config.rollout.rollout_batch_size,
                 request_seed_mode=self.config.rollout.request_seed_mode,
                 top_p=self.config.rollout.top_p,
@@ -742,7 +741,6 @@ class TrainingDriver:
                 stop_on_concluded=self.config.debate_stop_on_concluded,
                 base_r2_prefill=self.config.base_r2_prefill,
                 base_r3_prefill=self.config.base_r3_prefill,
-                base_r4_prefill=self.config.base_r4_prefill,
                 judge_harness_id=judge_harness.harness_id,
                 judge_max_tokens=self.config.debate_judge_max_tokens,
                 judge_temperature=self.config.debate_judge_temperature,
@@ -903,6 +901,9 @@ class TrainingDriver:
                 "mean_r4_length": 0.0,
                 "mean_r23_length": 0.0,
                 "mean_later_round_length": 0.0,
+                "mean_debate_rounds": 0.0,
+                "min_debate_rounds": 0,
+                "max_debate_rounds": 0,
                 "length_win_correlation": 0.0,
             }
         verdicts = [debate.verdict for debate in debates]
@@ -924,6 +925,16 @@ class TrainingDriver:
             for debate in debates
             for traj in (debate.trajectory_a, debate.trajectory_b)
             if len(traj.transitions) >= 4
+        ]
+        later_round_lengths = [
+            len(turn.completion_tokens)
+            for debate in debates
+            for trajectory in (debate.trajectory_a, debate.trajectory_b)
+            for turn in trajectory.transitions[1:]
+        ]
+        debate_round_counts = [
+            len(debate.trajectory_a.transitions)
+            for debate in debates
         ]
         r1_turns = [
             traj.transitions[0]
@@ -1002,7 +1013,10 @@ class TrainingDriver:
             "mean_r3_length": mean(r3_lengths) if r3_lengths else 0.0,
             "mean_r4_length": mean(r4_lengths) if r4_lengths else 0.0,
             "mean_r23_length": mean([*r2_lengths, *r3_lengths]) if r2_lengths or r3_lengths else 0.0,
-            "mean_later_round_length": mean([*r2_lengths, *r3_lengths, *r4_lengths]) if r2_lengths or r3_lengths or r4_lengths else 0.0,
+            "mean_later_round_length": mean(later_round_lengths) if later_round_lengths else 0.0,
+            "mean_debate_rounds": mean(debate_round_counts) if debate_round_counts else 0.0,
+            "min_debate_rounds": min(debate_round_counts, default=0),
+            "max_debate_rounds": max(debate_round_counts, default=0),
             "mean_r1_length": mean(len(turn.completion_tokens) for turn in r1_turns) if r1_turns else 0.0,
             "max_r1_length": max((len(turn.completion_tokens) for turn in r1_turns), default=0),
             "max_r2_length": max(r2_lengths, default=0),
@@ -1021,7 +1035,7 @@ class TrainingDriver:
                 if r3_turns else 0.0
             ),
             "r4_max_token_rate": (
-                mean(len(turn.completion_tokens) >= (self.config.debate_r4_max_tokens or self.config.debate_r23_max_tokens or self.config.rollout.max_tokens) for turn in r4_turns)
+                mean(len(turn.completion_tokens) >= (self.config.debate_r3_max_tokens or self.config.debate_r23_max_tokens or self.config.rollout.max_tokens) for turn in r4_turns)
                 if r4_turns else 0.0
             ),
             "r1_eos_rate": mean(bool(turn.completion_tokens) and turn.completion_tokens[-1] == self.tokenizer.eos_token_id for turn in r1_turns) if r1_turns else 0.0,
@@ -1089,7 +1103,7 @@ class TrainingDriver:
         grouped = assemble_split_train_examples(
             debates=debates,
             num_rounds=self.config.debate_rounds,
-            round_adapter_names=self.config.debate_round_adapter_names,
+            round_adapter_names=self.config.resolved_debate_round_adapter_names(),
             r1_reward_mode=self.config.debate_r1_reward,
             r23_reward_mode=self.config.debate_r23_reward,
             r23_constant=self.config.debate_r23_constant,

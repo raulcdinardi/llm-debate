@@ -9,7 +9,7 @@ import pytest
 from scripts.run_train import _parse_csv_tuple, _parse_init_adapter_dirs, parse_args
 from llm_local_rl.config import RolloutConfig, TrainRunConfig
 from llm_local_rl.judge_harness import (
-    CHAT_SOLUTION_TAGGED_R4_V1,
+    CHAT_SOLUTION_TAGGED_V1,
     CONSTITUTION_SINGLE_TOKEN_V1,
     CONSULTANCY_SINGLE_TOKEN_V1,
     SOLUTION_R1_RATIONALE_V1,
@@ -74,7 +74,7 @@ def test_cli_defaults_all_sampling_temperatures_to_one() -> None:
     assert args.judge_grpo_reward_mode == "coherence"
 
 
-def test_cli_accepts_four_round_debate_and_r4_token_cap() -> None:
+def test_cli_accepts_arbitrary_heterogeneous_debate_depth() -> None:
     args = parse_args(
         [
             "--model-path",
@@ -82,17 +82,47 @@ def test_cli_accepts_four_round_debate_and_r4_token_cap() -> None:
             "--output-dir",
             "/tmp/out",
             "--debate-rounds",
-            "4",
-            "--debate-r4-max-tokens",
-            "768",
+            "7",
+            "--debate-min-rounds",
+            "3",
         ]
     )
 
-    assert args.debate_rounds == 4
-    assert args.debate_r4_max_tokens == 768
+    assert args.debate_rounds == 7
+    assert args.debate_min_rounds == 3
 
-    assert resolve_judge_harness_id(harness_id=None, num_rounds=4) == CHAT_SOLUTION_TAGGED_R4_V1
+    assert resolve_judge_harness_id(harness_id=None, num_rounds=7) == CHAT_SOLUTION_TAGGED_V1
     assert args.debate_round_adapter_names == ["solution", "debate", "debate"]
+
+
+def test_config_repeats_last_adapter_for_arbitrary_round_depth() -> None:
+    config = TrainRunConfig(
+        model_path="/tmp/model",
+        output_dir="/tmp/out",
+        debate_rounds=7,
+        debate_min_rounds=3,
+    )
+
+    assert config.effective_debate_min_rounds() == 3
+    assert config.resolved_debate_round_adapter_names() == (
+        "solution",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+        "debate",
+    )
+
+
+def test_config_rejects_round_minimum_above_maximum() -> None:
+    with pytest.raises(ValueError, match="debate_min_rounds"):
+        TrainRunConfig(
+            model_path="/tmp/model",
+            output_dir="/tmp/out",
+            debate_rounds=4,
+            debate_min_rounds=5,
+        )
 
 
 def test_cli_accepts_frozen_single_token_judge_constraint() -> None:

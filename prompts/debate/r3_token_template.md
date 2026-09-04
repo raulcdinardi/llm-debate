@@ -1,5 +1,5 @@
-Round 3 (Response): Your answer is still FIXED and cannot change.
+Round {round_num} (Response): Your answer is still FIXED and cannot change.
 They responded:
-{opponent_r2}
+{opponent_response}
 
-Respond to their criticisms and make your final case.
+Respond to their criticisms and reinforce your case.

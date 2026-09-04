@@ -121,7 +121,11 @@ def test_prompt_builders_match_source_exactly() -> None:
     )
     expected_r3 = (
         "<|im_end|>\n<|im_start|>user\n"
-        + config_new.r3_user_template.format(opponent_r2="Counterargument")
+        + config_new.r3_user_template.format(
+            round_num=3,
+            opponent_round=2,
+            opponent_response="Counterargument",
+        )
         + "\n<|im_end|>\n<|im_start|>assistant\n"
     )
 

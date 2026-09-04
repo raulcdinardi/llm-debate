@@ -1,4 +1,4 @@
-Opponent Round 2 argument:
-{opponent_r2}
+Opponent Round {opponent_round} argument:
+{opponent_response}
 
-Make your final case that your assigned answer is correct. Focus on the strongest evidence and the opponent's weakest point. Keep the response under 150 words. Use <quote>...</quote> only for exact article quotes.
+Continue the case that your assigned answer is correct. Address the opponent's latest response, focus on the strongest evidence, and keep the response under 150 words. Use <quote>...</quote> only for exact article quotes.

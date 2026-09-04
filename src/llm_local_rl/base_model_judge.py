@@ -9,7 +9,6 @@ from llm_local_rl.judge_harness import (
     AgentDebateText,
     JudgeTranscript,
     SOLUTION_R1_RATIONALE_V1,
-    SOLUTION_R1_RATIONALE_R4_V1,
     get_judge_harness,
     harness_fingerprint,
 )
@@ -24,14 +23,10 @@ class RemoteBaseJudgeConfig:
 
     def __post_init__(self) -> None:
         harness = get_judge_harness(self.harness_id)
-        if harness.harness_id not in (
-            SOLUTION_R1_RATIONALE_V1,
-            SOLUTION_R1_RATIONALE_R4_V1,
-        ):
+        if harness.harness_id != SOLUTION_R1_RATIONALE_V1:
             raise ValueError(
-                f"External HTTP judge supports only {SOLUTION_R1_RATIONALE_V1!r} or "
-                f"{SOLUTION_R1_RATIONALE_R4_V1!r}; "
-                f"got {harness.harness_id!r}"
+                "External HTTP judge supports only "
+                f"{SOLUTION_R1_RATIONALE_V1!r}; got {harness.harness_id!r}"
             )
 
 
@@ -42,20 +37,15 @@ def build_remote_base_judge(config: RemoteBaseJudgeConfig):
     def judge(
         question: str,
         constitution: str,
-        r1_a: str,
-        r1_b: str,
-        r2_a: str,
-        r2_b: str,
-        r3_a: str,
-        r3_b: str,
-        r4_a: str = "",
-        r4_b: str = "",
+        *interleaved_round_texts: str,
     ) -> tuple[Verdict, str]:
+        if len(interleaved_round_texts) % 2 != 0 or not interleaved_round_texts:
+            raise ValueError("Judge requires one A/B text pair per debate round")
         transcript = JudgeTranscript(
             question=question,
             constitution=constitution,
-            agent_a=AgentDebateText(r1=r1_a, r2=r2_a, r3=r3_a, r4=r4_a),
-            agent_b=AgentDebateText(r1=r1_b, r2=r2_b, r3=r3_b, r4=r4_b),
+            agent_a=AgentDebateText(rounds=interleaved_round_texts[0::2]),
+            agent_b=AgentDebateText(rounds=interleaved_round_texts[1::2]),
         )
         rendered = harness.render_checked(transcript=transcript, base_system_text="")
         assert rendered.raw_text is not None

@@ -11,12 +11,9 @@ from llm_local_rl.debate_parity import Verdict
 
 
 CHAT_SOLUTION_TAGGED_V1 = "chat_solution_tagged_v1"
-CHAT_SOLUTION_TAGGED_R4_V1 = "chat_solution_tagged_r4_v1"
 CHAT_POINTWISE_TAGGED_V1 = "chat_pointwise_tagged_v1"
 SOLUTION_R1_RATIONALE_V1 = "solution_r1_rationale_v1"
-SOLUTION_R1_RATIONALE_R4_V1 = "solution_r1_rationale_r4_v1"
 CONSTITUTION_SINGLE_TOKEN_V1 = "constitution_single_token_v1"
-CONSTITUTION_SINGLE_TOKEN_R4_V1 = "constitution_single_token_r4_v1"
 CONSULTANCY_SINGLE_TOKEN_V1 = "consultancy_single_token_v1"
 PAIRWISE_SINGLE_TOKEN_V1 = "pairwise_single_token_v1"
 JUDGE_HARNESS_MANIFEST = "judge_harness.json"
@@ -24,12 +21,9 @@ JUDGE_HARNESS_MANIFEST_SCHEMA = "llm_local_rl_judge_harness_v1"
 
 JudgeHarnessId = Literal[
     "chat_solution_tagged_v1",
-    "chat_solution_tagged_r4_v1",
     "chat_pointwise_tagged_v1",
     "solution_r1_rationale_v1",
-    "solution_r1_rationale_r4_v1",
     "constitution_single_token_v1",
-    "constitution_single_token_r4_v1",
     "consultancy_single_token_v1",
     "pairwise_single_token_v1",
 ]
@@ -39,12 +33,43 @@ _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _THINK_TAIL_RE = re.compile(r"<think>.*$", re.IGNORECASE | re.DOTALL)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class AgentDebateText:
-    r1: str
-    r2: str
-    r3: str
-    r4: str = ""
+    rounds: tuple[str, ...]
+
+    def __init__(
+        self,
+        r1: str = "",
+        r2: str = "",
+        r3: str = "",
+        r4: str = "",
+        *,
+        rounds: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
+        values = (
+            tuple(str(value) for value in rounds)
+            if rounds is not None
+            else (r1, r2, r3, *((r4,) if r4 else ()))
+        )
+        if not values:
+            raise ValueError("Agent debate transcript must contain at least one round")
+        object.__setattr__(self, "rounds", values)
+
+    @property
+    def r1(self) -> str:
+        return self.rounds[0] if self.rounds else ""
+
+    @property
+    def r2(self) -> str:
+        return self.rounds[1] if len(self.rounds) > 1 else ""
+
+    @property
+    def r3(self) -> str:
+        return self.rounds[2] if len(self.rounds) > 2 else ""
+
+    @property
+    def r4(self) -> str:
+        return self.rounds[3] if len(self.rounds) > 3 else ""
 
 
 @dataclass(frozen=True)
@@ -116,30 +141,28 @@ def _contract_probe_transcript(*, required_rounds: int = 3) -> JudgeTranscript:
     return JudgeTranscript(
         question="__JUDGE_HARNESS_QUESTION_PAYLOAD__",
         constitution="__JUDGE_HARNESS_CONSTITUTION_PAYLOAD__",
-        agent_a=AgentDebateText(
-            r1="__JUDGE_HARNESS_A_R1_PAYLOAD__",
-            r2="__JUDGE_HARNESS_A_R2_PAYLOAD__",
-            r3="__JUDGE_HARNESS_A_R3_PAYLOAD__",
-            r4="__JUDGE_HARNESS_A_R4_PAYLOAD__" if required_rounds == 4 else "",
-        ),
-        agent_b=AgentDebateText(
-            r1="__JUDGE_HARNESS_B_R1_PAYLOAD__",
-            r2="__JUDGE_HARNESS_B_R2_PAYLOAD__",
-            r3="__JUDGE_HARNESS_B_R3_PAYLOAD__",
-            r4="__JUDGE_HARNESS_B_R4_PAYLOAD__" if required_rounds == 4 else "",
-        ),
+        agent_a=AgentDebateText(rounds=tuple(
+            f"__JUDGE_HARNESS_A_R{round_num}_PAYLOAD__"
+            for round_num in range(1, required_rounds + 1)
+        )),
+        agent_b=AgentDebateText(rounds=tuple(
+            f"__JUDGE_HARNESS_B_R{round_num}_PAYLOAD__"
+            for round_num in range(1, required_rounds + 1)
+        )),
     )
 
 
 def _round_summary(transcript: JudgeTranscript) -> str:
-    summary = (
-        "- Round 1: Both solvers propose solutions\n"
-        "- Round 2: Both argue for their solutions\n"
-        "- Round 3: Both respond to criticism\n"
-    )
-    if transcript.agent_a.r4 or transcript.agent_b.r4:
-        summary += "- Round 4: Both make a closing rebuttal\n"
-    return summary
+    count = max(len(transcript.agent_a.rounds), len(transcript.agent_b.rounds))
+    lines = []
+    for round_num in range(1, count + 1):
+        if round_num == 1:
+            lines.append("- Round 1: Both solvers propose solutions")
+        elif round_num == 2:
+            lines.append("- Round 2: Both argue for their solutions")
+        else:
+            lines.append(f"- Round {round_num}: Both respond to criticism")
+    return "\n".join(lines) + "\n"
 
 
 def extract_tagged_verdict(text: str) -> Verdict:
@@ -156,29 +179,18 @@ def extract_single_token_verdict(text: str) -> Verdict:
 
 
 def _transcript_body(transcript: JudgeTranscript) -> str:
-    agent_a_r4 = (
-        f"Round 4 (Closing rebuttal):\n{transcript.agent_a.r4}\n\n"
-        if transcript.agent_a.r4
-        else ""
-    )
-    agent_b_r4 = (
-        f"Round 4 (Closing rebuttal):\n{transcript.agent_b.r4}\n\n"
-        if transcript.agent_b.r4
-        else ""
-    )
+    def agent_body(name: str, agent: AgentDebateText) -> str:
+        labels = {1: "Proposal", 2: "Argument"}
+        return f"=== AGENT {name} ===\n" + "".join(
+            f"Round {round_num} ({labels.get(round_num, 'Response')}):\n{text}\n\n"
+            for round_num, text in enumerate(agent.rounds, start=1)
+        )
+
     return (
         f"Question: {transcript.question}\n\n"
         f"Constitution:\n{transcript.constitution}\n\n"
-        "=== AGENT A ===\n"
-        f"Round 1 (Proposal):\n{transcript.agent_a.r1}\n\n"
-        f"Round 2 (Argument):\n{transcript.agent_a.r2}\n\n"
-        f"Round 3 (Response):\n{transcript.agent_a.r3}\n\n"
-        + agent_a_r4
-        + "=== AGENT B ===\n"
-        f"Round 1 (Proposal):\n{transcript.agent_b.r1}\n\n"
-        f"Round 2 (Argument):\n{transcript.agent_b.r2}\n\n"
-        f"Round 3 (Response):\n{transcript.agent_b.r3}\n\n"
-        + agent_b_r4
+        + agent_body("A", transcript.agent_a)
+        + agent_body("B", transcript.agent_b)
     )
 
 
@@ -300,14 +312,16 @@ def _render_pairwise_single_token(
 def _render_chat_solution(
     transcript: JudgeTranscript, base_system_text: str
 ) -> RenderedJudgePrompt:
-    if transcript.agent_a.r4 or transcript.agent_b.r4:
+    if len(transcript.agent_a.rounds) > 3 or len(transcript.agent_b.rounds) > 3:
         r3_line = "- Round 3: Both respond to criticism\n"
-        r4_line = "- Round 4: Both make a closing rebuttal\n"
-        base_system_text = (
-            base_system_text.replace(r3_line, r3_line + r4_line, 1)
-            if r3_line in base_system_text
-            else base_system_text + "\n\n" + r4_line.rstrip()
+        later_lines = "".join(
+            f"- Round {round_num}: Both respond to criticism\n"
+            for round_num in range(
+                4,
+                max(len(transcript.agent_a.rounds), len(transcript.agent_b.rounds)) + 1,
+            )
         )
+        base_system_text = base_system_text.replace(r3_line, r3_line + later_lines, 1)
     system = (
         base_system_text
         + "\n\nIMPORTANT: Output exactly one tag: <VERDICT>...</VERDICT>. "
@@ -369,19 +383,6 @@ _HARNESSES: dict[JudgeHarnessId, JudgeHarnessSpec] = {
         required_phrases=("Round 1 response best satisfies the user",),
         forbidden_phrases=("more convincing case", "rebuttal effectiveness"),
     ),
-    CHAT_SOLUTION_TAGGED_R4_V1: JudgeHarnessSpec(
-        harness_id=CHAT_SOLUTION_TAGGED_R4_V1,
-        serialization="chat",
-        objective="select_best_round1_solution_from_four_round_debate",
-        output_contract="verdict_tag_only",
-        assistant_prefill="",
-        default_max_tokens=None,
-        required_rounds=4,
-        render=_render_chat_solution,
-        parse_verdict=extract_tagged_verdict,
-        required_phrases=("Round 1 response best satisfies the user", "Round 4"),
-        forbidden_phrases=("more convincing case", "rebuttal effectiveness"),
-    ),
     CHAT_POINTWISE_TAGGED_V1: JudgeHarnessSpec(
         harness_id=CHAT_POINTWISE_TAGGED_V1,
         serialization="chat",
@@ -411,23 +412,6 @@ _HARNESSES: dict[JudgeHarnessId, JudgeHarnessSpec] = {
         ),
         forbidden_phrases=("more convincing case", "rebuttal effectiveness"),
     ),
-    SOLUTION_R1_RATIONALE_R4_V1: JudgeHarnessSpec(
-        harness_id=SOLUTION_R1_RATIONALE_R4_V1,
-        serialization="raw_base",
-        objective="select_best_round1_solution_from_four_round_debate",
-        output_contract="rationale_then_verdict_tag",
-        assistant_prefill="The rationale for my judgment is:\n",
-        default_max_tokens=512,
-        required_rounds=4,
-        render=_render_solution_r1_rationale,
-        parse_verdict=extract_tagged_verdict,
-        required_phrases=(
-            "Round 1 response best satisfies the user",
-            "Do not reward confidence, rhetoric, or debate skill by itself.",
-            "Round 4",
-        ),
-        forbidden_phrases=("more convincing case", "rebuttal effectiveness"),
-    ),
     CONSTITUTION_SINGLE_TOKEN_V1: JudgeHarnessSpec(
         harness_id=CONSTITUTION_SINGLE_TOKEN_V1,
         serialization="raw_base",
@@ -439,18 +423,6 @@ _HARNESSES: dict[JudgeHarnessId, JudgeHarnessSpec] = {
         render=_render_constitution_single_token,
         parse_verdict=extract_single_token_verdict,
         required_phrases=("more convincing case", "rebuttal effectiveness"),
-    ),
-    CONSTITUTION_SINGLE_TOKEN_R4_V1: JudgeHarnessSpec(
-        harness_id=CONSTITUTION_SINGLE_TOKEN_R4_V1,
-        serialization="raw_base",
-        objective="select_best_constitution_adherence_four_round_case",
-        output_contract="single_token_a_or_b",
-        assistant_prefill="The response most adherent to the constitution was written by Agent",
-        default_max_tokens=1,
-        required_rounds=4,
-        render=_render_constitution_single_token,
-        parse_verdict=extract_single_token_verdict,
-        required_phrases=("more convincing case", "rebuttal effectiveness", "Round 4"),
     ),
     CONSULTANCY_SINGLE_TOKEN_V1: JudgeHarnessSpec(
         harness_id=CONSULTANCY_SINGLE_TOKEN_V1,
@@ -517,13 +489,6 @@ def resolve_judge_harness_id(
     legacy = legacy_prompt_format or "chat"
     if legacy == "chat" and num_rounds == 1:
         return CHAT_POINTWISE_TAGGED_V1
-    if num_rounds == 4:
-        if legacy == "chat":
-            return CHAT_SOLUTION_TAGGED_R4_V1
-        if legacy == "base_model_sft":
-            return SOLUTION_R1_RATIONALE_R4_V1
-        if legacy == "single_token_sft":
-            return CONSTITUTION_SINGLE_TOKEN_R4_V1
     try:
         return LEGACY_PROMPT_FORMAT_TO_HARNESS[legacy]
     except KeyError as exc:
@@ -532,13 +497,11 @@ def resolve_judge_harness_id(
 
 def harness_fingerprint(harness_id: str) -> str:
     spec = get_judge_harness(harness_id)
-    r4 = "__A_R4__" if spec.required_rounds == 4 else ""
-    b_r4 = "__B_R4__" if spec.required_rounds == 4 else ""
     sentinel = JudgeTranscript(
         question="__QUESTION__",
         constitution="__CONSTITUTION__",
-        agent_a=AgentDebateText("__A_R1__", "__A_R2__", "__A_R3__", r4),
-        agent_b=AgentDebateText("__B_R1__", "__B_R2__", "__B_R3__", b_r4),
+        agent_a=AgentDebateText("__A_R1__", "__A_R2__", "__A_R3__"),
+        agent_b=AgentDebateText("__B_R1__", "__B_R2__", "__B_R3__"),
     )
     rendered = spec.render_checked(transcript=sentinel, base_system_text="__SYSTEM__")
     payload = {

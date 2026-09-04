@@ -240,6 +240,50 @@ def test_four_round_split_projection_merges_shared_later_adapter_reward_mass() -
     )
 
 
+def test_projection_uses_each_debates_actual_depth_below_configured_maximum() -> None:
+    three_round = _make_debate(
+        question="three",
+        judge_raw_response={"bidirectional_judge": True, "order_invariant": True},
+    )
+    four_round = _append_fourth_round(
+        _make_debate(
+            question="four",
+            token_offset=50,
+            judge_raw_response={"bidirectional_judge": True, "order_invariant": True},
+        )
+    )
+
+    split = assemble_split_train_examples(
+        debates=[three_round, four_round],
+        num_rounds=6,
+        round_adapter_names=("solution", "debate"),
+        r1_reward_mode="task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        r23_advantage_scope="merged_r23",
+    )
+    assert [example.metadata["round_nums"] for example in split["debate"]] == [
+        [2, 3],
+        [2, 3],
+        [2, 3, 4],
+        [2, 3, 4],
+    ]
+
+    shared = assemble_training_data_by_mode(
+        debates=[three_round, four_round],
+        num_rounds=6,
+        r1_reward_mode="task",
+        r23_reward_mode="constant",
+        r23_constant=1.0,
+        r23_symmetric=True,
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+        r23_advantage_scope="merged_r23",
+    )
+    assert [datum.metadata["actual_num_rounds"] for datum in shared] == [3, 3, 4, 4]
+
+
 def _soft_judge_audit(score: float, *, js: float = 0.0) -> dict[str, object]:
     return {
         "bidirectional_judge": True,

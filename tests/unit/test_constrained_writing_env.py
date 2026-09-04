@@ -166,7 +166,7 @@ def test_base_text_debate_extension_contract_is_exact_and_round_specific():
     )
     assert "Round 3" in r3.system_text
     assert "Opponent Round 2 answer:\nOpponent argument.\n" in r3.user_text
-    assert "Make your final case" in r3.user_text
+    assert "Continue the case" in r3.user_text
     assert r3.assistant_prefill == "Responding to my opponent's criticism:\n1)"
     assert "Your fixed Round 1 answer:" not in r2.user_text + r3.user_text
 
@@ -177,14 +177,15 @@ def test_base_text_debate_extension_contract_is_exact_and_round_specific():
     )
     assert "Round 4" in r4.system_text
     assert "Opponent Round 3 answer:\nOpponent closing argument.\n" in r4.user_text
-    assert r4.assistant_prefill == "My closing response to my opponent is:\n1)"
+    assert r4.assistant_prefill == r3.assistant_prefill
 
-    with pytest.raises(ValueError, match="opponent_round must be 1, 2, or 3"):
-        task.build_base_text_debate_extension(
-            inst=inst,
-            opponent_round=4,
-            opponent_answer="invalid",
-        )
+    r5 = task.build_base_text_debate_extension(
+        inst=inst,
+        opponent_round=4,
+        opponent_answer="Another response.",
+    )
+    assert "Round 5" in r5.system_text
+    assert r5.assistant_prefill == r3.assistant_prefill
 
 
 def test_env_wrapper_shadow_scoring():
