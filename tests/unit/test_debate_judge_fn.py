@@ -241,7 +241,6 @@ def test_one_rollout_can_mix_arbitrary_debate_depths_without_sampling_inactive_p
         debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
         runtime_config=DebateRuntimeConfig(
             num_rounds=6,
-            rounds_per_group=(3, 6),
             num_groups=2,
             group_size=4,
             judge_adapter="judge",
@@ -250,30 +249,60 @@ def test_one_rollout_can_mix_arbitrary_debate_depths_without_sampling_inactive_p
         adapter_layout="split",
     )
 
-    output = runtime.rollout(step_seed=0)
+    seen_contexts = []
+
+    def generate_depths(context):
+        seen_contexts.append(context)
+        depths = [3, 4] if context.group_index == 0 else [5, 6]
+        context.rng.shuffle(depths)
+        return depths
+
+    output = runtime.rollout(step_seed=0, round_count_generator=generate_depths)
 
     depths = [len(debate.trajectory_a.transitions) for debate in output.debates]
-    assert depths == [3, 6, 6, 3]
-    assert sorted(depths[:2]) == [3, 6]
-    assert sorted(depths[2:]) == [3, 6]
+    assert depths == [3, 4, 6, 5]
+    assert sorted(depths[:2]) == [3, 4]
+    assert sorted(depths[2:]) == [5, 6]
+    assert [context.group_index for context in seen_contexts] == [0, 1]
+    assert all(context.rollout_seed == 0 for context in seen_contexts)
+    assert all(context.debates_per_group == 2 for context in seen_contexts)
+    assert all(context.max_rounds == 6 for context in seen_contexts)
     assert [debate.metrics["group_index"] for debate in output.debates] == [0, 0, 1, 1]
     assert [debate.metrics["debate_index_in_group"] for debate in output.debates] == [0, 1, 0, 1]
-    assert "assignments_by_group=[[3, 6], [6, 3]]" in output.info_lines[0]
+    assert "assignments_by_group=[[3, 4], [6, 5]]" in output.info_lines[0]
     assert [len(debate.trajectory_b.transitions) for debate in output.debates] == depths
     assert sum(request.adapter_name == "solution" for request in sampler.requests) == 8
     assert sum(request.adapter_name == "debate" for request in sampler.requests) == 28
     assert sum(request.adapter_name == "judge" for request in sampler.requests) == 4
-    deep = output.debates[1].trajectory_a
+    deep = output.debates[2].trajectory_a
     r3_prompt = tokenizer.decode(deep.transitions[2].prompt_tokens, skip_special_tokens=False)
     r4_prompt = tokenizer.decode(deep.transitions[3].prompt_tokens, skip_special_tokens=False)
     assert "Round 3 (Response)" in r3_prompt
     assert "Round 4 (Response)" in r4_prompt
     assert "closing rebuttal" not in r4_prompt.lower()
     deep_judge_prompt = tokenizer.decode(
-        output.debates[1].judge_prompt_tokens,
+        output.debates[2].judge_prompt_tokens,
         skip_special_tokens=False,
     )
     assert "Round 6 (Response):" in deep_judge_prompt
+    assert runtime._target_round_counts(
+        n_debates=4,
+        step_seed=0,
+        generator=generate_depths,
+    ) == depths
+
+    with pytest.raises(ValueError, match="exactly one depth per debate"):
+        runtime._target_round_counts(
+            n_debates=4,
+            step_seed=0,
+            generator=lambda _context: [3],
+        )
+    with pytest.raises(ValueError, match="above configured num_rounds"):
+        runtime._target_round_counts(
+            n_debates=4,
+            step_seed=0,
+            generator=lambda _context: [3, 7],
+        )
 
 
 def test_depth_multiset_is_repeated_per_group_then_deterministically_reshuffled() -> None:

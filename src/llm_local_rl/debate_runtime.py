@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 import random
 import re
-from typing import Callable
 
 from llm_local_rl.behavior_policy import validate_sampling_result_contract
 from llm_local_rl.judge_harness import (
@@ -29,6 +29,19 @@ from llm_local_rl.types import RolloutSampler, SamplingRequest
 
 JudgeAdapterMode = str
 JudgeFn = Callable[..., tuple[Verdict, str]]
+
+
+@dataclass(frozen=True)
+class DebateRoundCountContext:
+    rollout_seed: int | None
+    group_index: int
+    num_groups: int
+    debates_per_group: int
+    max_rounds: int
+    rng: random.Random
+
+
+DebateRoundCountGenerator = Callable[[DebateRoundCountContext], Sequence[int]]
 
 _SOLUTION_RE = re.compile(r"<SOLUTION>(.*?)</SOLUTION>", re.IGNORECASE | re.DOTALL)
 _VERDICT_RE = re.compile(r"<VERDICT>\s*([AB])\s*</VERDICT>", re.IGNORECASE)
@@ -168,6 +181,8 @@ class DebateRuntimeConfig:
                 for depth in self.rounds_per_group
             ):
                 raise ValueError("rounds_per_group depths must all be positive integers")
+            if max(self.rounds_per_group) > self.num_rounds:
+                raise ValueError("rounds_per_group depths must not exceed num_rounds")
         if not self.round_adapter_names:
             raise ValueError("round_adapter_names must not be empty")
 
@@ -259,15 +274,39 @@ class DebateRuntime:
             retry_flags.append(False)
         return verdicts, reasonings, prompt_tokens, completion_tokens, completion_logprobs, raw_responses, retry_flags
 
-    def rollout(self, *, step_seed: int | None) -> DebateRolloutOutput:
-        if self.runtime_config.group_size % 2 != 0:
-            raise ValueError("Debate requires even group_size.")
+    def rollout(
+        self,
+        *,
+        step_seed: int | None,
+        round_count_generator: DebateRoundCountGenerator | None = None,
+    ) -> DebateRolloutOutput:
+        """Roll out debates, optionally generating depths independently for each group.
+
+        The callback is invoked once per group. Its returned order maps directly to
+        that group's debate slots; it may use ``context.rng`` for reproducible sampling.
+        """
+        if self.runtime_config.num_groups < 1:
+            raise ValueError("Debate requires at least one group.")
+        if (
+            self.runtime_config.group_size < 2
+            or self.runtime_config.group_size % 2 != 0
+        ):
+            raise ValueError("Debate requires even group_size of at least 2.")
+        n_debates = (
+            self.runtime_config.num_groups * self.runtime_config.group_size // 2
+        )
+        target_round_counts = self._target_round_counts(
+            n_debates=n_debates,
+            step_seed=step_seed,
+            generator=round_count_generator,
+        )
         harness = get_judge_harness(self.runtime_config.judge_harness_id)
-        if self.judge_fn is None and self.runtime_config.effective_min_num_rounds() < harness.required_rounds:
+        actual_min_rounds = min(target_round_counts)
+        if self.judge_fn is None and actual_min_rounds < harness.required_rounds:
             raise ValueError(
                 f"Judge harness {harness.harness_id!r} requires at least "
-                f"{harness.required_rounds} rounds; configured minimum is "
-                f"{self.runtime_config.effective_min_num_rounds()}"
+                f"{harness.required_rounds} rounds; generated minimum is "
+                f"{actual_min_rounds}"
             )
         instances = self.task.sample_instances(n=self.runtime_config.num_groups, seed=step_seed)
         instances_repeated: list[TaskInstance] = []
@@ -283,9 +322,17 @@ class DebateRuntime:
                 )
             else:
                 instances_repeated.extend([inst] * self.runtime_config.group_size)
-        if self.runtime_config.effective_max_num_rounds() == 1:
-            return self._rollout_r1_only(instances_repeated=instances_repeated, step_seed=step_seed)
-        return self._rollout_variable_rounds(instances_repeated=instances_repeated, step_seed=step_seed)
+        if max(target_round_counts) == 1:
+            return self._rollout_r1_only(
+                instances_repeated=instances_repeated,
+                step_seed=step_seed,
+                target_round_counts=target_round_counts,
+            )
+        return self._rollout_variable_rounds(
+            instances_repeated=instances_repeated,
+            step_seed=step_seed,
+            target_round_counts=target_round_counts,
+        )
 
     def _postprocess_visible_texts(
         self,
@@ -655,18 +702,53 @@ class DebateRuntime:
             enable_thinking=self.debate_config.enable_thinking,
         )
 
-    def _target_round_counts(self, *, n_debates: int, step_seed: int | None) -> list[int]:
+    def _target_round_counts(
+        self,
+        *,
+        n_debates: int,
+        step_seed: int | None,
+        generator: DebateRoundCountGenerator | None = None,
+    ) -> list[int]:
         schedule = self.runtime_config.configured_depths()
         counts: list[int] = []
+        debates_per_group = self.runtime_config.group_size // 2
         for group_index in range(self.runtime_config.num_groups):
-            shuffled = list(schedule)
             seed = (
                 None
                 if step_seed is None
                 else f"{step_seed}:debate_round_counts:group={group_index}"
             )
-            random.Random(seed).shuffle(shuffled)
-            counts.extend(shuffled)
+            context = DebateRoundCountContext(
+                rollout_seed=step_seed,
+                group_index=group_index,
+                num_groups=self.runtime_config.num_groups,
+                debates_per_group=debates_per_group,
+                max_rounds=self.runtime_config.num_rounds,
+                rng=random.Random(seed),
+            )
+            if generator is None:
+                group_counts = list(schedule)
+                context.rng.shuffle(group_counts)
+            else:
+                group_counts = list(generator(context))
+            if len(group_counts) != debates_per_group:
+                raise ValueError(
+                    "Round-count generator must return exactly one depth per debate "
+                    f"for group {group_index} ({debates_per_group} values)"
+                )
+            if any(
+                not isinstance(depth, int) or isinstance(depth, bool) or depth < 1
+                for depth in group_counts
+            ):
+                raise ValueError(
+                    f"Round-count generator returned a non-positive-integer depth for group {group_index}"
+                )
+            if max(group_counts) > self.runtime_config.num_rounds:
+                raise ValueError(
+                    "Round-count generator returned depth above configured num_rounds "
+                    f"for group {group_index}"
+                )
+            counts.extend(group_counts)
         if len(counts) != n_debates:
             raise ValueError(
                 f"Depth schedule produced {len(counts)} debates, but rollout built {n_debates}"
@@ -846,6 +928,7 @@ class DebateRuntime:
         *,
         instances_repeated: list[TaskInstance],
         step_seed: int | None,
+        target_round_counts: list[int],
     ) -> DebateRolloutOutput:
         use_base_text_prefill = self._use_base_text_prefill()
         n_agents = len(instances_repeated)
@@ -854,10 +937,8 @@ class DebateRuntime:
             (instances_repeated[2 * index], instances_repeated[2 * index + 1])
             for index in range(n_debates)
         ]
-        target_round_counts = self._target_round_counts(
-            n_debates=n_debates,
-            step_seed=step_seed,
-        )
+        if len(target_round_counts) != n_debates:
+            raise ValueError("Target round counts do not match the generated debates")
         base_r1_prompt_tokens = [
             (
                 self._base_r1_prompt_tokens(inst=inst)
@@ -941,7 +1022,7 @@ class DebateRuntime:
                 "task_reward_metrics": task_reward_metrics[index],
             })
 
-        for round_num in range(2, self.runtime_config.effective_max_num_rounds() + 1):
+        for round_num in range(2, max(target_round_counts) + 1):
             active_debates = [
                 index
                 for index, target in enumerate(target_round_counts)
@@ -1116,13 +1197,18 @@ class DebateRuntime:
             debates=debates,
             info_lines=[
                 f"Debates={len(debates)} round_range="
-                f"{self.runtime_config.effective_min_num_rounds()}-"
-                f"{self.runtime_config.effective_max_num_rounds()} "
+                f"{min(target_round_counts)}-{max(target_round_counts)} "
                 f"depth_counts={depth_counts} assignments_by_group={assignments_by_group}"
             ],
         )
 
-    def _rollout_r1_only(self, *, instances_repeated: list[TaskInstance], step_seed: int | None) -> DebateRolloutOutput:
+    def _rollout_r1_only(
+        self,
+        *,
+        instances_repeated: list[TaskInstance],
+        step_seed: int | None,
+        target_round_counts: list[int],
+    ) -> DebateRolloutOutput:
         use_base_text_prefill = self._use_base_text_prefill()
         base_r1_prompt_tokens = [
             (
@@ -1247,6 +1333,7 @@ class DebateRuntime:
                 judge_completion_logprobs.append(lps)
                 judge_raw_responses.append(raw)
         debates = []
+        debates_per_group = self.runtime_config.group_size // 2
         for idx, (inst_a, inst_b) in enumerate(inst_pairs):
             a_idx = 2 * idx
             b_idx = 2 * idx + 1
@@ -1258,14 +1345,24 @@ class DebateRuntime:
                     trajectory_b=DebateTrajectory(agent="B", transitions=[Transition(prompt_tokens=base_r1_prompt_tokens[b_idx], completion_tokens=r1_tokens[b_idx], completion_logprobs=r1_lps[b_idx], round_num=1, metrics={"solution": r1_sol[b_idx], "instance_id": inst_b.instance_id, "visible_text_metrics": r1_visible_metrics[b_idx]}, raw_response=r1_raw[b_idx])], frozen_solution=r1_sol[b_idx], metrics={"r1": r1_text[b_idx], "instance_id": inst_b.instance_id, "task_reward": r1_task_rewards[b_idx], "task_reward_metrics": r1_task_reward_metrics[b_idx]}),
                     verdict=verdicts[idx],
                     judge_reasoning=judge_reasonings[idx],
-                    metrics={"token_only_rollout": True, "task": self.task.name, "judge_retry": False},
+                    metrics={
+                        "token_only_rollout": True,
+                        "task": self.task.name,
+                        "judge_retry": False,
+                        "num_rounds": target_round_counts[idx],
+                        "group_index": idx // debates_per_group,
+                        "debate_index_in_group": idx % debates_per_group,
+                    },
                     judge_prompt_tokens=judge_prompt_tokens[idx],
                     judge_completion_tokens=judge_completion_tokens[idx],
                     judge_completion_logprobs=judge_completion_logprobs[idx],
                     judge_raw_response=judge_raw_responses[idx],
                 )
             )
-        return DebateRolloutOutput(debates=debates, info_lines=[f"Debates={len(debates)} rounds=1"])
+        return DebateRolloutOutput(
+            debates=debates,
+            info_lines=[f"Debates={len(debates)} rounds=1"],
+        )
 
     def _run_llm_judge_transcripts(
         self,
