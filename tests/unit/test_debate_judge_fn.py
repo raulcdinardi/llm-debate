@@ -241,9 +241,9 @@ def test_one_rollout_can_mix_arbitrary_debate_depths_without_sampling_inactive_p
         debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
         runtime_config=DebateRuntimeConfig(
             num_rounds=6,
-            min_num_rounds=3,
-            num_groups=4,
-            group_size=2,
+            rounds_per_group=(3, 6),
+            num_groups=2,
+            group_size=4,
             judge_adapter="judge",
             judge_harness_id=CHAT_SOLUTION_TAGGED_V1,
         ),
@@ -253,7 +253,12 @@ def test_one_rollout_can_mix_arbitrary_debate_depths_without_sampling_inactive_p
     output = runtime.rollout(step_seed=0)
 
     depths = [len(debate.trajectory_a.transitions) for debate in output.debates]
-    assert depths == [3, 6, 3, 6]
+    assert depths == [3, 6, 6, 3]
+    assert sorted(depths[:2]) == [3, 6]
+    assert sorted(depths[2:]) == [3, 6]
+    assert [debate.metrics["group_index"] for debate in output.debates] == [0, 0, 1, 1]
+    assert [debate.metrics["debate_index_in_group"] for debate in output.debates] == [0, 1, 0, 1]
+    assert "assignments_by_group=[[3, 6], [6, 3]]" in output.info_lines[0]
     assert [len(debate.trajectory_b.transitions) for debate in output.debates] == depths
     assert sum(request.adapter_name == "solution" for request in sampler.requests) == 8
     assert sum(request.adapter_name == "debate" for request in sampler.requests) == 28
@@ -269,6 +274,36 @@ def test_one_rollout_can_mix_arbitrary_debate_depths_without_sampling_inactive_p
         skip_special_tokens=False,
     )
     assert "Round 6 (Response):" in deep_judge_prompt
+
+
+def test_depth_multiset_is_repeated_per_group_then_deterministically_reshuffled() -> None:
+    tokenizer = TinyChatTokenizer()
+    runtime = DebateRuntime(
+        task=HTSequenceDebateTask(sequence_len=4),
+        tokenizer=tokenizer,
+        sampler=RecordingSampler(tokenizer=tokenizer, requests=[]),
+        debate_config=DebateConfig(max_tokens_per_turn=16, temperature=0.0),
+        runtime_config=DebateRuntimeConfig(
+            num_rounds=6,
+            rounds_per_group=(3, 4, 5, 6),
+            num_groups=2,
+            group_size=8,
+            judge_adapter="judge",
+            judge_harness_id=CHAT_SOLUTION_TAGGED_V1,
+        ),
+        adapter_layout="split",
+    )
+
+    seed_zero = runtime._target_round_counts(n_debates=8, step_seed=0)
+    repeated_seed_zero = runtime._target_round_counts(n_debates=8, step_seed=0)
+    seed_one = runtime._target_round_counts(n_debates=8, step_seed=1)
+
+    assert seed_zero == [4, 5, 3, 6, 5, 6, 3, 4]
+    assert repeated_seed_zero == seed_zero
+    assert seed_one == [4, 5, 3, 6, 6, 5, 4, 3]
+    for assignment in (seed_zero, seed_one):
+        assert sorted(assignment[:4]) == [3, 4, 5, 6]
+        assert sorted(assignment[4:]) == [3, 4, 5, 6]
 
 
 def test_r1_only_bidirectional_judge_samples_both_orders_and_records_audit() -> None:

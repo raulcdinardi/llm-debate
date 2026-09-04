@@ -72,6 +72,7 @@ def test_cli_defaults_all_sampling_temperatures_to_one() -> None:
     assert args.debate_judge_bidirectional is False
     assert args.debate_judge_constrain_single_token is False
     assert args.judge_grpo_reward_mode == "coherence"
+    assert args.debate_rounds_per_group == []
 
 
 def test_cli_accepts_arbitrary_heterogeneous_debate_depth() -> None:
@@ -81,15 +82,15 @@ def test_cli_accepts_arbitrary_heterogeneous_debate_depth() -> None:
             "/tmp/model",
             "--output-dir",
             "/tmp/out",
-            "--debate-rounds",
-            "7",
-            "--debate-min-rounds",
+            "--debate-rounds-per-group",
             "3",
+            "7",
+            "4",
+            "6",
         ]
     )
 
-    assert args.debate_rounds == 7
-    assert args.debate_min_rounds == 3
+    assert args.debate_rounds_per_group == [3, 7, 4, 6]
 
     assert resolve_judge_harness_id(harness_id=None, num_rounds=7) == CHAT_SOLUTION_TAGGED_V1
     assert args.debate_round_adapter_names == ["solution", "debate", "debate"]
@@ -99,11 +100,18 @@ def test_config_repeats_last_adapter_for_arbitrary_round_depth() -> None:
     config = TrainRunConfig(
         model_path="/tmp/model",
         output_dir="/tmp/out",
-        debate_rounds=7,
-        debate_min_rounds=3,
+        debate_rounds_per_group=(3, 7, 4, 6),
     )
 
     assert config.effective_debate_min_rounds() == 3
+    assert config.effective_debate_max_rounds() == 7
+    assert config.configured_debate_depths() == (3, 7, 4, 6)
+    assert TrainRunConfig.from_dict(config.to_dict()).debate_rounds_per_group == (
+        3,
+        7,
+        4,
+        6,
+    )
     assert config.resolved_debate_round_adapter_names() == (
         "solution",
         "debate",
@@ -115,13 +123,21 @@ def test_config_repeats_last_adapter_for_arbitrary_round_depth() -> None:
     )
 
 
-def test_config_rejects_round_minimum_above_maximum() -> None:
-    with pytest.raises(ValueError, match="debate_min_rounds"):
+def test_config_rejects_depth_array_that_does_not_match_debates_per_group() -> None:
+    with pytest.raises(ValueError, match="exactly one depth per debate"):
         TrainRunConfig(
             model_path="/tmp/model",
             output_dir="/tmp/out",
-            debate_rounds=4,
-            debate_min_rounds=5,
+            debate_rounds_per_group=(3, 4, 5),
+        )
+
+
+def test_config_rejects_nonpositive_depth_in_group_array() -> None:
+    with pytest.raises(ValueError, match="positive integers"):
+        TrainRunConfig(
+            model_path="/tmp/model",
+            output_dir="/tmp/out",
+            debate_rounds_per_group=(3, 4, 0, 6),
         )
 
 

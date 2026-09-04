@@ -115,7 +115,7 @@ class DebateRolloutOutput:
 @dataclass(frozen=True)
 class DebateRuntimeConfig:
     num_rounds: int = 3
-    min_num_rounds: int = 0
+    rounds_per_group: tuple[int, ...] = ()
     num_groups: int = 1
     group_size: int = 2
     enable_thinking: bool | None = None
@@ -151,14 +151,36 @@ class DebateRuntimeConfig:
     debate_judge_server_adapter_path: str | None = None
 
     def __post_init__(self) -> None:
-        minimum = self.min_num_rounds or self.num_rounds
-        if self.num_rounds < 1 or minimum < 1 or minimum > self.num_rounds:
-            raise ValueError("Round range must satisfy 1 <= min_num_rounds <= num_rounds")
+        if self.num_rounds < 1:
+            raise ValueError("num_rounds must be at least 1")
+        object.__setattr__(self, "rounds_per_group", tuple(self.rounds_per_group))
+        if self.rounds_per_group:
+            if self.group_size < 2 or self.group_size % 2 != 0:
+                raise ValueError("Debate requires an even group_size of at least 2")
+            expected_depths = self.group_size // 2
+            if len(self.rounds_per_group) != expected_depths:
+                raise ValueError(
+                    "rounds_per_group must contain exactly one depth per debate "
+                    f"({expected_depths} entries for group_size={self.group_size})"
+                )
+            if any(
+                not isinstance(depth, int) or isinstance(depth, bool) or depth < 1
+                for depth in self.rounds_per_group
+            ):
+                raise ValueError("rounds_per_group depths must all be positive integers")
         if not self.round_adapter_names:
             raise ValueError("round_adapter_names must not be empty")
 
+    def configured_depths(self) -> tuple[int, ...]:
+        if self.rounds_per_group:
+            return self.rounds_per_group
+        return (self.num_rounds,) * max(1, self.group_size // 2)
+
     def effective_min_num_rounds(self) -> int:
-        return self.min_num_rounds or self.num_rounds
+        return min(self.configured_depths())
+
+    def effective_max_num_rounds(self) -> int:
+        return max(self.configured_depths())
 
 
 @dataclass
@@ -261,7 +283,7 @@ class DebateRuntime:
                 )
             else:
                 instances_repeated.extend([inst] * self.runtime_config.group_size)
-        if self.runtime_config.num_rounds == 1:
+        if self.runtime_config.effective_max_num_rounds() == 1:
             return self._rollout_r1_only(instances_repeated=instances_repeated, step_seed=step_seed)
         return self._rollout_variable_rounds(instances_repeated=instances_repeated, step_seed=step_seed)
 
@@ -634,12 +656,22 @@ class DebateRuntime:
         )
 
     def _target_round_counts(self, *, n_debates: int, step_seed: int | None) -> list[int]:
-        minimum = self.runtime_config.effective_min_num_rounds()
-        maximum = self.runtime_config.num_rounds
-        if minimum == maximum:
-            return [maximum] * n_debates
-        rng = random.Random(f"{step_seed}:debate_round_counts")
-        return [rng.randint(minimum, maximum) for _ in range(n_debates)]
+        schedule = self.runtime_config.configured_depths()
+        counts: list[int] = []
+        for group_index in range(self.runtime_config.num_groups):
+            shuffled = list(schedule)
+            seed = (
+                None
+                if step_seed is None
+                else f"{step_seed}:debate_round_counts:group={group_index}"
+            )
+            random.Random(seed).shuffle(shuffled)
+            counts.extend(shuffled)
+        if len(counts) != n_debates:
+            raise ValueError(
+                f"Depth schedule produced {len(counts)} debates, but rollout built {n_debates}"
+            )
+        return counts
 
     def _sample_many(self, *, prompt_tokens_list: list[list[int]], round_num: int, step_seed: int | None, stop_token_ids: list[int], max_tokens: int, temperature: float, adapter_name: str | None = None) -> list[tuple[list[int], list[float], str, dict]]:
         requests = []
@@ -909,7 +941,7 @@ class DebateRuntime:
                 "task_reward_metrics": task_reward_metrics[index],
             })
 
-        for round_num in range(2, self.runtime_config.num_rounds + 1):
+        for round_num in range(2, self.runtime_config.effective_max_num_rounds() + 1):
             active_debates = [
                 index
                 for index, target in enumerate(target_round_counts)
@@ -1036,6 +1068,7 @@ class DebateRuntime:
         ) = judge_outputs
 
         debates: list[DebateResult] = []
+        debates_per_group = self.runtime_config.group_size // 2
         for index, (inst_a, inst_b) in enumerate(inst_pairs):
             a_index = 2 * index
             b_index = a_index + 1
@@ -1062,6 +1095,8 @@ class DebateRuntime:
                         "task": self.task.name,
                         "judge_retry": judge_retry_flags[index],
                         "num_rounds": target_round_counts[index],
+                        "group_index": index // debates_per_group,
+                        "debate_index_in_group": index % debates_per_group,
                     },
                     judge_prompt_tokens=judge_prompt_tokens[index],
                     judge_completion_tokens=judge_completion_tokens[index],
@@ -1073,12 +1108,17 @@ class DebateRuntime:
             depth: target_round_counts.count(depth)
             for depth in sorted(set(target_round_counts))
         }
+        assignments_by_group = [
+            target_round_counts[start : start + debates_per_group]
+            for start in range(0, len(target_round_counts), debates_per_group)
+        ]
         return DebateRolloutOutput(
             debates=debates,
             info_lines=[
                 f"Debates={len(debates)} round_range="
-                f"{self.runtime_config.effective_min_num_rounds()}-{self.runtime_config.num_rounds} "
-                f"depth_counts={depth_counts}"
+                f"{self.runtime_config.effective_min_num_rounds()}-"
+                f"{self.runtime_config.effective_max_num_rounds()} "
+                f"depth_counts={depth_counts} assignments_by_group={assignments_by_group}"
             ],
         )
 

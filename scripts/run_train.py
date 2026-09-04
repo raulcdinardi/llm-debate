@@ -71,12 +71,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--thinking-mode", default="default", choices=["default", "no_think", "force_think"])
     parser.add_argument("--advantage-mode", default="zscore", choices=["identity", "centered_mean", "zscore"])
     parser.add_argument("--ppo-clip-epsilon", type=float, default=0.2)
-    parser.add_argument("--debate-rounds", type=int, default=3, help="Maximum debate depth (>=1).")
     parser.add_argument(
-        "--debate-min-rounds",
+        "--debate-rounds",
         type=int,
-        default=0,
-        help="Minimum per-debate depth; 0 fixes every debate at --debate-rounds.",
+        default=3,
+        help="Fixed debate depth when --debate-rounds-per-group is omitted.",
+    )
+    parser.add_argument(
+        "--debate-rounds-per-group",
+        type=int,
+        nargs="+",
+        default=[],
+        metavar="N",
+        help=(
+            "One round count per debate in a prompt group. The complete array is "
+            "reshuffled independently inside every group on each rollout."
+        ),
     )
     parser.add_argument(
         "--debate-r1-reward",
@@ -335,6 +345,10 @@ def main() -> int:
     from llm_local_rl.driver import TrainingDriver
 
     args = parse_args()
+    effective_debate_rounds = max(
+        args.debate_rounds_per_group,
+        default=args.debate_rounds,
+    )
     if args.sampler_teardown_before_training and args.sampler_sleep_before_training:
         raise ValueError("Use either --sampler-teardown-before-training or --sampler-sleep-before-training, not both.")
     if args.resume:
@@ -396,7 +410,7 @@ def main() -> int:
                 advantage_mode=args.advantage_mode,
                 ppo_clip_epsilon=args.ppo_clip_epsilon,
                 debate_rounds=args.debate_rounds,
-                debate_min_rounds=args.debate_min_rounds,
+                debate_rounds_per_group=tuple(args.debate_rounds_per_group),
                 debate_r1_reward=args.debate_r1_reward,
                 debate_r23_reward=args.debate_r23_reward,
                 debate_r23_constant=args.debate_r23_constant,
@@ -414,7 +428,7 @@ def main() -> int:
                 debate_judge_harness=resolve_judge_harness_id(
                     harness_id=args.debate_judge_harness,
                     legacy_prompt_format=args.debate_judge_prompt_format,
-                    num_rounds=args.debate_rounds,
+                    num_rounds=effective_debate_rounds,
                 ),
                 debate_judge_max_tokens=args.debate_judge_max_tokens,
                 debate_judge_temperature=args.debate_judge_temperature,

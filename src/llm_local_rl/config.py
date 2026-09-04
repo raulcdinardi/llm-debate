@@ -80,7 +80,7 @@ class TrainRunConfig:
     advantage_mode: str = "zscore"
     ppo_clip_epsilon: float = 0.2
     debate_rounds: int = 3
-    debate_min_rounds: int = 0
+    debate_rounds_per_group: tuple[int, ...] = ()
     debate_r1_reward: str = "task"
     debate_r23_reward: str = "constant"
     debate_r23_constant: float = 1.0
@@ -188,15 +188,23 @@ class TrainRunConfig:
         """Return the single resolved judge contract used by every execution path."""
         return get_judge_harness(self.debate_judge_harness)
 
+    def configured_debate_depths(self) -> tuple[int, ...]:
+        if self.debate_rounds_per_group:
+            return self.debate_rounds_per_group
+        return (self.debate_rounds,) * max(1, self.rollout.group_size // 2)
+
     def effective_debate_min_rounds(self) -> int:
-        return self.debate_min_rounds or self.debate_rounds
+        return min(self.configured_debate_depths())
+
+    def effective_debate_max_rounds(self) -> int:
+        return max(self.configured_debate_depths())
 
     def resolved_debate_round_adapter_names(self) -> tuple[str, ...]:
         if not self.debate_round_adapter_names:
             raise ValueError("debate_round_adapter_names must not be empty")
         return tuple(
             self.debate_round_adapter_names[min(index, len(self.debate_round_adapter_names) - 1)]
-            for index in range(self.debate_rounds)
+            for index in range(self.effective_debate_max_rounds())
         )
 
     def __post_init__(self) -> None:
@@ -240,9 +248,28 @@ class TrainRunConfig:
         uses_configured_harness = self.debate_mock_judge_seed is None
         if self.debate_rounds < 1:
             raise ValueError("debate_rounds must be at least 1")
+        object.__setattr__(
+            self,
+            "debate_rounds_per_group",
+            tuple(self.debate_rounds_per_group),
+        )
+        if self.debate_rounds_per_group:
+            if self.rollout.mode != "debate":
+                raise ValueError("debate_rounds_per_group requires rollout.mode='debate'")
+            if self.rollout.group_size < 2 or self.rollout.group_size % 2 != 0:
+                raise ValueError("Debate requires an even rollout.group_size of at least 2")
+            expected_depths = self.rollout.group_size // 2
+            if len(self.debate_rounds_per_group) != expected_depths:
+                raise ValueError(
+                    "debate_rounds_per_group must contain exactly one depth per debate "
+                    f"in a group ({expected_depths} entries for group_size={self.rollout.group_size})"
+                )
+            if any(
+                not isinstance(depth, int) or isinstance(depth, bool) or depth < 1
+                for depth in self.debate_rounds_per_group
+            ):
+                raise ValueError("debate_rounds_per_group depths must all be positive integers")
         min_rounds = self.effective_debate_min_rounds()
-        if min_rounds < 1 or min_rounds > self.debate_rounds:
-            raise ValueError("debate_min_rounds must be 0 or between 1 and debate_rounds")
         if uses_configured_harness and min_rounds < judge_harness.required_rounds:
             raise ValueError(
                 f"Judge harness {judge_harness.harness_id!r} requires at least "
@@ -363,7 +390,7 @@ class TrainRunConfig:
         if self.debate_r1_reward == "judge_soft_task_gap" and self.rollout.mode != "debate":
             raise ValueError("judge_soft_task_gap is only valid for debate rollouts")
         if self.debate_r23_reward == "soft_judge":
-            if self.debate_rounds < 2:
+            if self.effective_debate_max_rounds() < 2:
                 raise ValueError("soft_judge R2/R3 reward requires at least two debate rounds")
             if self.debate_r23_mode != "symmetric":
                 raise ValueError("soft_judge is intrinsically symmetric/zero-sum")
@@ -394,7 +421,7 @@ class TrainRunConfig:
         if self.debate_stop_on_concluded:
             if self.rollout.mode != "debate":
                 raise ValueError("debate_stop_on_concluded is only valid for debate rollouts")
-            if self.debate_rounds < 2:
+            if self.effective_debate_max_rounds() < 2:
                 raise ValueError("debate_stop_on_concluded requires at least two debate rounds")
             if self.debate_prompt_format != "qwen35_base_text_prefill":
                 raise ValueError(
@@ -408,7 +435,9 @@ class TrainRunConfig:
                 raise ValueError("judge_rejection_task is only valid for debate rollouts")
             if self.adapter_layout != "split":
                 raise ValueError("judge_rejection_task requires adapter_layout='split'")
-            expected_round_adapters = ("solution",) + ("debate",) * (self.debate_rounds - 1)
+            expected_round_adapters = ("solution",) + (
+                "debate",
+            ) * (self.effective_debate_max_rounds() - 1)
             configured_round_adapters = self.resolved_debate_round_adapter_names()
             if configured_round_adapters != expected_round_adapters:
                 raise ValueError(
@@ -433,7 +462,7 @@ class TrainRunConfig:
         if self.debate_judge_bidirectional:
             if judge_modes != 0:
                 raise ValueError("bidirectional judge sampling requires the in-process judge sampler")
-            if self.rollout.mode != "debate" or self.debate_rounds < 1:
+            if self.rollout.mode != "debate" or self.effective_debate_max_rounds() < 1:
                 raise ValueError(
                     "bidirectional judge sampling requires at least one debate round"
                 )
@@ -537,7 +566,7 @@ class TrainRunConfig:
             advantage_mode=data.get("advantage_mode", "zscore"),
             ppo_clip_epsilon=data.get("ppo_clip_epsilon", 0.2),
             debate_rounds=data.get("debate_rounds", 3),
-            debate_min_rounds=data.get("debate_min_rounds", 0),
+            debate_rounds_per_group=tuple(data.get("debate_rounds_per_group", ())),
             debate_r1_reward=data.get("debate_r1_reward", "task"),
             debate_r23_reward=data.get("debate_r23_reward", "constant"),
             debate_r23_constant=data.get("debate_r23_constant", 1.0),
@@ -555,7 +584,10 @@ class TrainRunConfig:
             debate_judge_harness=resolve_judge_harness_id(
                 harness_id=data.get("debate_judge_harness"),
                 legacy_prompt_format=data.get("debate_judge_prompt_format"),
-                num_rounds=int(data.get("debate_rounds", 3)),
+                num_rounds=max(
+                    data.get("debate_rounds_per_group", ()),
+                    default=int(data.get("debate_rounds", 3)),
+                ),
             ),
             debate_judge_max_tokens=data.get("debate_judge_max_tokens", 0),
             debate_judge_temperature=data.get("debate_judge_temperature", 1.0),

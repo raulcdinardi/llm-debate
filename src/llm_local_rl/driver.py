@@ -346,7 +346,7 @@ class TrainingDriver:
         r2_max_tokens = self.config.debate_r2_max_tokens or r23_max_tokens
         r3_max_tokens = self.config.debate_r3_max_tokens or r23_max_tokens
         return DebateConfig(
-            num_rounds=self.config.debate_rounds,
+            num_rounds=self.config.effective_debate_max_rounds(),
             enable_thinking=self._enable_thinking(),
             max_tokens_per_turn=self.config.rollout.max_tokens,
             max_tokens_r1=r1_max_tokens,
@@ -722,8 +722,8 @@ class TrainingDriver:
             sampler=self.sampler,
             debate_config=self._debate_config(),
             runtime_config=DebateRuntimeConfig(
-                num_rounds=self.config.debate_rounds,
-                min_num_rounds=self.config.debate_min_rounds,
+                num_rounds=self.config.effective_debate_max_rounds(),
+                rounds_per_group=self.config.configured_debate_depths(),
                 num_groups=self.config.rollout.num_groups,
                 group_size=self.config.rollout.group_size,
                 debate_r1_reward=self.config.debate_r1_reward,
@@ -1079,7 +1079,7 @@ class TrainingDriver:
         if self.config.adapter_layout == "shared":
             training_data = assemble_training_data_by_mode(
                 debates=debates,
-                num_rounds=self.config.debate_rounds,
+                num_rounds=self.config.effective_debate_max_rounds(),
                 r1_reward_mode=self.config.debate_r1_reward,
                 r23_reward_mode=self.config.debate_r23_reward,
                 r23_constant=self.config.debate_r23_constant,
@@ -1102,7 +1102,7 @@ class TrainingDriver:
 
         grouped = assemble_split_train_examples(
             debates=debates,
-            num_rounds=self.config.debate_rounds,
+            num_rounds=self.config.effective_debate_max_rounds(),
             round_adapter_names=self.config.resolved_debate_round_adapter_names(),
             r1_reward_mode=self.config.debate_r1_reward,
             r23_reward_mode=self.config.debate_r23_reward,
