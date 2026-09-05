@@ -1,0 +1,582 @@
+{
+  "source_commit": "10ede7c772f8fd2eedb24256f0fc075968097aef",
+  "legacy_commit": "5796701ef85ac402a3dd3d71ade1204085d32e5e",
+  "files": {
+    ".dockerignore": {
+      "source_path": ".dockerignore",
+      "sha256": "bce1c0e6f70a1922503b336f6b88ac56acb001c00ab3e83586d56be3a1340e4e"
+    },
+    "docs/local_rl.md": {
+      "source_path": "README.md",
+      "sha256": "4209bed225b0437319b46258c16d3ebbe32ace0f8476aa4a2910b6c744e4f5eb"
+    },
+    "docker/compose.qwen35-ht-debate.yaml": {
+      "source_path": "docker/compose.qwen35-ht-debate.yaml",
+      "sha256": "77ba9f324836a90fea3cda323dda4e624911d41d51d73a9b722cb24a8cee7648"
+    },
+    "docker/cw-judge-signal-phase0.Dockerfile": {
+      "source_path": "docker/cw-judge-signal-phase0.Dockerfile",
+      "sha256": "7a2fc5d17551d5855cfc53ce50a444796e4c2b098058e353d56c7e9d03edc950"
+    },
+    "docker/entrypoint.sh": {
+      "source_path": "docker/entrypoint.sh",
+      "sha256": "d26812e0a038666669272edff7818dc1daaeff1412d363a0d2a7220fcb57ecaf"
+    },
+    "docker/qwen35-ht-debate.Dockerfile": {
+      "source_path": "docker/qwen35-ht-debate.Dockerfile",
+      "sha256": "f3a3beb8fc77b275ce8f1965ee828f1caa45eb19e07c93839e47effa0ee8dc76"
+    },
+    "docker/qwen35-ht-debate.env.example": {
+      "source_path": "docker/qwen35-ht-debate.env.example",
+      "sha256": "177fdb1623ea29755ed91e32393831d57e0d9eb44f7c0741392585eacf8c0bfb"
+    },
+    "docker/qwen35-ht-debate.preloaded.Dockerfile": {
+      "source_path": "docker/qwen35-ht-debate.preloaded.Dockerfile",
+      "sha256": "4ca8e6fe29e3e24f739519a8594fd19c836932e8a440270df0569165e31667ce"
+    },
+    "docker/qwen35-ht-debate.real.env.example": {
+      "source_path": "docker/qwen35-ht-debate.real.env.example",
+      "sha256": "ea59c50820f225276818b899426b6c618828b79dc21572bd6a75c26c4497a53b"
+    },
+    "docker/run_cw_judge_signal_phase0.sh": {
+      "source_path": "docker/run_cw_judge_signal_phase0.sh",
+      "sha256": "454309df0d4d1896aca448bf919045887c7c69970c132bccd1f0fc4d9b5e33d0"
+    },
+    "docker/run_ht_debate_qwen35.sh": {
+      "source_path": "docker/run_ht_debate_qwen35.sh",
+      "sha256": "2c89dd5d1ec07df67ff3d9f6a13cee622c9967ef3b98d1cf0674c563b185a556"
+    },
+    "docker/run_ht_qwen35_suite.sh": {
+      "source_path": "docker/run_ht_qwen35_suite.sh",
+      "sha256": "855b7f0cac382da126648d1a0755eb84ad5307d5cb71d596ceead988e64a65ed"
+    },
+    "docker/vast_onstart_ht_debate.sh": {
+      "source_path": "docker/vast_onstart_ht_debate.sh",
+      "sha256": "28d82d2efb348de8059fbb6b1ad19c519d2b8af58373c926398eaeb688b5a9f5"
+    },
+    "docs/architecture.md": {
+      "source_path": "docs/architecture.md",
+      "sha256": "733a09d8eb61530a10d655e695c11286ee69ca5f698967c6523112bd4d3aabb3"
+    },
+    "docs/cw_judge_signal_integration_20260719.md": {
+      "source_path": "docs/cw_judge_signal_integration_20260719.md",
+      "sha256": "2cd28f86ad2ec21d4207dbbae9f92bf4d72e1a28d1565cd6c18d9ca5ff385e39"
+    },
+    "docs/debate_judge_grpo.md": {
+      "source_path": "docs/debate_judge_grpo.md",
+      "sha256": "a2486c599e27fdffe782e39e62b90fc67967f5e97181fd8922492e5e0ec066e6"
+    },
+    "docs/judge_harnesses.md": {
+      "source_path": "docs/judge_harnesses.md",
+      "sha256": "bc3fc33a7a7eb3d0e26a7e09ab106a956e55b75c2533b322ae23a81add8268a2"
+    },
+    "docs/order_symmetric_soft_judge.md": {
+      "source_path": "docs/order_symmetric_soft_judge.md",
+      "sha256": "5d5a2e9ffa27db90bf8367771fd01284f9ee224252f27cd3b60f4413bbd098f7"
+    },
+    "docs/qwen35_ht_debate_docker.md": {
+      "source_path": "docs/qwen35_ht_debate_docker.md",
+      "sha256": "4a7dd1a7f20bb00b365d5ea25a79f51074c64edacdfea2fda93704455a36b0c2"
+    },
+    "docs/test_inventory.md": {
+      "source_path": "docs/test_inventory.md",
+      "sha256": "88839a12b9cdea9efcb6ad3445035ea03b8857477f02282a280827401b560f6e"
+    },
+    "docs/vast_ht_debate_launch.md": {
+      "source_path": "docs/vast_ht_debate_launch.md",
+      "sha256": "2a1b7f3a4cc9688350f160df2706bba3f9d076f27018ba6674337fe0c618962c"
+    },
+    "prompts/local_rl/debate/r2_token_template.md": {
+      "source_path": "prompts/debate/r2_token_template.md",
+      "sha256": "66899b0926b165e7742f84e11d62275d0634979464c31d569db1f785cc1c0ce2"
+    },
+    "prompts/local_rl/debate/r2_user_template.md": {
+      "source_path": "prompts/debate/r2_user_template.md",
+      "sha256": "05d68f52618a4dc48bff5f5b00a90ccc5109c9414a20c0368c386ca389a5d2c0"
+    },
+    "prompts/local_rl/debate/r3_token_template.md": {
+      "source_path": "prompts/debate/r3_token_template.md",
+      "sha256": "dbb2f30b1e865f2c806a62f9b247543ce9b58b9dc8566a8d008b198674242cdb"
+    },
+    "prompts/local_rl/debate/r3_user_template.md": {
+      "source_path": "prompts/debate/r3_user_template.md",
+      "sha256": "88b3f4cb1f56ba3d61d16207afdb2f157b8cf0c4f585c95d6c1197f5358ea2c9"
+    },
+    "prompts/local_rl/debate/system_argue.md": {
+      "source_path": "prompts/debate/system_argue.md",
+      "sha256": "1cc909cecd035275033aced426cb1e5346df5bc3cc2f450e75a4f8ab689f90fe"
+    },
+    "prompts/local_rl/debate/system_judge.md": {
+      "source_path": "prompts/debate/system_judge.md",
+      "sha256": "884c8910ebf77c87f6d8f371d2088d8bac8e7864b9caa1c4482f6433db0a12e3"
+    },
+    "prompts/local_rl/debate/system_pointwise_judge.md": {
+      "source_path": "prompts/debate/system_pointwise_judge.md",
+      "sha256": "4c5fd301c990d190d0c3c1a76043f7c64b21d9b3f67f125ba42bb97fa0356f00"
+    },
+    "prompts/local_rl/debate/system_propose.md": {
+      "source_path": "prompts/debate/system_propose.md",
+      "sha256": "3094248790960beac7f68136c5ea9e1eee1a7353918af18e2c234ef5513a8259"
+    },
+    "prompts/local_rl/tasks/coin_system.md": {
+      "source_path": "prompts/tasks/coin_system.md",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "prompts/local_rl/tasks/coin_user.md": {
+      "source_path": "prompts/tasks/coin_user.md",
+      "sha256": "bef0cba48ac602d0ec58a94d9a09eb84e1597f34b67f48ea5843df08057d010e"
+    },
+    "prompts/local_rl/tasks/constrained_writing_user.md": {
+      "source_path": "prompts/tasks/constrained_writing_user.md",
+      "sha256": "e055c414726e273ec2c4899183729fe4e6b09bef8c784e268f9e9f0219e869ae"
+    },
+    "prompts/local_rl/tasks/ht_sequence_user.md": {
+      "source_path": "prompts/tasks/ht_sequence_user.md",
+      "sha256": "0ed7756721fc9909496c047f016fc16a809809fb698ca15e2af073847d640ea5"
+    },
+    "prompts/local_rl/tasks/quality_debate_judge_context.md": {
+      "source_path": "prompts/tasks/quality_debate_judge_context.md",
+      "sha256": "90f4d157137e8977425d7157e665bc3cecc56639f38bee60962bd15b669efe48"
+    },
+    "prompts/local_rl/tasks/quality_debate_r1.md": {
+      "source_path": "prompts/tasks/quality_debate_r1.md",
+      "sha256": "f6b0abd8620f20a12df75a2e73c3418fd27f0500757024ec41c70b231afc1833"
+    },
+    "prompts/local_rl/tasks/quality_debate_r2.md": {
+      "source_path": "prompts/tasks/quality_debate_r2.md",
+      "sha256": "66752b4d895ba8516db93dc62fec538e7e57dfb859b482e2bf7f274f536238af"
+    },
+    "prompts/local_rl/tasks/quality_debate_r3.md": {
+      "source_path": "prompts/tasks/quality_debate_r3.md",
+      "sha256": "e82eac243423a1e5fc2d34a9ffe39d8aa5b1097688e0ce8965365611c0a620cd"
+    },
+    "prompts/local_rl/tasks/short_story_judge_context.md": {
+      "source_path": "prompts/tasks/short_story_judge_context.md",
+      "sha256": "dc6c9109ec64b8f4d9cef1fcedb00eff95550066a25ee8f0bf30190401c2027f"
+    },
+    "prompts/local_rl/tasks/short_story_r1.md": {
+      "source_path": "prompts/tasks/short_story_r1.md",
+      "sha256": "6d3faa98efc0a3ced64a42f6def983ca5842ce3b170ff11fb248790f5f085e0a"
+    },
+    "prompts/local_rl/tasks/short_story_r2.md": {
+      "source_path": "prompts/tasks/short_story_r2.md",
+      "sha256": "5450eea1369f73d8d2dd2b91870d70e2de07e036eef8bea60e573eafab43dad0"
+    },
+    "prompts/local_rl/tasks/short_story_r3.md": {
+      "source_path": "prompts/tasks/short_story_r3.md",
+      "sha256": "c71f6e256a05d457933839fffb467167593c3bf16f130fae0a31ba6ac86e449e"
+    },
+    "pyproject.toml": {
+      "source_path": "pyproject.toml",
+      "sha256": "c8232d07882d3f7464d1d522f15e36034a182a2243386fb6e323468034b009e1"
+    },
+    "scripts/behavior_policy_temperature_microprobe.py": {
+      "source_path": "scripts/behavior_policy_temperature_microprobe.py",
+      "sha256": "24064b7b1bb55b5faac9448dfab677482436710c7cc8cc0acb06abed075c9de9"
+    },
+    "scripts/bind_judge_harness.py": {
+      "source_path": "scripts/bind_judge_harness.py",
+      "sha256": "2554b26f96b4c282cc8443aa18d4f74f364699691823e27834be7b01be87545e"
+    },
+    "scripts/build_push_dockerhub_qwen35_vast_image.sh": {
+      "source_path": "scripts/build_push_dockerhub_qwen35_vast_image.sh",
+      "sha256": "3e7d642e66b865027b85359bd02a7890bbd6bdb8725478c926ce56e9edff7b42"
+    },
+    "scripts/build_push_qwen35_vast_image.sh": {
+      "source_path": "scripts/build_push_qwen35_vast_image.sh",
+      "sha256": "245b5f574f0e9c5033f890f25a7848340bf2f752cacdc987a8311f6f61048907"
+    },
+    "scripts/cw_constrained_writing_scorer_gold.py": {
+      "source_path": "scripts/cw_constrained_writing_scorer_gold.py",
+      "sha256": "a31cbc01c00740b9e9d0b6a3868dc9aeb137959737303e90e5530382031b16ca"
+    },
+    "scripts/cw_judge_signal_phase0_diagnostic.py": {
+      "source_path": "scripts/cw_judge_signal_phase0_diagnostic.py",
+      "sha256": "b82b736e04a5ea0eb863c745332b51cc58992d6c0d23a540e9cfe593ed666755"
+    },
+    "scripts/cw_judge_signal_phase0_finalize.py": {
+      "source_path": "scripts/cw_judge_signal_phase0_finalize.py",
+      "sha256": "5e5d31409820cc1db710d96fd1feb34c3ac3c09e17e4a3ddbe66ec1ed6b44000"
+    },
+    "scripts/cw_judge_signal_phase0_prepare.py": {
+      "source_path": "scripts/cw_judge_signal_phase0_prepare.py",
+      "sha256": "1bf9b0bf6bad9c630954e29fb70e43705fd8be0cd8ef754185981ad20b89ccb3"
+    },
+    "scripts/cw_phase0_archive.py": {
+      "source_path": "scripts/cw_phase0_archive.py",
+      "sha256": "3839950628b8818fd992272a084af8983b8167e237fd5b0b22c2679d23246822"
+    },
+    "scripts/install_docker_wsl.sh": {
+      "source_path": "scripts/install_docker_wsl.sh",
+      "sha256": "39c0258b0316f8e1793c4038e1e0c4302ca515901e3e83939679717ab789f5be"
+    },
+    "scripts/make_vast_bundle.sh": {
+      "source_path": "scripts/make_vast_bundle.sh",
+      "sha256": "709a2e8481887d8509f3a036b3ee237e6d8c0438a16ef40295f7c003786655b1"
+    },
+    "scripts/run_ht_baseline.py": {
+      "source_path": "scripts/run_ht_baseline.py",
+      "sha256": "ade3dc3b9257be9a9ca9270a6f89c22e2edbf1db2a1561c6325e961b3aad4888"
+    },
+    "scripts/run_ht_train.py": {
+      "source_path": "scripts/run_ht_train.py",
+      "sha256": "2227f2e9964a470b5fc16184fd30f96373d40a40e321796f8bca437d0f17f2d3"
+    },
+    "scripts/run_test_suite.py": {
+      "source_path": "scripts/run_test_suite.py",
+      "sha256": "ca2a257327746e48984e822c6a37555c8f9803d8d5a124854e4ffec83031feb1"
+    },
+    "scripts/run_train.py": {
+      "source_path": "scripts/run_train.py",
+      "sha256": "8c7a34aa6a0ab427a883ee9b8fbbf2fd673eea0a6b9b0e275b49a48b60bfd758"
+    },
+    "src/llm_local_rl/__init__.py": {
+      "source_path": "src/llm_local_rl/__init__.py",
+      "sha256": "09b3a1bb66eb2c31802f9d88b0300f7f70c99d2ceb0421200286179e59dc0b03"
+    },
+    "src/llm_local_rl/base_model_judge.py": {
+      "source_path": "src/llm_local_rl/base_model_judge.py",
+      "sha256": "596406ee98f8a2eeb3048816c1674a8add6a317ba333d8e6c0f3853e8e14dc69"
+    },
+    "src/llm_local_rl/behavior_policy.py": {
+      "source_path": "src/llm_local_rl/behavior_policy.py",
+      "sha256": "6487dd83e7d43e31f9cbf6f76f4a44ad778aacfbb389ead2156f7ceaa6454478"
+    },
+    "src/llm_local_rl/behavior_policy_microprobe.py": {
+      "source_path": "src/llm_local_rl/behavior_policy_microprobe.py",
+      "sha256": "03d70580bb09431905073f95dc0ab2cd940d7a097c36fc398beef8ef62d19c2f"
+    },
+    "src/llm_local_rl/chat_templates.py": {
+      "source_path": "src/llm_local_rl/chat_templates.py",
+      "sha256": "260716eb248cf4b818ea1d4a066a1e5729f76cffda4abe3ebf2683c65403cf87"
+    },
+    "src/llm_local_rl/checkpointing.py": {
+      "source_path": "src/llm_local_rl/checkpointing.py",
+      "sha256": "5beb3ac7d990d72a68a9689e33854c463d3392ce61540aa178351aadd2dae957"
+    },
+    "src/llm_local_rl/config.py": {
+      "source_path": "src/llm_local_rl/config.py",
+      "sha256": "1eaa89f72fd92b8f43fcfedc7a900a9a97f5ffd6da5d63e2eaeeee023d91317e"
+    },
+    "src/llm_local_rl/constrained_writing.py": {
+      "source_path": "src/llm_local_rl/constrained_writing.py",
+      "sha256": "eb2c5121457c5fa01908844227ca8ad9ac20f5cd2422fc2d2b9ffb357b5f8dd3"
+    },
+    "src/llm_local_rl/countdown_code.py": {
+      "source_path": "src/llm_local_rl/countdown_code.py",
+      "sha256": "01654e2c99e566f7b2ac1f14c5a7a9577b855d05d28281f4782ae6ee9c736f61"
+    },
+    "src/llm_local_rl/debate_depth.py": {
+      "source_path": "src/llm_local_rl/debate_depth.py",
+      "sha256": "3597c43168806389894a3920e7833d4b5ad43d275b26d7280e97b5eb13ccf5bf"
+    },
+    "src/llm_local_rl/debate_parity.py": {
+      "source_path": "src/llm_local_rl/debate_parity.py",
+      "sha256": "1738bff08cd886f27f4199bd373a138bd2860f2ce71926cdf131c0fe12be29a4"
+    },
+    "src/llm_local_rl/debate_runtime.py": {
+      "source_path": "src/llm_local_rl/debate_runtime.py",
+      "sha256": "d070d35a0eabd0d2101ad67d8cb5556dd1b5f46b92f910fda99e4320cf962d08"
+    },
+    "src/llm_local_rl/debate_tasks.py": {
+      "source_path": "src/llm_local_rl/debate_tasks.py",
+      "sha256": "78200d9acd7afa4f68d171ae72e82060634a0a3a2c63b6345b3e22d767f7a299"
+    },
+    "src/llm_local_rl/driver.py": {
+      "source_path": "src/llm_local_rl/driver.py",
+      "sha256": "33dc31efa032d9097b2bf631f9efec363d7fcf1b2efb31a57b9e82762ce0cafb"
+    },
+    "src/llm_local_rl/envs.py": {
+      "source_path": "src/llm_local_rl/envs.py",
+      "sha256": "56a4747f36b79cd668d6ca2366ae34bcf7d7c0f1ecb3fcec0105d426f6c16800"
+    },
+    "src/llm_local_rl/episodes.py": {
+      "source_path": "src/llm_local_rl/episodes.py",
+      "sha256": "f0c28b147745c444baf9211499b4a54317603394d5f2dea6e14e331a80fa781c"
+    },
+    "src/llm_local_rl/ht_sequence_format.py": {
+      "source_path": "src/llm_local_rl/ht_sequence_format.py",
+      "sha256": "30319c52df4f0ff4616e5b7aa567e0152726f4aefca57a176cc31471ba7a23b2"
+    },
+    "src/llm_local_rl/integration_assets.py": {
+      "source_path": "src/llm_local_rl/integration_assets.py",
+      "sha256": "db2b4e442e0705cc0d7cece7c6ceb25464c5f8298e5698714a5774eb90a9446a"
+    },
+    "src/llm_local_rl/interfaces.py": {
+      "source_path": "src/llm_local_rl/interfaces.py",
+      "sha256": "b31404c928e1399ada625dd6200bdcc8185a551f7e5c80bfb195b0cfe0ed1266"
+    },
+    "src/llm_local_rl/judge_harness.py": {
+      "source_path": "src/llm_local_rl/judge_harness.py",
+      "sha256": "6afe1817d4e51e66d4051946dcc95b563e2ce89e810b5882d8ce95ba048d85ab"
+    },
+    "src/llm_local_rl/local_renderers.py": {
+      "source_path": "src/llm_local_rl/local_renderers.py",
+      "sha256": "03f30f32b7cb86bdb0736ebe4fdf71eaa4a441615ac97ab8e00083fbc4fbafa5"
+    },
+    "src/llm_local_rl/lora_identity.py": {
+      "source_path": "src/llm_local_rl/lora_identity.py",
+      "sha256": "b9e7cc4077f27bae050d88b624ed2671949efd63e0c2509e568aa43e9d1caf66"
+    },
+    "src/llm_local_rl/masking.py": {
+      "source_path": "src/llm_local_rl/masking.py",
+      "sha256": "0b71418d8fcbd219b41aebd24565a215a6a5dc20c6bad807b7c3693a5e9f805e"
+    },
+    "src/llm_local_rl/memory_trace.py": {
+      "source_path": "src/llm_local_rl/memory_trace.py",
+      "sha256": "715f3d9121bfe0fdfb7d32af5aefc67898e17f022e6d260ad8346c578fecb202"
+    },
+    "src/llm_local_rl/metrics.py": {
+      "source_path": "src/llm_local_rl/metrics.py",
+      "sha256": "d71f5d3faee209551506b4389faae7b521fa516d226fcdc663237dc6b31b5611"
+    },
+    "src/llm_local_rl/mmlu_pro_pairwise.py": {
+      "source_path": "src/llm_local_rl/mmlu_pro_pairwise.py",
+      "sha256": "2ddeedcc832c4d2462ac8c6bae5614a9b760af376f06bd0001f6d9f47c1a43b5"
+    },
+    "src/llm_local_rl/mock_judge.py": {
+      "source_path": "src/llm_local_rl/mock_judge.py",
+      "sha256": "46ef4f2fc55f1898062de4cbdd3e3b2a326b29a6b048400d722e85f542a4321b"
+    },
+    "src/llm_local_rl/model_io_trace.py": {
+      "source_path": "src/llm_local_rl/model_io_trace.py",
+      "sha256": "5fb5b895417df372ab5b8b52009320120fb150a0df1f82eb98cc394e43a5935a"
+    },
+    "src/llm_local_rl/observability.py": {
+      "source_path": "src/llm_local_rl/observability.py",
+      "sha256": "5fceb7fcc12a31d9fe4f8978f3aa3f9319bdf74086430027ce1060da184493aa"
+    },
+    "src/llm_local_rl/on_policy_logprobs.py": {
+      "source_path": "src/llm_local_rl/on_policy_logprobs.py",
+      "sha256": "f6b5404113eaea55c23bae812cbacb2dd76b4d1efc9aac4110b66f8ce3c58050"
+    },
+    "src/llm_local_rl/prompts.py": {
+      "source_path": "src/llm_local_rl/prompts.py",
+      "sha256": "d8d94a1870a8e5410a9b1dcd821a202f102988bb682ad25fad59d2b0acc05ddc"
+    },
+    "src/llm_local_rl/quality_data.py": {
+      "source_path": "src/llm_local_rl/quality_data.py",
+      "sha256": "a2a83d2fdf106006c95183194f4201a5d9e1e4463a6d1db6535645a274fd29a1"
+    },
+    "src/llm_local_rl/quote_verifier.py": {
+      "source_path": "src/llm_local_rl/quote_verifier.py",
+      "sha256": "38468b4e69b29ed287f7401a8594b9a84bcc6965e42be1b5b900f6cf2eb644e9"
+    },
+    "src/llm_local_rl/qwen35_base_format.py": {
+      "source_path": "src/llm_local_rl/qwen35_base_format.py",
+      "sha256": "c2437a1c69edb1ecc0e84ef3e5fa6514c1e194d48678901275f28714c1b5923a"
+    },
+    "src/llm_local_rl/registry.py": {
+      "source_path": "src/llm_local_rl/registry.py",
+      "sha256": "41fd948d874b36d2b85cac8a480ba31375df975596ad7bcc8545c2ed2ae3ef29"
+    },
+    "src/llm_local_rl/replay.py": {
+      "source_path": "src/llm_local_rl/replay.py",
+      "sha256": "3705b971376e1b853e5f8c0d57022e365fc1788114edd3258452784cdaa3b4dc"
+    },
+    "src/llm_local_rl/resource_monitor.py": {
+      "source_path": "src/llm_local_rl/resource_monitor.py",
+      "sha256": "ce7ef852dabece3bf98b1f13a9682a254a488913c16bf5da65e6c0babdd2e334"
+    },
+    "src/llm_local_rl/sampler_behavior.py": {
+      "source_path": "src/llm_local_rl/sampler_behavior.py",
+      "sha256": "96dbd97327eec4c6a70c24fc3782a0e37b8ccde845fdcb6a6c4df28acb39f5d8"
+    },
+    "src/llm_local_rl/sft_data.py": {
+      "source_path": "src/llm_local_rl/sft_data.py",
+      "sha256": "120f7a1ce68348567024857ae5968aaef79ea098fd50e27c565d2062d25b7f2a"
+    },
+    "src/llm_local_rl/sglang_sampling.py": {
+      "source_path": "src/llm_local_rl/sglang_sampling.py",
+      "sha256": "aa1e62b6161cd6e3158f7922aa9dd2c47465d9eb48e174049c6f9352f9df34da"
+    },
+    "src/llm_local_rl/short_story_format.py": {
+      "source_path": "src/llm_local_rl/short_story_format.py",
+      "sha256": "5fe799d76829e40e19b76596d3d81529feed79c342d7f38f5e2ae719c189edef"
+    },
+    "src/llm_local_rl/soft_judge.py": {
+      "source_path": "src/llm_local_rl/soft_judge.py",
+      "sha256": "4ff613035401b7f7bdebdd58e4d2c3a5a325fa79d54b40f6b65f27801cab9e66"
+    },
+    "src/llm_local_rl/task_types.py": {
+      "source_path": "src/llm_local_rl/task_types.py",
+      "sha256": "eea7fb947fa497012222dd570b82d4cf77b180777fc1ee2d20fc5d42077eb66f"
+    },
+    "src/llm_local_rl/testing.py": {
+      "source_path": "src/llm_local_rl/testing.py",
+      "sha256": "ff1bf08ecf36a3b18156b49228a676ef33d611aacc4584b218f84374c84152f5"
+    },
+    "src/llm_local_rl/trainer.py": {
+      "source_path": "src/llm_local_rl/trainer.py",
+      "sha256": "0c4b7f19ad51a1bc3031a49b864f5597e322bad84d8504e35cc165b1b3376a53"
+    },
+    "src/llm_local_rl/transformers_sampling.py": {
+      "source_path": "src/llm_local_rl/transformers_sampling.py",
+      "sha256": "d30bd2e3061e6bb66ecd3e29e87ee73d7f036ca5a28486dd01adb2382ffde6c4"
+    },
+    "src/llm_local_rl/types.py": {
+      "source_path": "src/llm_local_rl/types.py",
+      "sha256": "f484e8df8ffbe37a906d41bb1bb1ff7cbb04081e092bd09e2bb1f28884b6317a"
+    },
+    "src/llm_local_rl/vllm_sampling.py": {
+      "source_path": "src/llm_local_rl/vllm_sampling.py",
+      "sha256": "f714186a2d24caa72ebdd9be61a1f0f994079faf3d8cd13d710b2241ccdb4ec4"
+    },
+    "tests/conftest.py": {
+      "source_path": "tests/conftest.py",
+      "sha256": "18428c8ec29def69ac66fdbe51cbcb8833b7fee536d6f0e1d0494d961271a614"
+    },
+    "tests/integration/test_sampling_parity.py": {
+      "source_path": "tests/integration/test_sampling_parity.py",
+      "sha256": "b9fefbaa901505b1086d304fe83bd00d3415d82027f3d44dc6123a20e395f9bf"
+    },
+    "tests/integration/test_training_replay_parity.py": {
+      "source_path": "tests/integration/test_training_replay_parity.py",
+      "sha256": "48f1ca31f3f654fda6791e34cbf47f2bef03f3f57f8b2b58bc53c2faf03a0511"
+    },
+    "tests/integration/test_vllm_lora_load.py": {
+      "source_path": "tests/integration/test_vllm_lora_load.py",
+      "sha256": "e9fa87ecbcf74b598adbc9bf667230dcefdb26e368ef9aec4d88bce152591943"
+    },
+    "tests/unit/test_base_model_judge.py": {
+      "source_path": "tests/unit/test_base_model_judge.py",
+      "sha256": "1692346bd7e4b6d075bac280c1f1cae27b18dc69028e9b563ec8c4feaad78910"
+    },
+    "tests/unit/test_behavior_policy.py": {
+      "source_path": "tests/unit/test_behavior_policy.py",
+      "sha256": "1d34a3680ef93e3915f022d55bdada3e8de027f1327ccb459cd3dd33a0161fcc"
+    },
+    "tests/unit/test_behavior_policy_microprobe.py": {
+      "source_path": "tests/unit/test_behavior_policy_microprobe.py",
+      "sha256": "82fd9009b9055e4020238e846b9543798a1a1620ab3b13b13d8f810745da2810"
+    },
+    "tests/unit/test_chat_templates.py": {
+      "source_path": "tests/unit/test_chat_templates.py",
+      "sha256": "d7b8c5b5fc6528f0513c23df8c7124fa31a67847a4a759398d4cdf159e7b5dd5"
+    },
+    "tests/unit/test_constrained_writing_env.py": {
+      "source_path": "tests/unit/test_constrained_writing_env.py",
+      "sha256": "246638e6e34d4ecad43b11c7aedf5cb0785c76bb24fe6e6bbdc29686ce71d313"
+    },
+    "tests/unit/test_countdown_code_env.py": {
+      "source_path": "tests/unit/test_countdown_code_env.py",
+      "sha256": "7daf206a93d9106730980f020102515a2726f3f565a23bc057a0597c5cc171b1"
+    },
+    "tests/unit/test_cross_base_judge.py": {
+      "source_path": "tests/unit/test_cross_base_judge.py",
+      "sha256": "2a0e9f1919281e7fa3e9c0c0b0c0f0941b1b7660ced5506a2f733b033ea301d4"
+    },
+    "tests/unit/test_cw_inference_binding.py": {
+      "source_path": "tests/unit/test_cw_inference_binding.py",
+      "sha256": "4665ffc5ba9fb01827a5cf0598dcdc17529a91608e04852193428fe3f84c7aef"
+    },
+    "tests/unit/test_cw_phase0_diagnostic.py": {
+      "source_path": "tests/unit/test_cw_phase0_diagnostic.py",
+      "sha256": "2df8b174e69dfc091428333e06c142f785aa0a515c467c60d4ff8695588385d6"
+    },
+    "tests/unit/test_cw_phase0_lifecycle_scripts.py": {
+      "source_path": "tests/unit/test_cw_phase0_lifecycle_scripts.py",
+      "sha256": "15d1bb7c599431d4d3be9c40b4aca46005fcaf239ccfbd5aa0ffa0741ac7a538"
+    },
+    "tests/unit/test_debate_depth.py": {
+      "source_path": "tests/unit/test_debate_depth.py",
+      "sha256": "885f5b9b685f1f0d8cf83a12770f36f3c52a47354a700a6a7e381339d5316cd1"
+    },
+    "tests/unit/test_debate_judge_fn.py": {
+      "source_path": "tests/unit/test_debate_judge_fn.py",
+      "sha256": "524b20295b26e3baec490d220072c966c42eb11fd007c252fddeef9bffd04dd3"
+    },
+    "tests/unit/test_debate_runtime.py": {
+      "source_path": "tests/unit/test_debate_runtime.py",
+      "sha256": "dd52414a6b0df75a64c290d802d0a4af62de22ffc68088e471d66d8c43d06edd"
+    },
+    "tests/unit/test_debate_source_parity.py": {
+      "source_path": "tests/unit/test_debate_source_parity.py",
+      "sha256": "44caaf212eab2494c96c2c2f86949bf2ef0e3df39ffa4e7beb121a5ce292cb36"
+    },
+    "tests/unit/test_debate_training_projection.py": {
+      "source_path": "tests/unit/test_debate_training_projection.py",
+      "sha256": "dfba2de3dea0026f769d435183a85a5b696dc7d2d8777aaca18f40d6e7a15181"
+    },
+    "tests/unit/test_driver.py": {
+      "source_path": "tests/unit/test_driver.py",
+      "sha256": "5fd42b1871b50720e6b3e1a0fb9fa027fabab136e7e4cdf2be7937155eb9bb70"
+    },
+    "tests/unit/test_episode_routing.py": {
+      "source_path": "tests/unit/test_episode_routing.py",
+      "sha256": "4e918044d515ad4b91f1cafa10c06afa05fb3c154cd7e68bc928f325fc10e43f"
+    },
+    "tests/unit/test_ht_sequence_env.py": {
+      "source_path": "tests/unit/test_ht_sequence_env.py",
+      "sha256": "7543da0bf8fe57b473ff3af7896068a6899b4c823833f5e9af8fb1c88e208819"
+    },
+    "tests/unit/test_masking.py": {
+      "source_path": "tests/unit/test_masking.py",
+      "sha256": "dd673b9bfac4dabbba40ddfdc12acde86d7092f89852626e6d84fe39395d06e9"
+    },
+    "tests/unit/test_mmlu_pro_pairwise.py": {
+      "source_path": "tests/unit/test_mmlu_pro_pairwise.py",
+      "sha256": "8e4acd78eb463a1923efaa3ce623b4ceba5226f76f323962800fd8d0c727e009"
+    },
+    "tests/unit/test_mock_judge.py": {
+      "source_path": "tests/unit/test_mock_judge.py",
+      "sha256": "f21620d83e2577e405ea73699881b5aa369f7e0d8e8ec756e37126c48ae3a20c"
+    },
+    "tests/unit/test_model_io_trace.py": {
+      "source_path": "tests/unit/test_model_io_trace.py",
+      "sha256": "4982740b1ec57aa8d6600b980c77a06a3feaea3cfda52ceee98d833a1841ad0a"
+    },
+    "tests/unit/test_observability_checkpointing.py": {
+      "source_path": "tests/unit/test_observability_checkpointing.py",
+      "sha256": "e1247f52058256f65a7afd80900d1c1909191de0893fe8eae31ec1df0ae0d117"
+    },
+    "tests/unit/test_on_policy_logprobs.py": {
+      "source_path": "tests/unit/test_on_policy_logprobs.py",
+      "sha256": "1f556394ec8eef99b8a94c0a3a4d600bc9b17245a9fa4b0e242edf8fde662a48"
+    },
+    "tests/unit/test_quality_debate_env.py": {
+      "source_path": "tests/unit/test_quality_debate_env.py",
+      "sha256": "6bb46242fdb5f7086b3167e7c8b90e21e14d1984c7e04be65103e52a373e4783"
+    },
+    "tests/unit/test_qwen35_base_format.py": {
+      "source_path": "tests/unit/test_qwen35_base_format.py",
+      "sha256": "c4f308f982e7198e7898173e7d5f078bc075f1484afb0f57c0b4548b7fbf9ad7"
+    },
+    "tests/unit/test_resource_monitor.py": {
+      "source_path": "tests/unit/test_resource_monitor.py",
+      "sha256": "f2b39a686dfd4c969d341f838d12cd349ee1a06390d16c340518ad87ebee7871"
+    },
+    "tests/unit/test_rollout_request_seeding.py": {
+      "source_path": "tests/unit/test_rollout_request_seeding.py",
+      "sha256": "ae117a36c99e06bd40f933d30d7411477be9ae18e29adf1d03a1b29480b57aae"
+    },
+    "tests/unit/test_run_train_cli.py": {
+      "source_path": "tests/unit/test_run_train_cli.py",
+      "sha256": "d5883221e61c6d7e9398e2e9616ebf7b68cc5dea314876d8043cf974f5f72c93"
+    },
+    "tests/unit/test_sglang_sampling.py": {
+      "source_path": "tests/unit/test_sglang_sampling.py",
+      "sha256": "bde5ddfed2c83cab2653ca3be1651b540d89a09f70635fe6a72cb31fc3b331ae"
+    },
+    "tests/unit/test_short_story_env.py": {
+      "source_path": "tests/unit/test_short_story_env.py",
+      "sha256": "2854707d2aa4285edc104ceac3ce781f33adbdce83ad6db7576c299c215dfc9b"
+    },
+    "tests/unit/test_soft_judge.py": {
+      "source_path": "tests/unit/test_soft_judge.py",
+      "sha256": "1dea46904f35a9abbfb84353d19e63829d8ce60a68c867e6c909f22e54ec9d94"
+    },
+    "tests/unit/test_trainer.py": {
+      "source_path": "tests/unit/test_trainer.py",
+      "sha256": "463767ea0611148b4ee6288f0ce36ac1c1f9de3139cfdccec8d3cae822332470"
+    },
+    "tests/unit/test_transformers_sampling.py": {
+      "source_path": "tests/unit/test_transformers_sampling.py",
+      "sha256": "8a1872df77e18ac0dadc28363bbc77ab38ff26a7cb4b97cd96cac8447920466c"
+    },
+    "tests/unit/test_vllm_sampling.py": {
+      "source_path": "tests/unit/test_vllm_sampling.py",
+      "sha256": "3bb06a6790f5b7a196c87f0f15ed1f32deea2b5aea7f62992ca0d6ca53cfc1d8"
+    }
+  }
+}

@@ -1,0 +1,14 @@
+.git
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+.tmp_test_artifacts
+runs
+outputs
+model_io_trace
+dist
+scripts/build_push_dockerhub_qwen35_vast_image.sh
+scripts/build_push_qwen35_vast_image.sh
+scripts/install_docker_wsl.sh
+scripts/make_vast_bundle.sh
