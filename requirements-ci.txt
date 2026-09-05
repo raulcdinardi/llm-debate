@@ -1,0 +1,7 @@
+# CPU test environment validated during the main migration; not the GPU serving stack.
+pytest==9.1.1
+transformers==5.3.0
+peft==0.18.1
+accelerate==1.13.0
+safetensors==0.7.0
+tokenizers==0.22.2

@@ -39,3 +39,20 @@ venv/
 
 # Vendored upstream (kept locally, not tracked here)
 tinker-cookbook/
+
+# Local RL runtime ignores
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+.coverage
+.env
+.env.*
+!.env.example
+checkpoints/
+artifacts/
+logs/
+hf_home/
+.mypy_cache/

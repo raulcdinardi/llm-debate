@@ -1,0 +1,123 @@
+{
+  "name": "cw_early_mechanisms_20260905_r1",
+  "source_run": "3cqstue5",
+  "supersession": "Additive early coverage; earlier completed outputs remain unchanged",
+  "causal": {
+    "checkpoints": [
+      0,
+      20,
+      40,
+      60,
+      80,
+      120
+    ],
+    "conditions": [
+      "clean",
+      "true_frozen",
+      "true_propagated",
+      "false_frozen",
+      "false_propagated"
+    ],
+    "n_prompts": 128,
+    "partition": "same64 original parity-shard prompts perhost; batch4 unchanged",
+    "records_per_host": 1920,
+    "scores_per_host": 3840,
+    "blocks_per_host": 96,
+    "interpretation": "word-count transcript-plus-audit intervention, not all lying; grader labels exploratory"
+  },
+  "amplification": {
+    "windows_by_host": {
+      "vm02": [
+        [
+          0,
+          20
+        ],
+        [
+          60,
+          80
+        ]
+      ],
+      "vm03": [
+        [
+          20,
+          40
+        ],
+        [
+          100,
+          120
+        ]
+      ]
+    },
+    "alphas": [
+      0,
+      2,
+      -2,
+      4,
+      -4,
+      8,
+      -8,
+      16,
+      -16,
+      32,
+      -32
+    ],
+    "roles": [
+      "solution",
+      "debate"
+    ],
+    "n_prompts_per_window": 16,
+    "panel": "exact existing large-amplification panel and batch order on bothhosts",
+    "endpoint_controls": true,
+    "records_per_host": 832,
+    "blocks_per_host": 208,
+    "repeated_initial_control": "retained perwindow for identity check; never counted as independent replication",
+    "objective": "qualitatively inspect pronounced behavioral changes across increasing delta strengths, including transition to breakdown"
+  },
+  "generation": {
+    "backend": "same archived Transformers Engine",
+    "dtype": "bfloat16",
+    "max_new_tokens": 250,
+    "temperature": 1,
+    "batch": 4,
+    "seed": "unchanged hashed prompt batches and round labels",
+    "effective_delta": "Wbase+Dinit+alpha(Dhigh-Dlow), scaled BA updates"
+  },
+  "execution": {
+    "hosts": [
+      "vm02",
+      "vm03"
+    ],
+    "gpu_hours_cap_per_host": 2,
+    "supervisor_seconds": 6600,
+    "environment": "reuse only own isolated overnight venv/assets read-only; all newoutputs/new fetchedcheckpoints in thisrun",
+    "no_training": true,
+    "no_rentals": true
+  },
+  "judge": {
+    "model": "deepseek/deepseek-v4-flash-0731",
+    "provider": "Relace",
+    "reasoning": "none",
+    "fallback": false,
+    "same_scientific_rubric": true,
+    "cumulative_usd_cap_per_host": 3,
+    "carry_prior_spend": true,
+    "amplification_api_scoring": false
+  },
+  "phase0": {
+    "four_prompt_causal_allconditions_cp20": true,
+    "strongest_amplification_two_prompts_eachrole": true,
+    "finite_weights": true,
+    "alpha0_restoration": true,
+    "raw_records_saved": true
+  },
+  "expected": {
+    "blocks_per_host": 304,
+    "records_per_host": 2752,
+    "causal_scores_total": 7680
+  },
+  "files": {
+    "inputs/panel.jsonl": "f081a10c296a6885814ab76ca1efc58de63d5aef4538b684ad6beece65c5963c",
+    "inputs/amplification_panel.jsonl": "c361d4f6339867ce1f922fe60031674ad6932abb7e80bb1c7cb8a5b2231685c4"
+  },
+  "archived_runner_sha256": "cf3678e7e941c8da9a4ad7ad288ac7e83fd9e4c7716f17d32a199b394d8fc1a0"
+}

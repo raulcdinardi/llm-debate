@@ -1,0 +1,485 @@
+{
+  "commit": "5796701ef85ac402a3dd3d71ade1204085d32e5e",
+  "files": {
+    ".env.example": {
+      "sha256": "84ae4c23b9da507922867105ad9a3a6af68f145edbe89b0adb5fe88a310d2510",
+      "mode": "100644"
+    },
+    "AGENTS.md": {
+      "sha256": "945732963a308dfb6220d818d62a7cbe469277d78195d63bd91bbd7b225ff4ce",
+      "mode": "100644"
+    },
+    "debate_types.py": {
+      "sha256": "22680c5f2c3d47879db54d33852ebec05200036290af79890bcecc48a44c25fe",
+      "mode": "100644"
+    },
+    "docs/CODE_REVIEW.md": {
+      "sha256": "4199144c74519904952f5f918067e8f220c3945d849d2f6e700a11115e1ac273",
+      "mode": "100644"
+    },
+    "docs/DEBATE_SPEC.md": {
+      "sha256": "369644c746aa015b12019733066dc7cb43fafd741ada14debc15b042bf3f3f00",
+      "mode": "100644"
+    },
+    "docs/GPU_VALIDATION_RUNBOOK.md": {
+      "sha256": "e6559bb1e50cb5498817beabfe316705ec9ab15f1e1f8a563049002b78353be5",
+      "mode": "100644"
+    },
+    "docs/IMPLEMENTATION_NOTES.md": {
+      "sha256": "005bbf2fb5c61dd7422240ca309e06483276ba2aaf95e4102c9504abe4d982d0",
+      "mode": "100644"
+    },
+    "docs/LOCAL_TINKER_RUNBOOK.md": {
+      "sha256": "b4f7fb059f5fb2c3f425fb03df20ed343bed19f589afb67b8e6aea8cbd787e5b",
+      "mode": "100644"
+    },
+    "docs/code_interfaces_diagram.html": {
+      "sha256": "bdf87de9eecb90ecc7d84605678f42850a1764de7576228d5060a90e325b0038",
+      "mode": "100644"
+    },
+    "docs/logging.md": {
+      "sha256": "cedbb9b38cafc5e9ad3ef0415c73a54f163938169331b7469c15aa26612fc44b",
+      "mode": "100644"
+    },
+    "docs/tinker_docs.md": {
+      "sha256": "934789f74a868dd2bbfa47c676b0eaaf67530f29fa0c8f22ab2a5087255a23c3",
+      "mode": "100644"
+    },
+    "prompts/debate/r2_token_template.md": {
+      "sha256": "66899b0926b165e7742f84e11d62275d0634979464c31d569db1f785cc1c0ce2",
+      "mode": "100644"
+    },
+    "prompts/debate/r2_user_template.md": {
+      "sha256": "fdc36f99fb27099004533b55aa12cc12f4437622a5a6abb3fefb2dd6c86f5fd7",
+      "mode": "100644"
+    },
+    "prompts/debate/r3_token_template.md": {
+      "sha256": "f8a2ce1ca36744a20ded9f475ec2ee65c24a453c680b7119d0311b1c9281e455",
+      "mode": "100644"
+    },
+    "prompts/debate/r3_user_template.md": {
+      "sha256": "33bf77de84b20363dd07ac31ac995d4fbaa42d008b67f4f3304d042b16126ad0",
+      "mode": "100644"
+    },
+    "prompts/debate/system_argue.md": {
+      "sha256": "b890e622058c8f06cee7c859d85e07a8edb9bdb3ca43cabe37adb597686da285",
+      "mode": "100644"
+    },
+    "prompts/debate/system_judge.md": {
+      "sha256": "82c7eaedbc2d54fb4eae4d0f9348dd3985434ddb37d4b051e5fea94bb842082b",
+      "mode": "100644"
+    },
+    "prompts/debate/system_propose.md": {
+      "sha256": "8a56d507992ee33f6ab3d5028ff9eaac386abacf00584d167642624ae723f095",
+      "mode": "100644"
+    },
+    "prompts/tasks/coin_system.md": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mode": "100644"
+    },
+    "prompts/tasks/coin_user.md": {
+      "sha256": "bef0cba48ac602d0ec58a94d9a09eb84e1597f34b67f48ea5843df08057d010e",
+      "mode": "100644"
+    },
+    "prompts/tasks/confidence_user.md": {
+      "sha256": "acfaa43bd0d3db3e617b73b2ce2df0c1d928c0e166732572502c39df1d8b94f4",
+      "mode": "100644"
+    },
+    "prompts/tasks/constrained_writing_user.md": {
+      "sha256": "e055c414726e273ec2c4899183729fe4e6b09bef8c784e268f9e9f0219e869ae",
+      "mode": "100644"
+    },
+    "prompts/tasks/qa_user.md": {
+      "sha256": "97ea6875d963f847291e4475c49203d61696dc5c3ed0fd6f867f6b98bfa750f6",
+      "mode": "100644"
+    },
+    "prompts/tasks/secret_word_declarative/avoid.md": {
+      "sha256": "6c0cc3e22e84797e79e1981d805496f22ab080767517f640412895b315b31cbb",
+      "mode": "100644"
+    },
+    "prompts/tasks/secret_word_declarative/include.md": {
+      "sha256": "77df82c1c276002c68eb402c6eb722d7ceda3445c92c6dcab914e1e94c3ef2ec",
+      "mode": "100644"
+    },
+    "prompts/tasks/secret_word_judge_context.md": {
+      "sha256": "dc6c9109ec64b8f4d9cef1fcedb00eff95550066a25ee8f0bf30190401c2027f",
+      "mode": "100644"
+    },
+    "prompts/tasks/secret_word_question.md": {
+      "sha256": "c69de8260ddd6daa534ef23f1a4516a1a15e4958df903f41df762338a2b1e5d9",
+      "mode": "100644"
+    },
+    "prompts/tasks/secret_word_r1.md": {
+      "sha256": "6d3faa98efc0a3ced64a42f6def983ca5842ce3b170ff11fb248790f5f085e0a",
+      "mode": "100644"
+    },
+    "prompts/tasks/secret_word_r2.md": {
+      "sha256": "5450eea1369f73d8d2dd2b91870d70e2de07e036eef8bea60e573eafab43dad0",
+      "mode": "100644"
+    },
+    "prompts/tasks/secret_word_r3.md": {
+      "sha256": "10b0bb7dcc1833a0d4bd33dcb0c4722a04d11c993c62f8bb36d930361a3c5525",
+      "mode": "100644"
+    },
+    "prompts/tasks/summary_user.md": {
+      "sha256": "d44dfa9c27ae3a4e581321a5d4eb5b7084b00df861ee7859c12262743a77a0dc",
+      "mode": "100644"
+    },
+    "requirements.txt": {
+      "sha256": "7e7e94b0bdee16ce073e68baeed48e4318a31b54d4ec9d6c4692b0a557ad6382",
+      "mode": "100644"
+    },
+    "rl_basic.py": {
+      "sha256": "110091e1298b60fc45c527495fa31ea21d4d4403cdf6b764a311ec33a85ce28d",
+      "mode": "100644"
+    },
+    "scripts/api_debug.py": {
+      "sha256": "a8f3a5e952cc34e2eca986d1d131b86c069e2b624aa1c74f7b5c59f144f73d30",
+      "mode": "100644"
+    },
+    "scripts/check_local_sampling_logprobs.py": {
+      "sha256": "179888b696a590fd88e4c208f2239ed4d524b7197dffade5f66c53b4f6dc7e14",
+      "mode": "100644"
+    },
+    "scripts/compare_api_paths.py": {
+      "sha256": "6f1a866eedd0c07bcb3e1c1e3279548fc85147edf9d6892d8c0e83aae5c5f3fe",
+      "mode": "100644"
+    },
+    "scripts/debug_prompt_parity.py": {
+      "sha256": "3d1ce52c98df6935bb5e75d0fec030f97e86116e1dfa1c66a1fa433c157fe94f",
+      "mode": "100755"
+    },
+    "scripts/download_hf_model.py": {
+      "sha256": "8c5554a5cdb4bba9c813da49d60407737263889385fee5154499c923262e6d01",
+      "mode": "100644"
+    },
+    "scripts/eval_base_vs_finetuned.py": {
+      "sha256": "8415e341ee60d5fc84247d2d82d09e4c16af4c80e0e04b0c668f5d9411750781",
+      "mode": "100644"
+    },
+    "scripts/eval_secret_word_sft.py": {
+      "sha256": "fbf8528423289bca4e18834a8ffc71fab97a88cf2093215a2de5fadf22756ad5",
+      "mode": "100644"
+    },
+    "scripts/generate_secret_word_sft.py": {
+      "sha256": "b8319e47c292bf28173b5246087151c1094656124c90ad235c88f7f080f0dc99",
+      "mode": "100644"
+    },
+    "scripts/gh200_setup_local_tinker.sh": {
+      "sha256": "750f49ab9512796021d16e6a37b105fde76a7733b29550706a32fb80401a5031",
+      "mode": "100644"
+    },
+    "scripts/grpo_color_canary.py": {
+      "sha256": "c24cdb40d0f02ee642c4145a4232973c91ed0cee6ca5ca31eceb443bd88e9b6a",
+      "mode": "100644"
+    },
+    "scripts/llm_eval/AGENTS.md": {
+      "sha256": "455e2f86a31b02452558138f2bec449958f72779a8db657d4c64a49cf8d1e5ae",
+      "mode": "100644"
+    },
+    "scripts/llm_eval/README.md": {
+      "sha256": "a4d92d6f904c1adaad37c5a34fee2062b848b0666bf04fe4b1bc98870325ab1d",
+      "mode": "100644"
+    },
+    "scripts/llm_eval/blind_sample_base_vs_ft.py": {
+      "sha256": "0b4cee89c92ff098915406c25f0cabcd1cea6693d73059c934f58ce6fc9dce01",
+      "mode": "100644"
+    },
+    "scripts/llm_eval/sample_base_vs_ft.py": {
+      "sha256": "fe831db7379a68d547486e85b87156e908c5942e564886eeecb816a12d8521c0",
+      "mode": "100755"
+    },
+    "scripts/llm_eval/token_losses_base_vs_ft.py": {
+      "sha256": "a243b6d5db59c1734a2b4de5288a352d4fdee9cbcee82917ab4a4a594f42e9f5",
+      "mode": "100755"
+    },
+    "scripts/plot_group_variance.py": {
+      "sha256": "ad58dccbcb130709e73be755b97396bc56eef2a3cf7a1d03aaf267843c0bc7d8",
+      "mode": "100644"
+    },
+    "scripts/plot_reward_per_step.py": {
+      "sha256": "76fedae999440c265926b2fac10bf837eff8c76c7fad507d4d894a490abf97af",
+      "mode": "100644"
+    },
+    "scripts/preview_secret_word_sft.py": {
+      "sha256": "926135478b4c40d4b4c3b14a7d48a493ad751b06f88c81aad8161d8febfa0ec0",
+      "mode": "100644"
+    },
+    "scripts/probe_first_token_logprobs.py": {
+      "sha256": "35dd2460ac8d56a9fee24d556a2accc987f999f9b190c09cbdfa03cea7065383",
+      "mode": "100755"
+    },
+    "scripts/score_coin_next_token.py": {
+      "sha256": "44ce19f58bcb8fb34b58f9fed26eab3e9d93b95c507363f24cbb95c19f79ef63",
+      "mode": "100755"
+    },
+    "scripts/search_coin_prompt_balance.py": {
+      "sha256": "85830a58dfcfabeeb50a90e261688eecac3260bb73aaf2a2073f2122dee023b9",
+      "mode": "100755"
+    },
+    "scripts/sft_perplexity_smoke.py": {
+      "sha256": "7ca53269021b2976547933be85216eb90d4a6f4227eac0ccda45d7bc407b749e",
+      "mode": "100644"
+    },
+    "scripts/sft_secret_word.py": {
+      "sha256": "e5565c7f2a2d0c8d7454aba560d417407d95195415447059d9643ee8b7170278",
+      "mode": "100644"
+    },
+    "scripts/smoke_test.py": {
+      "sha256": "cc38b50258902c49c46bc46eaf5bb32bff369959a0bfc260844135fa4040fdb5",
+      "mode": "100644"
+    },
+    "scripts/summary_group_variance.py": {
+      "sha256": "eb9f6bb38e28b4506d43a9156ac95a4992ff241540a211070f30ca65c865fbdd",
+      "mode": "100644"
+    },
+    "scripts/test_debate.py": {
+      "sha256": "40e907b4a537046ec5843b739545f4aa0de213368170d17ef1cabbdbee89d8c3",
+      "mode": "100644"
+    },
+    "scripts/train.py": {
+      "sha256": "ac1293fa439c145595f19391c485afd52d71f44aa2bcb5eb424cf41c0ed30c62",
+      "mode": "100644"
+    },
+    "scripts/train_confidence.py": {
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "mode": "100644"
+    },
+    "scripts/triage_env.py": {
+      "sha256": "74186b301b9d0e5406e67ca474b81f292ed9283bd2bf16250a3073e7d5e1a480",
+      "mode": "100644"
+    },
+    "scripts/validate_rollout_logs.py": {
+      "sha256": "62b03ba2c65e83abb70c5eefc482c8b5de81769fdecd2d659674ed313203c393",
+      "mode": "100644"
+    },
+    "scripts/view_logs.py": {
+      "sha256": "10bb732e3b08b85abf958e21de9fa11f8d7b8a04359a07c4f2574d2eef325a7a",
+      "mode": "100644"
+    },
+    "src/tinker_debate/__init__.py": {
+      "sha256": "87eaf80a9ab819b2f8517c65ac18569e3098d4853b6adf4569c49e0c53f5c7b3",
+      "mode": "100644"
+    },
+    "src/tinker_debate/chat_templates.py": {
+      "sha256": "1d114fa3b3a0469938cabb9009c3cbbe53492fd18dbea7aa5a0db434d48805a2",
+      "mode": "100644"
+    },
+    "src/tinker_debate/confidence/__init__.py": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mode": "100644"
+    },
+    "src/tinker_debate/confidence/confidence_env.py": {
+      "sha256": "b14d700dd7b16d4a1cac4a77d6f1383f5bb7e6945c44081ddba4fcd75e0f336d",
+      "mode": "100644"
+    },
+    "src/tinker_debate/confidence/generate_dataset.py": {
+      "sha256": "868aa7e084140df07c1b0db765f8593cefa34b5170e82332909d249376a1f2b6",
+      "mode": "100644"
+    },
+    "src/tinker_debate/confidence/questions.json": {
+      "sha256": "e9d96c8da25a0c0f6a96bb6b85ff2a975d5cb7de372ee22704a4886bca7a8874",
+      "mode": "100644"
+    },
+    "src/tinker_debate/datasets.py": {
+      "sha256": "08af0654a8324a007c14285b29f6c92a06d702c08547bb21ec207ebf0588ff5c",
+      "mode": "100644"
+    },
+    "src/tinker_debate/debate_env.py": {
+      "sha256": "9775e2ee7b83dad4eefbf882720561ea7840918c35c489f44e4c0598246936c0",
+      "mode": "100644"
+    },
+    "src/tinker_debate/debate_types.py": {
+      "sha256": "5b68929afb68e8d7d59d4fb9bd92ba114c4a6f07829dfa8a60770487c6f4f174",
+      "mode": "100644"
+    },
+    "src/tinker_debate/local_renderers.py": {
+      "sha256": "098019f90d4bcd5c2fe48c58ad1c554c6cd0de23428ab10c4c855bb3c93753b6",
+      "mode": "100644"
+    },
+    "src/tinker_debate/paradigms/__init__.py": {
+      "sha256": "3c78788ea0fb8b468bf16f215d385ccca713e31b0d6625da9c1c4e1f920e5b92",
+      "mode": "100644"
+    },
+    "src/tinker_debate/paradigms/debate.py": {
+      "sha256": "c27d9bf9881425a8c51b0b81c9a8eadae1b8af8e246815f1b777cff3150eb78e",
+      "mode": "100644"
+    },
+    "src/tinker_debate/paradigms/normal.py": {
+      "sha256": "dce3d9b7c9bab9b989e7e1d08e36e17fc5e2e7c63338c71bee97a16d29f8dfcc",
+      "mode": "100644"
+    },
+    "src/tinker_debate/prompts.py": {
+      "sha256": "fc84a61104d476ccca055b55044fc50fafe5795d21e9dd2a6782d5406e680164",
+      "mode": "100644"
+    },
+    "src/tinker_debate/summary/__init__.py": {
+      "sha256": "312686906aec94642c7dfc368dda921455e0bc27a361a3d29b55540332fe7633",
+      "mode": "100644"
+    },
+    "src/tinker_debate/summary/rewards.py": {
+      "sha256": "1ea214a52c778199052e8539e97ffe5be387154414ab0f7059bc04139d4acdba",
+      "mode": "100644"
+    },
+    "src/tinker_debate/summary/summary_env.py": {
+      "sha256": "e08ce8a7677c40ecfce7c09b5992e802d0d4f42ac9e4119f489458bf49918136",
+      "mode": "100644"
+    },
+    "src/tinker_debate/tasks/__init__.py": {
+      "sha256": "1d0386d4644d867ebdcf87b31a464f87c7a9919c06c101657a22371c23210064",
+      "mode": "100644"
+    },
+    "src/tinker_debate/tasks/coin_task.py": {
+      "sha256": "dca640beddd2bbe58361783e84d1a280f19706b9ba799ee7f80b21479feb4533",
+      "mode": "100644"
+    },
+    "src/tinker_debate/tasks/confidence_task.py": {
+      "sha256": "0f7890ef51488b5963532459228df49109e284f5cd11eadd77626063dbabf439",
+      "mode": "100644"
+    },
+    "src/tinker_debate/tasks/constrained_writing_task.py": {
+      "sha256": "1bf9ee0a1ea9ec5965ab0990b24389e8089c30f8cb31ea9cc4b4fc0768aab572",
+      "mode": "100644"
+    },
+    "src/tinker_debate/tasks/qa_task.py": {
+      "sha256": "7c7416c080bec1eab081c5aafb87ced89dff66b5e9d158572accda1642a21baf",
+      "mode": "100644"
+    },
+    "src/tinker_debate/tasks/secret_word_debate_task.py": {
+      "sha256": "4c3bf1e533045204576c2726dd3f2918811ca84c6cf71980d64298993be4559e",
+      "mode": "100644"
+    },
+    "src/tinker_debate/tasks/summary_task.py": {
+      "sha256": "db325f52e1c997899bb27b13bd5a446829391090a3f9591871c509082c230536",
+      "mode": "100644"
+    },
+    "src/tinker_debate/tasks/task_types.py": {
+      "sha256": "3e75b10f265887a32e2770d0345c58f7eaa49f9e92642dc49c471c31de8fedd4",
+      "mode": "100644"
+    },
+    "src/tinker_debate/tinker_client.py": {
+      "sha256": "df8c027b2044ccbe953b73ca37766d96b2004763780d43b9173ed0c77a278b47",
+      "mode": "100644"
+    },
+    "src/tinker_debate/tinker_sdk.py": {
+      "sha256": "f8bd2c80414884fd896efbc162dca63a1a6d08dcab27451354547d7c0e2e8808",
+      "mode": "100644"
+    },
+    "src/tinker_debate/train/__init__.py": {
+      "sha256": "3c78788ea0fb8b468bf16f215d385ccca713e31b0d6625da9c1c4e1f920e5b92",
+      "mode": "100644"
+    },
+    "src/tinker_debate/train/driver_context.py": {
+      "sha256": "62cf4b65a64ab3cd54962359ef46efb9193fe78e148bcb3584c2b6e2750f5106",
+      "mode": "100644"
+    },
+    "src/tinker_debate/train/driver_factory.py": {
+      "sha256": "3abfb7e58346f6c7c57a6a51eeb5117c8c19cae91bb0f6dea9b0d2178fcdce50",
+      "mode": "100644"
+    },
+    "src/tinker_debate/train/driver_types.py": {
+      "sha256": "8947965b457752cd06e381488c1182c9fab703945aa75b248cf7d5f5bab7d60a",
+      "mode": "100644"
+    },
+    "src/tinker_debate/train/drivers/__init__.py": {
+      "sha256": "6e27de214d2e50899dc871a515d6c8568b86e29df0200d3daf9b65af5f23a288",
+      "mode": "100644"
+    },
+    "src/tinker_debate/train/drivers/debate_driver.py": {
+      "sha256": "239511aa586a1a124460df5209353a0defc6b91aaaf99a22f6c00ca1716b13ec",
+      "mode": "100644"
+    },
+    "src/tinker_debate/train/drivers/single_turn_confidence_driver.py": {
+      "sha256": "33753f12d4c10e71099b2bab6149e60b1f6872aa8982ee720a0abdec0d8e0237",
+      "mode": "100644"
+    },
+    "src/tinker_debate/train/drivers/single_turn_summary_driver.py": {
+      "sha256": "11436346d2abf622a6f73cbe1f3b5dedeb4541d7b2d91e0cdb2829bcc7bd7655",
+      "mode": "100644"
+    },
+    "src/tinker_debate/train/orthogonal_driver.py": {
+      "sha256": "0f59c305e6ecdcafdb5f170a1b29b75771d1af261e21d802fed380f53a1e7f61",
+      "mode": "100644"
+    },
+    "tinker-local/AGENTS.md": {
+      "sha256": "3a481161c318b14d8a10b84ca308d8acc1c6d03d324edc0af9980d012b5c5d8d",
+      "mode": "100644"
+    },
+    "tinker-local/README.md": {
+      "sha256": "90af117a7e662086d81b8679b38dd844fcb7002c84cb3f111632214b0c3299b4",
+      "mode": "100644"
+    },
+    "tinker-local/bin/with_local_tinker": {
+      "sha256": "2beb91281e50092710ab522417a28af158f69a2e4ca622be30cf87341570cc00",
+      "mode": "100755"
+    },
+    "tinker-local/pyproject.toml": {
+      "sha256": "b6922a24b152f23bd39c3463ccf3678bd5bf422676cc94df40dc76e3b43d335d",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/__init__.py": {
+      "sha256": "658773166cc708b85be1c87631a56e2be8120125fadaa5838295935f1b322d48",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/_async.py": {
+      "sha256": "44e3fbbbe90f582dc1b642e9cc1d5204b451866ff56fe455ec1557ad8f2961c8",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/_transformers_backend.py": {
+      "sha256": "6e30241924932c09b16e841390298851ea4bf2779a4827672b1c66f71ad9520f",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/_vllm_backend.py": {
+      "sha256": "a182cd2ad9ac2136b7792daa1ff14469ca64730a89a88f0355bdaf0319f2d72f",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/_vllm_process.py": {
+      "sha256": "65ee205ba50e9a98525addb2ee281f919a1723f7823bccde61b2df8f4900b668",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/local_config.py": {
+      "sha256": "272df439938b1ba3a17383413b0d3dcfbaeb5cc808a46f5310d0d4b27cfa26db",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/model_input.py": {
+      "sha256": "55aec7a03dea9b046d19e46c660833b6837d489bb09015c4ac15ea82f16d03ae",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/sampling_client.py": {
+      "sha256": "6b39bfe493b76434e0651d5851b1e392baf1930c06c98e622219cef3bdfc6e26",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/service_client.py": {
+      "sha256": "225099af2b31d179bcdec004af2e33542fe3cb998cb10df443f871c5d89a7696",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/training_client.py": {
+      "sha256": "8ce7cb9767efee8465ae668daf55153b9aac17b73af74ded7b50749d91d7625e",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/types.py": {
+      "sha256": "f122c30cadf4b5ab6581cc3345d499251b77b396d2d6f2b951720410189e2474",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/vllm_sampling_client.py": {
+      "sha256": "1a51ca356f72c557cd39399a6b872a2acdc630edf0b1edab2792d5057b0be759",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker/vllm_worker.py": {
+      "sha256": "dd8e71767febf1a4becf5940b7fd5a50fcab0c9e70517f12e1a531724ffff637",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker_local_examples/__init__.py": {
+      "sha256": "3c78788ea0fb8b468bf16f215d385ccca713e31b0d6625da9c1c4e1f920e5b92",
+      "mode": "100644"
+    },
+    "tinker-local/src/tinker_local_examples/minimal_smoke.py": {
+      "sha256": "8d53a02be69e19f8ca39ad8f117e3af0b75309e166e185a400690e6153911921",
+      "mode": "100644"
+    },
+    "viz.py": {
+      "sha256": "a5a147e45631de39ecf64be2435bf221eaae21d52724c2ed7e68c9353f0039ca",
+      "mode": "100644"
+    }
+  }
+}

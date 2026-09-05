@@ -1,0 +1,29 @@
+{
+  "provenance": "Read-only snapshot of the developer checkout used by the previous parity tests, 2026-09-05. This reference includes uncommitted legacy work; it is not asserted to equal legacy main.",
+  "files": {
+    "src/tinker_debate/debate_types.py": "dfaa3ddc6497de0bbd17ac14e3a4bcc483ba44252fa6297d615951c29290cbd0",
+    "src/tinker_debate/prompts.py": "fc84a61104d476ccca055b55044fc50fafe5795d21e9dd2a6782d5406e680164",
+    "prompts/debate/r2_token_template.md": "66899b0926b165e7742f84e11d62275d0634979464c31d569db1f785cc1c0ce2",
+    "prompts/debate/r2_user_template.md": "05d68f52618a4dc48bff5f5b00a90ccc5109c9414a20c0368c386ca389a5d2c0",
+    "prompts/debate/r3_token_template.md": "f8a2ce1ca36744a20ded9f475ec2ee65c24a453c680b7119d0311b1c9281e455",
+    "prompts/debate/r3_user_template.md": "b4b01abab3e62c436af7b74d0e84038a604bb23bcc38120b241d08b33c06bc21",
+    "prompts/debate/system_argue.md": "1cc909cecd035275033aced426cb1e5346df5bc3cc2f450e75a4f8ab689f90fe",
+    "prompts/debate/system_judge.md": "61dde651a964f95482e475900a17541fecb762e4b9d208013ef4b5185ee1730f",
+    "prompts/debate/system_pointwise_judge.md": "4c5fd301c990d190d0c3c1a76043f7c64b21d9b3f67f125ba42bb97fa0356f00",
+    "prompts/debate/system_propose.md": "3094248790960beac7f68136c5ea9e1eee1a7353918af18e2c234ef5513a8259",
+    "prompts/tasks/coin_system.md": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "prompts/tasks/coin_user.md": "bef0cba48ac602d0ec58a94d9a09eb84e1597f34b67f48ea5843df08057d010e",
+    "prompts/tasks/confidence_user.md": "acfaa43bd0d3db3e617b73b2ce2df0c1d928c0e166732572502c39df1d8b94f4",
+    "prompts/tasks/constrained_writing_user.md": "e055c414726e273ec2c4899183729fe4e6b09bef8c784e268f9e9f0219e869ae",
+    "prompts/tasks/ht_sequence_user.md": "0ed7756721fc9909496c047f016fc16a809809fb698ca15e2af073847d640ea5",
+    "prompts/tasks/qa_user.md": "97ea6875d963f847291e4475c49203d61696dc5c3ed0fd6f867f6b98bfa750f6",
+    "prompts/tasks/secret_word_judge_context.md": "dc6c9109ec64b8f4d9cef1fcedb00eff95550066a25ee8f0bf30190401c2027f",
+    "prompts/tasks/secret_word_question.md": "c69de8260ddd6daa534ef23f1a4516a1a15e4958df903f41df762338a2b1e5d9",
+    "prompts/tasks/secret_word_r1.md": "6d3faa98efc0a3ced64a42f6def983ca5842ce3b170ff11fb248790f5f085e0a",
+    "prompts/tasks/secret_word_r2.md": "5450eea1369f73d8d2dd2b91870d70e2de07e036eef8bea60e573eafab43dad0",
+    "prompts/tasks/secret_word_r3.md": "10b0bb7dcc1833a0d4bd33dcb0c4722a04d11c993c62f8bb36d930361a3c5525",
+    "prompts/tasks/summary_user.md": "d44dfa9c27ae3a4e581321a5d4eb5b7084b00df861ee7859c12262743a77a0dc",
+    "prompts/tasks/secret_word_declarative/avoid.md": "6c0cc3e22e84797e79e1981d805496f22ab080767517f640412895b315b31cbb",
+    "prompts/tasks/secret_word_declarative/include.md": "77df82c1c276002c68eb402c6eb722d7ceda3445c92c6dcab914e1e94c3ef2ec"
+  }
+}
