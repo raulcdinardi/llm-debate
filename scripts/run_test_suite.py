@@ -7,18 +7,7 @@ import subprocess
 import sys
 
 
-UNIT_TARGETS = [
-    "tests/unit/test_behavior_policy.py",
-    "tests/unit/test_behavior_policy_microprobe.py",
-    "tests/unit/test_ht_sequence_env.py",
-    "tests/unit/test_masking.py",
-    "tests/unit/test_episode_routing.py",
-    "tests/unit/test_driver.py",
-    "tests/unit/test_debate_training_projection.py",
-    "tests/unit/test_debate_source_parity.py",
-    "tests/unit/test_base_model_judge.py",
-    "tests/unit/test_debate_judge_fn.py",
-]
+UNIT_TARGETS = ["tests/unit"]
 
 INTEGRATION_TARGETS = [
     "tests/integration/test_vllm_lora_load.py",

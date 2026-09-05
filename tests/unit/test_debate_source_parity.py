@@ -19,14 +19,7 @@ def _source_compatible_training_data(data) -> list[dict]:
 
 
 def _import_source_modules():
-    candidates = [
-        Path("/mnt/c/Users/raulc/Desktop/llm-debate/src"),
-        Path("/home/vm02/Desktop/raul/mnt/c/Users/raulc/Desktop/llm-debate/src"),
-        Path("/home/vm02/Desktop/raul/llm-debate-4070/src"),
-    ]
-    source_repo = next((path for path in candidates if path.exists()), None)
-    if source_repo is None:
-        raise RuntimeError(f"Source repo path missing; tried {candidates}")
+    source_repo = Path(__file__).resolve().parents[1] / "fixtures" / "legacy_parity" / "src"
     package = types.ModuleType("tinker_debate")
     package.__path__ = [str(source_repo / "tinker_debate")]
     sys.modules["tinker_debate"] = package
