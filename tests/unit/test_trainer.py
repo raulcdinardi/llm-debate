@@ -280,6 +280,48 @@ def test_supervised_label_ce_js_uses_direct_labels_and_zero_js_for_equal_distrib
     assert metrics["completion_tokens_checked"] == 0.0
 
 
+def test_unsupervised_js_has_no_label_ce_term() -> None:
+    examples = [
+        TrainExample(
+            adapter_name="judge",
+            input_ids=[0],
+            target_ids=[target],
+            loss_mask=[1],
+            behavior_logprob_mask=[0],
+            old_logprobs=[0.0],
+            advantages=[0.0],
+            metadata={
+                "training_objective": "unsupervised_js",
+                "behavior_policy_allowed_token_ids": [0, 1],
+                "judge_coherence_pair_id": "pair-0",
+                "judge_coherence_pair_member": member,
+            },
+        )
+        for member, target in (("forward", 0), ("reverse", 1))
+    ]
+
+    trainer = _fake_trainer()
+    with torch.no_grad():
+        trainer.model.bias.fill_(1.0)
+    metrics = trainer.train_batch(
+        adapter_name="judge",
+        batch=examples,
+        objective="unsupervised_js",
+    )
+
+    expected_js = bernoulli_js_divergence(
+        1.0 / (1.0 + math.exp(-1.0)),
+        1.0 / (1.0 + math.exp(1.0)),
+    ) / math.log(2.0)
+    assert metrics["training_objective"] == "unsupervised_js"
+    assert metrics["loss"] == pytest.approx(expected_js, abs=1e-6)
+    assert metrics["supervised_label_nll"] == 0.0
+    assert metrics["supervised_label_accuracy"] == 0.0
+    assert metrics["judge_coherence_js"] == pytest.approx(expected_js, abs=1e-6)
+    assert metrics["judge_coherence_reliability"] == pytest.approx(1.0 - expected_js)
+    assert metrics["judge_coherence_pair_count"] == 1.0
+
+
 def test_direct_js_is_bounded_symmetric_and_differentiable() -> None:
     logprobs = torch.tensor([math.log(0.9), math.log(0.1)], requires_grad=True)
     js = _normalized_bernoulli_js_from_paired_correct_logprobs(logprobs)

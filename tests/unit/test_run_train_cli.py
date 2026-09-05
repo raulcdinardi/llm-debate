@@ -69,6 +69,8 @@ def test_cli_defaults_all_sampling_temperatures_to_one() -> None:
     args = parse_args(["--model-path", "/tmp/model", "--output-dir", "/tmp/out"])
 
     assert args.adapter_layout == "shared"
+    assert args.num_groups == 8
+    assert args.group_size == 16
     assert args.temperature == 1.0
     assert args.debate_judge_temperature == 1.0
     assert args.debate_r1_reward == "task"
@@ -113,6 +115,7 @@ def test_config_repeats_last_adapter_for_arbitrary_round_depth() -> None:
     config = TrainRunConfig(
         model_path="/tmp/model",
         output_dir="/tmp/out",
+        rollout=RolloutConfig(num_groups=2, group_size=8),
         debate_rounds=7,
         debate_depth_policy="shuffled_multiset",
         debate_depth_policy_params={"depths": [3, 7, 4, 6]},
@@ -205,6 +208,7 @@ def test_previous_depth_array_config_migrates_to_registered_policy() -> None:
     payload.pop("debate_depth_policy")
     payload.pop("debate_depth_policy_params")
     payload["debate_rounds"] = 3
+    payload["rollout"]["group_size"] = 8
     payload["debate_rounds_per_group"] = [3, 7, 4, 6]
 
     restored = TrainRunConfig.from_dict(payload)
@@ -212,6 +216,25 @@ def test_previous_depth_array_config_migrates_to_registered_policy() -> None:
     assert restored.debate_rounds == 7
     assert restored.debate_depth_policy == "shuffled_multiset"
     assert restored.debate_depth_policy_params == {"depths": [3, 7, 4, 6]}
+
+
+def test_rollout_config_defaults_to_apples_to_apples_8x16_debate_geometry() -> None:
+    rollout = RolloutConfig()
+
+    assert rollout.num_groups == 8
+    assert rollout.group_size == 16
+
+
+def test_cli_accepts_prompt_group_soft_judge_grpo() -> None:
+    args = parse_args(
+        [
+            "--model-path", "/tmp/model",
+            "--output-dir", "/tmp/out",
+            "--debate-r23-reward", "soft_judge_prompt_grpo",
+        ]
+    )
+
+    assert args.debate_r23_reward == "soft_judge_prompt_grpo"
 
 
 def test_cli_accepts_frozen_single_token_judge_constraint() -> None:
@@ -269,6 +292,41 @@ def test_soft_judge_config_is_opt_in_and_fail_closed() -> None:
     assert config.to_dict()["judge_label_token_contract_temporary"] is True
     restored = TrainRunConfig.from_dict(config.to_dict())
     assert restored.debate_judge_score_mode == "order_sym_soft_logit"
+
+
+def test_prompt_group_soft_judge_grpo_requires_multiple_debates_and_frozen_judge() -> None:
+    config = TrainRunConfig(
+        model_path="/model",
+        output_dir="/out",
+        rollout=RolloutConfig(
+            mode="debate",
+            env_name="mmlu_pro_pairwise",
+            num_groups=8,
+            group_size=16,
+        ),
+        mmlu_pro_data_path="/corpus/mmlu.jsonl",
+        adapter_layout="split",
+        debate_rounds=3,
+        debate_round_adapter_names=("solution", "debate", "debate"),
+        debate_r1_reward="none",
+        debate_r23_reward="soft_judge_prompt_grpo",
+        debate_r23_mode="symmetric",
+        debate_judge_adapter="judge",
+        debate_judge_harness=CONSTITUTION_SINGLE_TOKEN_V1,
+        debate_judge_temperature=0.0,
+        debate_judge_max_tokens=1,
+        debate_judge_bidirectional=True,
+        debate_judge_constrain_single_token=True,
+        debate_judge_score_mode="order_sym_soft_logit",
+        judge_label_token_contract="lfm25_ab_whitespace_compat_v1",
+        train_judge=False,
+        train_adapter_names=("debate",),
+    )
+
+    assert config.rollout.num_groups == 8
+    assert config.rollout.group_size == 16
+    with pytest.raises(ValueError, match="at least two debates per prompt"):
+        replace(config, rollout=replace(config.rollout, group_size=2))
 
 
 def test_cli_accepts_label_judge_grpo_reward_mode() -> None:
@@ -369,6 +427,51 @@ def test_openbookqa_supervised_label_ce_js_contract_is_trainable_and_granular() 
     assert migrated.train_judge is True
     assert migrated.judge_training_objective == "supervised_label_ce_js"
     assert migrated.judge_grpo_reward_mode == "coherence"
+
+
+def test_unlabeled_js_direct_objective_uses_same_strict_pair_contract() -> None:
+    args = parse_args(
+        [
+            "--model-path",
+            "/tmp/model",
+            "--output-dir",
+            "/tmp/out",
+            "--train-judge",
+            "--judge-training-objective",
+            "unsupervised_js",
+            "--judge-coherence-js-weight",
+            "1.0",
+        ]
+    )
+    assert args.judge_training_objective == "unsupervised_js"
+
+    config = TrainRunConfig(
+        model_path="/model",
+        output_dir="/out",
+        rollout=RolloutConfig(mode="debate", env_name="constrained_writing", temperature=1.0),
+        adapter_layout="split",
+        debate_rounds=3,
+        debate_round_adapter_names=("solution", "debate", "debate"),
+        debate_r1_reward="none",
+        debate_r23_reward="soft_judge",
+        debate_r23_mode="symmetric",
+        debate_judge_adapter="judge",
+        debate_judge_harness=CONSTITUTION_SINGLE_TOKEN_V1,
+        debate_judge_temperature=1.0,
+        debate_judge_max_tokens=1,
+        debate_judge_bidirectional=True,
+        debate_judge_constrain_single_token=True,
+        debate_judge_score_mode="order_sym_soft_logit",
+        judge_label_token_contract="lfm25_openbookqa_spaced_ab_v1",
+        train_judge=True,
+        judge_training_objective="unsupervised_js",
+        judge_coherence_js_weight=1.0,
+        train_adapter_names=("debate", "judge"),
+    )
+    assert config.judge_training_objective == "unsupervised_js"
+
+    with pytest.raises(ValueError, match="weight > 0"):
+        replace(config, judge_coherence_js_weight=0.0)
 
 
 def test_documented_judge_grpo_flags_parse_and_pass_config_validation() -> None:

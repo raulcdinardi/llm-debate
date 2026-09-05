@@ -170,14 +170,25 @@ def validate_judge_prompt_label_boundary(
             f"{contract.required_prompt_suffix!r}; observed suffix={prompt_text[-32:]!r}"
         )
     prompt_ids = tuple(int(token_id) for token_id in prompt_token_ids)
-    for surface, allowed_ids in (
+    for surface, semantic_token_ids in (
         (contract.canonical_a, contract.a_token_ids),
         (contract.canonical_b, contract.b_token_ids),
     ):
-        isolated = tuple(tokenizer.encode(surface, add_special_tokens=False))
-        if len(isolated) != 1 or isolated[0] not in allowed_ids:
-            raise ValueError(f"Canonical label {surface!r} is not one allowed token")
-        expected_id = isolated[0]
+        canonical_ids = tuple(
+            int(token_id)
+            for token_id in tokenizer.encode(surface, add_special_tokens=False)
+        )
+        if len(canonical_ids) != 1:
+            raise ValueError(
+                f"Canonical judge label {surface!r} for {contract.name!r} must encode "
+                f"to exactly one token; observed={canonical_ids}"
+            )
+        expected_id = canonical_ids[0]
+        if expected_id not in semantic_token_ids:
+            raise ValueError(
+                f"Canonical judge label {surface!r} for {contract.name!r} maps to "
+                f"token {expected_id}, outside semantic token ids={semantic_token_ids}"
+            )
         combined = tuple(
             int(token_id)
             for token_id in tokenizer.encode(prompt_text + surface, add_special_tokens=False)

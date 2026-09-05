@@ -17,6 +17,20 @@ from llm_local_rl.judge_harness import (
 )
 
 
+def test_directional_judge_distribution_metrics_include_tail_quantiles() -> None:
+    from llm_local_rl.driver import _distribution_metrics
+
+    metrics = _distribution_metrics("judge/forward_a_probability", [0.0, 0.25, 0.5, 0.75, 1.0])
+
+    assert metrics == {
+        "judge/forward_a_probability_mean": pytest.approx(0.5),
+        "judge/forward_a_probability_p05": pytest.approx(0.05),
+        "judge/forward_a_probability_p50": pytest.approx(0.5),
+        "judge/forward_a_probability_p95": pytest.approx(0.95),
+    }
+    assert _distribution_metrics("judge/empty", []) == {}
+
+
 def test_sampling_temperature_defaults_are_one_in_config_and_legacy_payloads() -> None:
     config = TrainRunConfig(
         model_path="/tmp/nonexistent_model_for_shape_only",

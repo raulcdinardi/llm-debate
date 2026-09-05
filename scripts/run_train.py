@@ -61,8 +61,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--adapter-layout", default="shared", choices=["shared", "split"])
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--num-samples", type=int, default=16)
-    parser.add_argument("--num-groups", type=int, default=2)
-    parser.add_argument("--group-size", type=int, default=8)
+    parser.add_argument("--num-groups", type=int, default=8)
+    parser.add_argument("--group-size", type=int, default=16)
     parser.add_argument("--rollout-batch-size", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -122,7 +122,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ],
     )
     parser.add_argument(
-        "--debate-r23-reward", default="constant", choices=["constant", "soft_judge", "soft_judge_raw", "none"]
+        "--debate-r23-reward",
+        default="constant",
+        choices=["constant", "soft_judge", "soft_judge_raw", "soft_judge_prompt_grpo", "none"],
     )
     parser.add_argument("--debate-r23-constant", type=float, default=1.0)
     parser.add_argument("--debate-r1-judge-delta-q", type=float, default=1.0)
@@ -196,19 +198,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--judge-training-objective",
-        choices=["grpo", "supervised_label_ce_js"],
+        choices=["grpo", "supervised_label_ce_js", "unsupervised_js"],
         default="grpo",
         help=(
             "Optimization objective for the trainable judge. 'grpo' preserves sampled-action "
             "PPO/GRPO; 'supervised_label_ce_js' applies direct two-class label CE plus "
-            "differentiable referent-aligned JS coherence. Debate adapters remain GRPO."
+            "differentiable referent-aligned JS coherence; 'unsupervised_js' applies only "
+            "the differentiable coherence loss and consumes no task labels. Debate adapters "
+            "remain PPO/GRPO."
         ),
     )
     parser.add_argument(
         "--judge-coherence-js-weight",
         type=float,
         default=1.0,
-        help="Coefficient lambda_js in label_ce + lambda_js * JS/ln(2).",
+        help=(
+            "Coefficient lambda_js on normalized referent-aligned JS. The labeled objective "
+            "adds label CE; unsupervised_js uses only this weighted JS term."
+        ),
     )
     parser.add_argument(
         "--judge-grpo-reward-mode",

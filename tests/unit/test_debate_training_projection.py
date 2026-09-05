@@ -11,6 +11,7 @@ from llm_local_rl.debate_parity import (
     audit_base_text_debate_format,
     assemble_judge_coherence_grpo_examples,
     assemble_judge_supervised_label_examples,
+    assemble_judge_unsupervised_js_examples,
     assemble_split_train_examples,
     assemble_training_data_by_mode,
     assemble_training_data_r1_r23,
@@ -143,6 +144,52 @@ def test_supervised_judge_targets_gold_referent_in_both_orders() -> None:
     ]
     assert metrics["judge_supervised_sampled_label_accuracy"] == 0.0
     assert metrics["judge_supervised_referent_js_mean"] == pytest.approx(0.2)
+
+
+def test_unsupervised_js_uses_referent_probes_without_task_labels() -> None:
+    turns = [
+        {
+            "order": "forward",
+            "verdict": "B",
+            "prompt_tokens": [101, 102],
+            "completion_tokens": [378],
+            "completion_logprobs": [-0.8],
+            "behavior_policy_allowed_token_ids": [334, 378],
+        },
+        {
+            "order": "reverse",
+            "verdict": "A",
+            "prompt_tokens": [201, 202],
+            "completion_tokens": [334],
+            "completion_logprobs": [-0.7],
+            "behavior_policy_allowed_token_ids": [334, 378],
+        },
+    ]
+    # A reward tie proves this path neither requires nor derives a gold winner.
+    debate = _make_debate(
+        reward_a=0.5,
+        reward_b=0.5,
+        judge_raw_response={
+            "bidirectional_judge": True,
+            "order_invariant": False,
+            "judge_label_token_contract": {
+                "a_token_ids": [334],
+                "b_token_ids": [378],
+            },
+            "soft_score": {"referent_js_divergence_normalized": 0.2},
+            "_training_judge_turns": turns,
+        },
+    )
+
+    examples, metrics = assemble_judge_unsupervised_js_examples([debate])
+
+    assert [row.target_ids[-1] for row in examples] == [334, 378]
+    assert all(row.metadata["judge_js_probe_referent"] == "original_agent_a" for row in examples)
+    assert all("judge_label_gold_agent" not in row.metadata for row in examples)
+    assert all(row.behavior_logprob_mask[-1] == 0 for row in examples)
+    assert metrics["judge_training_objective"] == "unsupervised_js"
+    assert metrics["judge_unsupervised_group_size"] == 2
+    assert metrics["judge_unsupervised_referent_js_mean"] == pytest.approx(0.2)
 
 
 def _make_debate(
@@ -469,6 +516,51 @@ def test_soft_judge_r23_is_exactly_zero_sum_even_when_hard_labels_disagree() -> 
         example.metadata["judge_coherence_reliability"] == pytest.approx(0.5)
         for example in debate_examples
     )
+
+
+def test_soft_judge_prompt_grpo_normalizes_s_within_prompt_and_ignores_reliability() -> None:
+    debates = [
+        _make_debate(
+            instance_id="same-prompt",
+            judge_raw_response=_soft_judge_audit(0.25, js=0.0),
+        ),
+        _make_debate(
+            instance_id="same-prompt",
+            token_offset=100,
+            judge_raw_response=_soft_judge_audit(0.25, js=0.9),
+        ),
+    ]
+    split = assemble_split_train_examples(
+        debates=debates,
+        num_rounds=3,
+        round_adapter_names=("solution", "debate", "debate"),
+        r1_reward_mode="none",
+        r23_reward_mode="soft_judge_prompt_grpo",
+        r23_constant=99.0,
+        r23_symmetric=True,
+        r23_advantage_scope="merged_r23",
+        task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
+    )
+
+    examples = split["debate"]
+    assert [example.metadata["r23_reward"] for example in examples] == [1.0, -1.0, 1.0, -1.0]
+    assert [example.metadata["r23_prompt_grpo_raw_reward"] for example in examples] == [
+        0.25,
+        -0.25,
+        0.25,
+        -0.25,
+    ]
+    assert all(example.metadata["r23_prompt_grpo_group_mean"] == pytest.approx(0.0) for example in examples)
+    assert all(example.metadata["r23_prompt_grpo_group_std"] == pytest.approx(0.25) for example in examples)
+    assert all(example.metadata["r23_reliability_applied"] is False for example in examples)
+    assert [example.metadata["judge_coherence_reliability"] for example in examples] == [
+        1.0,
+        1.0,
+        pytest.approx(0.1),
+        pytest.approx(0.1),
+    ]
+    assert all(example.advantages[-5:] == [0.25, 0.25, 0.0, 0.25, 0.25] for example in examples[::2])
+    assert all(example.advantages[-5:] == [-0.25, -0.25, 0.0, -0.25, -0.25] for example in examples[1::2])
 
 
 def test_base_text_debate_format_audit_is_exact_and_terminal() -> None:
@@ -912,3 +1004,27 @@ def test_split_projection_uses_configured_r1_adapter_for_every_reward_mode() -> 
     assert len(split["custom_solution"]) == 2
     assert all(example.adapter_name == "custom_solution" for example in split["custom_solution"])
     assert "solution" not in split
+
+
+@pytest.mark.parametrize("mode,expected", [
+    ("soft_judge_raw", [0.25, -0.25, 0.5, -0.5]),
+    ("soft_judge", [0.25, -0.25, 0.05, -0.05]),
+    ("soft_judge_prompt_grpo", [0.25 / (0.15625 ** 0.5), -0.25 / (0.15625 ** 0.5), 0.5 / (0.15625 ** 0.5), -0.5 / (0.15625 ** 0.5)]),
+])
+def test_merged_reward_modes_preserve_mixed_depth_signals(mode, expected):
+    debates = [
+        _make_debate(instance_id="same", judge_raw_response=_soft_judge_audit(0.25, js=0.0)),
+        _append_fourth_round(_make_debate(instance_id="same", token_offset=100,
+                                        judge_raw_response=_soft_judge_audit(0.5, js=0.9))),
+    ]
+    examples = assemble_split_train_examples(
+        debates=debates, num_rounds=4,
+        round_adapter_names=("solution", "debate", "debate", "debate"),
+        r1_reward_mode="none", r23_reward_mode=mode, r23_constant=99.0,
+        r23_symmetric=True, r23_advantage_scope="merged_r23",
+        task_reward_fn=lambda traj, debate: 0.0,
+    )["debate"]
+    assert [e.metadata["r23_reward"] for e in examples] == pytest.approx(expected)
+    assert [sum(e.advantages) for e in examples] == pytest.approx(expected)
+    if mode == "soft_judge_prompt_grpo":
+        assert all(e.metadata["r23_reliability_applied"] is False for e in examples)
