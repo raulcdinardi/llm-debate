@@ -1,0 +1,97 @@
+{
+  "source_experiment": "cw_early_mechanisms_20260905_r1",
+  "files": {
+    "control/runner.py": {
+      "original_sha256": "cf3678e7e941c8da9a4ad7ad288ac7e83fd9e4c7716f17d32a199b394d8fc1a0",
+      "sha256": "cf3678e7e941c8da9a4ad7ad288ac7e83fd9e4c7716f17d32a199b394d8fc1a0"
+    },
+    "control/evaluate.py": {
+      "original_sha256": "6e82353876181b47f6f172662df1d592ffc8f474c7ed7a27c1b9238fdcef32c4",
+      "sha256": "f6a3f3d9f2d63cf5b0c94739da22151aa304a20e16ae390df54b464dc995f2c2"
+    },
+    "control/score.py": {
+      "original_sha256": "48b749e870d2477e1386a88afa019952b9f82fe6b01b99f53764ea2edcba4973",
+      "sha256": "48b749e870d2477e1386a88afa019952b9f82fe6b01b99f53764ea2edcba4973"
+    },
+    "control/score_v2.py": {
+      "original_sha256": "4dd29f72c6c1def10de75f1976e278a6588e13df41c958f3d3f75e660784a629",
+      "sha256": "4dd29f72c6c1def10de75f1976e278a6588e13df41c958f3d3f75e660784a629"
+    },
+    "spec.json": {
+      "original_sha256": "ee79921a9763fb51e3a868fb2e516c64ee543ebb52514061e4e37f634de235e8",
+      "sha256": "23f7fcd5811629186d3dc65a4f1f23043f3f46a8a91aef648e2205be9e6a5824"
+    }
+  },
+  "portability_changes": [
+    "evaluate.py accepts CW_HOST=vm02 or vm03 for shard selection; historical path-derived fallback retained.",
+    "Archived specification omits session authorization and the local source-records path; scientific fields and input hashes retained."
+  ],
+  "source_files": {
+    "src/llm_local_rl/__init__.py": "09b3a1bb66eb2c31802f9d88b0300f7f70c99d2ceb0421200286179e59dc0b03",
+    "src/llm_local_rl/base_model_judge.py": "73f3edb7ddf32ce8999e0c0c5cc883b0d32cd4a29772f98f3e6134c9e27b0a38",
+    "src/llm_local_rl/behavior_policy.py": "247cb29c8a49d13d72b62900f635290a9d9dd6e7c96a49eb4d4a495069276613",
+    "src/llm_local_rl/behavior_policy_microprobe.py": "03d70580bb09431905073f95dc0ab2cd940d7a097c36fc398beef8ef62d19c2f",
+    "src/llm_local_rl/chat_templates.py": "260716eb248cf4b818ea1d4a066a1e5729f76cffda4abe3ebf2683c65403cf87",
+    "src/llm_local_rl/checkpointing.py": "5beb3ac7d990d72a68a9689e33854c463d3392ce61540aa178351aadd2dae957",
+    "src/llm_local_rl/config.py": "dd516cf43a2aac35b5fe0f60f389056f5bfcf04afc5e4b98d4f8993839dbd62e",
+    "src/llm_local_rl/constrained_writing.py": "0205d8cbf82a1e2e285164e80193b75a3171334ac182b5d3684190c93b395b7e",
+    "src/llm_local_rl/countdown_code.py": "01654e2c99e566f7b2ac1f14c5a7a9577b855d05d28281f4782ae6ee9c736f61",
+    "src/llm_local_rl/debate_parity.py": "a041dcb4f5c906320cab954a4bee0696e2dcb29ec985d557a06f1e9574eacb60",
+    "src/llm_local_rl/debate_runtime.py": "e017f31c3e8fd4f3484acb487c52ed638fc0604b1b111736f930ff0130d9f15b",
+    "src/llm_local_rl/debate_tasks.py": "78200d9acd7afa4f68d171ae72e82060634a0a3a2c63b6345b3e22d767f7a299",
+    "src/llm_local_rl/driver.py": "1578c502b837a1796ab083829f8cfcb38a2460930b5675a3e6f7b1b27b388039",
+    "src/llm_local_rl/envs.py": "56a4747f36b79cd668d6ca2366ae34bcf7d7c0f1ecb3fcec0105d426f6c16800",
+    "src/llm_local_rl/episodes.py": "f0c28b147745c444baf9211499b4a54317603394d5f2dea6e14e331a80fa781c",
+    "src/llm_local_rl/ht_sequence_format.py": "30319c52df4f0ff4616e5b7aa567e0152726f4aefca57a176cc31471ba7a23b2",
+    "src/llm_local_rl/integration_assets.py": "db2b4e442e0705cc0d7cece7c6ceb25464c5f8298e5698714a5774eb90a9446a",
+    "src/llm_local_rl/interfaces.py": "b31404c928e1399ada625dd6200bdcc8185a551f7e5c80bfb195b0cfe0ed1266",
+    "src/llm_local_rl/judge_harness.py": "1ec2bd4853b235a4a1312cdee65810040762a984197a6e2d7bb16c116689680b",
+    "src/llm_local_rl/local_renderers.py": "03f30f32b7cb86bdb0736ebe4fdf71eaa4a441615ac97ab8e00083fbc4fbafa5",
+    "src/llm_local_rl/lora_identity.py": "b9e7cc4077f27bae050d88b624ed2671949efd63e0c2509e568aa43e9d1caf66",
+    "src/llm_local_rl/masking.py": "0b71418d8fcbd219b41aebd24565a215a6a5dc20c6bad807b7c3693a5e9f805e",
+    "src/llm_local_rl/memory_trace.py": "715f3d9121bfe0fdfb7d32af5aefc67898e17f022e6d260ad8346c578fecb202",
+    "src/llm_local_rl/metrics.py": "d71f5d3faee209551506b4389faae7b521fa516d226fcdc663237dc6b31b5611",
+    "src/llm_local_rl/mmlu_pro_pairwise.py": "2ddeedcc832c4d2462ac8c6bae5614a9b760af376f06bd0001f6d9f47c1a43b5",
+    "src/llm_local_rl/mock_judge.py": "22802b2ffd88848da3fbb685aa11d334cde70a2024c5e67fa7607f641c770bc4",
+    "src/llm_local_rl/model_io_trace.py": "5fb5b895417df372ab5b8b52009320120fb150a0df1f82eb98cc394e43a5935a",
+    "src/llm_local_rl/observability.py": "5fceb7fcc12a31d9fe4f8978f3aa3f9319bdf74086430027ce1060da184493aa",
+    "src/llm_local_rl/on_policy_logprobs.py": "f6b5404113eaea55c23bae812cbacb2dd76b4d1efc9aac4110b66f8ce3c58050",
+    "src/llm_local_rl/prompts.py": "d8d94a1870a8e5410a9b1dcd821a202f102988bb682ad25fad59d2b0acc05ddc",
+    "src/llm_local_rl/quality_data.py": "a2a83d2fdf106006c95183194f4201a5d9e1e4463a6d1db6535645a274fd29a1",
+    "src/llm_local_rl/quote_verifier.py": "38468b4e69b29ed287f7401a8594b9a84bcc6965e42be1b5b900f6cf2eb644e9",
+    "src/llm_local_rl/qwen35_base_format.py": "c2437a1c69edb1ecc0e84ef3e5fa6514c1e194d48678901275f28714c1b5923a",
+    "src/llm_local_rl/registry.py": "41fd948d874b36d2b85cac8a480ba31375df975596ad7bcc8545c2ed2ae3ef29",
+    "src/llm_local_rl/replay.py": "3705b971376e1b853e5f8c0d57022e365fc1788114edd3258452784cdaa3b4dc",
+    "src/llm_local_rl/resource_monitor.py": "ce7ef852dabece3bf98b1f13a9682a254a488913c16bf5da65e6c0babdd2e334",
+    "src/llm_local_rl/sampler_behavior.py": "96dbd97327eec4c6a70c24fc3782a0e37b8ccde845fdcb6a6c4df28acb39f5d8",
+    "src/llm_local_rl/sft_data.py": "120f7a1ce68348567024857ae5968aaef79ea098fd50e27c565d2062d25b7f2a",
+    "src/llm_local_rl/sglang_sampling.py": "751c67314a83e92bcf02d1722c585dfa0705b265d8c3aa5f8699ba6f4114b6ac",
+    "src/llm_local_rl/short_story_format.py": "5fe799d76829e40e19b76596d3d81529feed79c342d7f38f5e2ae719c189edef",
+    "src/llm_local_rl/task_types.py": "eea7fb947fa497012222dd570b82d4cf77b180777fc1ee2d20fc5d42077eb66f",
+    "src/llm_local_rl/testing.py": "ff1bf08ecf36a3b18156b49228a676ef33d611aacc4584b218f84374c84152f5",
+    "src/llm_local_rl/trainer.py": "0f39328f2f79cbf62573983ca158e25452e2712e53585c2fff1f1afd5fcc71ef",
+    "src/llm_local_rl/transformers_sampling.py": "d30bd2e3061e6bb66ecd3e29e87ee73d7f036ca5a28486dd01adb2382ffde6c4",
+    "src/llm_local_rl/types.py": "03e83d1f0102b2c46575cb6b61c22866ed361ac3696d6ecc19cfc43f81e88949",
+    "src/llm_local_rl/vllm_sampling.py": "1b50b7ff3de3853b4bc5cca3f1aaec1c6fb9bd814d03f6a967f926a192e3e7e8",
+    "prompts/debate/r2_token_template.md": "66899b0926b165e7742f84e11d62275d0634979464c31d569db1f785cc1c0ce2",
+    "prompts/debate/r2_user_template.md": "05d68f52618a4dc48bff5f5b00a90ccc5109c9414a20c0368c386ca389a5d2c0",
+    "prompts/debate/r3_token_template.md": "f8a2ce1ca36744a20ded9f475ec2ee65c24a453c680b7119d0311b1c9281e455",
+    "prompts/debate/r3_user_template.md": "b4b01abab3e62c436af7b74d0e84038a604bb23bcc38120b241d08b33c06bc21",
+    "prompts/debate/system_argue.md": "1cc909cecd035275033aced426cb1e5346df5bc3cc2f450e75a4f8ab689f90fe",
+    "prompts/debate/system_judge.md": "884c8910ebf77c87f6d8f371d2088d8bac8e7864b9caa1c4482f6433db0a12e3",
+    "prompts/debate/system_pointwise_judge.md": "4c5fd301c990d190d0c3c1a76043f7c64b21d9b3f67f125ba42bb97fa0356f00",
+    "prompts/debate/system_propose.md": "3094248790960beac7f68136c5ea9e1eee1a7353918af18e2c234ef5513a8259",
+    "prompts/tasks/coin_system.md": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "prompts/tasks/coin_user.md": "bef0cba48ac602d0ec58a94d9a09eb84e1597f34b67f48ea5843df08057d010e",
+    "prompts/tasks/constrained_writing_user.md": "e055c414726e273ec2c4899183729fe4e6b09bef8c784e268f9e9f0219e869ae",
+    "prompts/tasks/ht_sequence_user.md": "0ed7756721fc9909496c047f016fc16a809809fb698ca15e2af073847d640ea5",
+    "prompts/tasks/quality_debate_judge_context.md": "90f4d157137e8977425d7157e665bc3cecc56639f38bee60962bd15b669efe48",
+    "prompts/tasks/quality_debate_r1.md": "f6b0abd8620f20a12df75a2e73c3418fd27f0500757024ec41c70b231afc1833",
+    "prompts/tasks/quality_debate_r2.md": "66752b4d895ba8516db93dc62fec538e7e57dfb859b482e2bf7f274f536238af",
+    "prompts/tasks/quality_debate_r3.md": "72eae0c43892f34aa7ceb625df66b804942e41de98a2b65f91b06e83bc6aebd8",
+    "prompts/tasks/short_story_judge_context.md": "dc6c9109ec64b8f4d9cef1fcedb00eff95550066a25ee8f0bf30190401c2027f",
+    "prompts/tasks/short_story_r1.md": "6d3faa98efc0a3ced64a42f6def983ca5842ce3b170ff11fb248790f5f085e0a",
+    "prompts/tasks/short_story_r2.md": "5450eea1369f73d8d2dd2b91870d70e2de07e036eef8bea60e573eafab43dad0",
+    "prompts/tasks/short_story_r3.md": "10b0bb7dcc1833a0d4bd33dcb0c4722a04d11c993c62f8bb36d930361a3c5525"
+  }
+}

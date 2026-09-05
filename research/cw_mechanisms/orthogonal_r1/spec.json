@@ -1,0 +1,70 @@
+{
+  "status": "FROZEN_PILOT",
+  "source_run": "hdhyhpsy",
+  "question": "Does the original frozen judge lower its signed soft preference when one quality-tied R1 is degraded along a dimension not used by the unchanged debate?",
+  "candidate_pool": 108,
+  "selection": "Equal existing archived R1 overall scores; user explicitly rejects re-scoring baseline ties.",
+  "pilot": {
+    "target_valid_pairs": 8,
+    "max_candidates": 24,
+    "purpose": "Establish feasible quality degradation without changing debate applicability; failure does not permit weakening acceptance.",
+    "tie_confirmation": "Existing archived R1 scores only; no new baseline tie calls",
+    "acceptance": "Unchanged mechanical reward/rule/penalty and sentence-word-count summary; lower independent craft rating in both orders; claim-level invariance audit and source review."
+  },
+  "full_target": {
+    "max_valid_pairs": 64,
+    "scope": "Only after pilot validation and frozen runtime spec; retain all attempted/rejected edits. No extrapolation from candidate count to eligible count."
+  },
+  "intervention": {
+    "rounds_frozen": [
+      "A:R2",
+      "A:R3",
+      "B:R2",
+      "B:R3"
+    ],
+    "story_side": "Both A and B separately where feasible, never degrade both simultaneously; failed-side attempts retained. Primary average within original pair, then prompt cluster.",
+    "preserve": [
+      "all event/entity/action facts referenced by either side",
+      "verbatim quoted spans",
+      "counts and lexical/structural claims",
+      "truth status and applicability of already incorrect claims",
+      "programmatic rule scores and penalties where feasible; primary acceptance requires unchanged task metrics"
+    ],
+    "change": "Quality dimension unmentioned by the debate, preferably imagery or fluency; inspect all qualitative claims to exclude contradictions. Do not assume edit type guarantees orthogonality.",
+    "quality_validation": "Blind original/edited comparison in both orders, separate from edit generation; same V4 model/provider; require independently confirmed lower quality and applicable fixed debate. Store failure reasons."
+  },
+  "judge": {
+    "identity": "Exact original frozen judge adapter/hash/harness/label contract from hdhyhpsy; not V4 as replacement",
+    "score": "s=tanh((z_forward-z_reverse)/4), z=log P(A)-log P(B) with semantic whitespace token aggregation",
+    "primary_effect": "delta_s_target=orientation*(s_edited-s_original), orientation +1 for A edit and -1 for B edit; negative favors the unchanged competitor",
+    "measurements": [
+      "matched fresh original/edited s in both display orders",
+      "raw semantic label probabilities and logits",
+      "paired delta_s_target and winner flip",
+      "archived-vs-replayed original calibration on pilot"
+    ],
+    "no_prompt_change": true
+  },
+  "inference": "Paired 10000 prompt-cluster bootstrap; mirrored sides/orders not independent. Report exact denominator, quality drops, audit exclusions; optional s-vs-quality dose description is exploratory.",
+  "resources": {
+    "status": "USER_AUTHORIZED",
+    "proposed_api_cap_usd": 3,
+    "proposed_host": "idle vm02 or vm03, Raul isolated directory only",
+    "no_training": true,
+    "no_rental": true,
+    "no_environment_changes_elsewhere": true,
+    "host": "vm02",
+    "api_cap_usd": 3,
+    "judge_gpu_cap_seconds": 1800
+  },
+  "orthogonality_limit": "Operationally audited invariance, not proof of semantic independence. Generic claims of overall superiority may preclude any eligible edit.",
+  "code_sha256": {
+    "control/pilot.py": "852560d15f911cc2bdba4a8122d6ce60c7748d01f7860b361ce72e02fa4c773d"
+  },
+  "authorized_at": "2026-09-05T21:31:16.135061+00:00",
+  "supersedes": "cw_hdhyhpsy_orthogonal_r1_20260905_r2",
+  "provider": "Baidu",
+  "provider_slug": "baidu",
+  "provider_change_authorization": "Raul: use baidu",
+  "prior_conservative_reservation": 2.19
+}

@@ -1,0 +1,139 @@
+{
+  "name": "cw_overnight_mechanisms_20260905_r1",
+  "source_run": "3cqstue5",
+  "source_archive_sha256": "39c3d533da5809b607d48bc6f040637444ff0982298e154332f033ce835b2586",
+  "model": {
+    "repo": "LiquidAI/LFM2.5-2.6B-Base",
+    "revision": "c57bdaed1ef166fe3095dda07f4a5e789ad5321e",
+    "local_directory": "base_exact"
+  },
+  "panel": {
+    "n": 128,
+    "unique_prompts": 128,
+    "source_sha256": "5c9852dab4ab53bdf0aa59cf4a902013385ef11026072123144546565c1d5327",
+    "window_counts": [
+      32,
+      32,
+      32,
+      32
+    ]
+  },
+  "causal": {
+    "checkpoints": [
+      100,
+      140,
+      160,
+      200
+    ],
+    "variants": [
+      "clean",
+      "true_frozen",
+      "true_propagated",
+      "false_frozen",
+      "false_propagated"
+    ],
+    "cross_cells": [
+      [
+        100,
+        200
+      ],
+      [
+        200,
+        100
+      ]
+    ],
+    "n_unique_prompts": 128,
+    "clean_debates": 768,
+    "transcripts": 2816,
+    "judge_orders": 2,
+    "judge_calls": 5632,
+    "generated_turns": 4096
+  },
+  "amplification": {
+    "windows": [
+      [
+        120,
+        140
+      ],
+      [
+        160,
+        180
+      ]
+    ],
+    "alphas": [
+      -1,
+      0,
+      1,
+      2
+    ],
+    "roles": [
+      "solution",
+      "debate"
+    ],
+    "n_unique_prompts": 64,
+    "initialization": "OpenBookQA step104 role-specific adapters; not raw base",
+    "effective_update": "W_base + D_init + alpha*(D_high-D_low); D=LoRA_scale*B@A",
+    "deduplicate_alpha_zero": true,
+    "actual_endpoint_controls": [
+      120,
+      140,
+      160,
+      180
+    ],
+    "rows": 1408,
+    "generated_turns": 2112,
+    "interpretation": "Exploratory behavior amplification; no isolated-feature claim"
+  },
+  "generation": {
+    "backend": "transformers",
+    "dtype": "bfloat16",
+    "max_new_tokens": 250,
+    "temperature": 1,
+    "top_p": 1,
+    "top_k": 0,
+    "batch": 4,
+    "seeds": "hashed ordered prompt IDs and round label, common across checkpoint conditions",
+    "prompt_source": "exact source archive native CW base-text extension",
+    "judge_rules_blind": true
+  },
+  "judge": {
+    "model": "deepseek/deepseek-v4-flash-0731",
+    "provider": "relace",
+    "fallback": false,
+    "reasoning": "none",
+    "temperature": 0,
+    "api_usd_cap_per_host": 3
+  },
+  "execution": {
+    "hosts": [
+      "vm02",
+      "vm03"
+    ],
+    "partition": "complete prompt families, even/odd panel rows",
+    "root": "/media/HOST/ssd1T/raul/cw_overnight_20260905",
+    "hard_hours": 8,
+    "phase0": "4 prompts full clean+causal and two amplification extremes on each GPU",
+    "environment": "isolated venv; vm02 reads existing Raul packages without modifying them, vm03 fresh pinned packages",
+    "deadline_policy": "preserve completed blocks; partial is never complete",
+    "unattended": true
+  },
+  "analysis": {
+    "unit": "unique prompt",
+    "bootstrap": "paired prompt cluster 10000 resamples",
+    "primary": [
+      "false vs true effect on grounded rejection",
+      "false vs true effect on canonical judge preference"
+    ],
+    "secondary": [
+      "propagated minus frozen contrast",
+      "cross checkpoint win and order consistency"
+    ],
+    "strategy_annotations": "exploratory evidence-cited classifications; no checkpoint labels in judge prompts"
+  },
+  "files": {
+    "inputs/panel.jsonl": "f081a10c296a6885814ab76ca1efc58de63d5aef4538b684ad6beece65c5963c",
+    "inputs/base_model.json": "789743115f6fbe58e56be7ac4f1f312b86a1e23afc6e5964a1a6c36ede367a86",
+    "inputs/download_manifest_public.json": "2fcdafeaf640f768996a5e81a427981582fd4772594ca18f5cfa4765ada12cc1",
+    "control/runner.py": "cf3678e7e941c8da9a4ad7ad288ac7e83fd9e4c7716f17d32a199b394d8fc1a0"
+  }
+}
