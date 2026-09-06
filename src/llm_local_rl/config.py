@@ -126,6 +126,7 @@ class TrainRunConfig:
     rollout_grad_accum_steps: int = 1
     rollout_assistant_prefill: str | None = None
     train_minibatch_size: int = 0
+    train_optimizer_batch_size: int = 0
     train_max_tokens: int = 0
     train_length_bucket_batches: bool = False
     train_logprob_backend: str = "full_logits"
@@ -210,6 +211,8 @@ class TrainRunConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.train_optimizer_batch_size < 0:
+            raise ValueError("train_optimizer_batch_size must be non-negative")
         for name, value in (
             ("adapter_checkpoint_every", self.adapter_checkpoint_every),
             ("rollout_shard_every", self.rollout_shard_every),
@@ -324,6 +327,8 @@ class TrainRunConfig:
                 raise ValueError(
                     "direct JS judge objectives require reliability-weighted soft_judge rewards"
                 )
+            if self.train_optimizer_batch_size % 2 != 0:
+                raise ValueError("direct JS judge objectives require an even train_optimizer_batch_size")
             if self.train_minibatch_size > 0 and self.train_minibatch_size % 2 != 0:
                 raise ValueError(
                     "direct JS judge objectives require train_minibatch_size=0 or an even value"
@@ -643,6 +648,7 @@ class TrainRunConfig:
                 data["rollout_assistant_prefill"] if "rollout_assistant_prefill" in data else ""
             ),
             train_minibatch_size=data.get("train_minibatch_size", 0),
+            train_optimizer_batch_size=data.get("train_optimizer_batch_size", 0),
             train_max_tokens=data.get("train_max_tokens", 0),
             train_length_bucket_batches=data.get("train_length_bucket_batches", False),
             train_logprob_backend=data.get("train_logprob_backend", "full_logits"),

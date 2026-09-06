@@ -409,6 +409,9 @@ def test_openbookqa_supervised_label_ce_js_contract_is_trainable_and_granular() 
     assert restored.judge_coherence_js_weight == 0.0
     assert restored.debate_r23_reward == "soft_judge"
     assert restored.train_adapter_names == ("debate", "judge")
+    assert replace(ce_only, train_optimizer_batch_size=32).train_optimizer_batch_size == 32
+    with pytest.raises(ValueError, match="even"):
+        replace(ce_only, train_optimizer_batch_size=3)
     with pytest.raises(ValueError, match="even"):
         replace(ce_only, train_minibatch_size=3)
 
@@ -703,3 +706,17 @@ def test_cli_parses_same_engine_base_sft_judge_contract() -> None:
     assert args.debate_judge_top_k == 20
     assert args.debate_judge_presence_penalty == 1.5
     assert args.debate_judge_seed == 0
+
+
+def test_optimizer_batch_size_cli_and_legacy_config_roundtrip():
+    args = parse_args(["--model-path", "/model", "--output-dir", "/out",
+                       "--train-optimizer-batch-size", "32", "--train-minibatch-size", "8"])
+    config = TrainRunConfig(model_path=args.model_path, output_dir=args.output_dir,
+                            train_optimizer_batch_size=args.train_optimizer_batch_size,
+                            train_minibatch_size=args.train_minibatch_size)
+    assert TrainRunConfig.from_dict(config.to_dict()) == config
+    legacy = config.to_dict()
+    del legacy["train_optimizer_batch_size"]
+    assert TrainRunConfig.from_dict(legacy).train_optimizer_batch_size == 0
+    with pytest.raises(ValueError, match="non-negative"):
+        replace(config, train_optimizer_batch_size=-1)

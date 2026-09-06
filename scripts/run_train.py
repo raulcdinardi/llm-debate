@@ -268,6 +268,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--train-minibatch-size", type=int, default=0)
+    parser.add_argument(
+        "--train-optimizer-batch-size", type=int, default=0,
+        help="Examples per optimizer update per adapter; 0 uses the full rollout batch. "
+        "One pass, fixed rollout logprobs/advantages; physical minibatches accumulate within each update.",
+    )
     parser.add_argument("--train-max-tokens", type=int, default=0)
     parser.add_argument("--train-length-bucket-batches", action="store_true")
     parser.add_argument(
@@ -489,6 +494,7 @@ def main() -> int:
                 rollout_grad_accum_steps=args.rollout_grad_accum_steps,
                 rollout_assistant_prefill=args.rollout_assistant_prefill,
                 train_minibatch_size=args.train_minibatch_size,
+                train_optimizer_batch_size=args.train_optimizer_batch_size,
                 train_max_tokens=args.train_max_tokens,
                 train_length_bucket_batches=args.train_length_bucket_batches,
                 train_logprob_backend=args.train_logprob_backend,

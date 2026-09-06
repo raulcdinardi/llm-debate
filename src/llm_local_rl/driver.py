@@ -505,6 +505,7 @@ class TrainingDriver:
             device=device,
             ppo_clip_epsilon=self.config.ppo_clip_epsilon,
             train_minibatch_size=self.config.train_minibatch_size,
+            train_optimizer_batch_size=self.config.train_optimizer_batch_size,
             train_max_tokens=self.config.train_max_tokens,
             train_length_bucket_batches=self.config.train_length_bucket_batches,
             train_logprob_backend=self.config.train_logprob_backend,

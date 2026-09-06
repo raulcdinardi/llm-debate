@@ -136,3 +136,16 @@ def test_wandb_initialization_failure_is_local_and_fail_open(tmp_path: Path, mon
     failures = [json.loads(line) for line in (tmp_path / "observability" / "wandb_failures.jsonl").read_text().splitlines()]
     assert failures[0]["operation"] == "init"
     assert failures[0]["error_type"] == "RuntimeError"
+
+
+def test_optimizer_batch_size_preserves_legacy_checkpoint_fingerprint():
+    import hashlib
+    import json
+    from llm_local_rl.checkpointing import config_fingerprint
+
+    legacy = {"model_path": "/model", "learning_rate": 0.001}
+    original_hash = hashlib.sha256(json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert config_fingerprint({**legacy, "train_optimizer_batch_size": 0}) == original_hash
+    assert config_fingerprint({**legacy, "train_optimizer_batch_size": 32}) != original_hash
+    assert config_fingerprint({**legacy, "train_optimizer_batch_size": 32}) != config_fingerprint(
+        {**legacy, "train_optimizer_batch_size": 64})
