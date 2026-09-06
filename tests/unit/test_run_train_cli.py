@@ -403,6 +403,15 @@ def test_openbookqa_supervised_label_ce_js_contract_is_trainable_and_granular() 
     assert config.judge_training_objective == "supervised_label_ce_js"
     assert config.judge_coherence_js_weight == pytest.approx(0.75)
 
+    ce_only = replace(config, judge_coherence_js_weight=0.0, train_minibatch_size=32)
+    restored = TrainRunConfig.from_dict(ce_only.to_dict())
+    assert restored == ce_only
+    assert restored.judge_coherence_js_weight == 0.0
+    assert restored.debate_r23_reward == "soft_judge"
+    assert restored.train_adapter_names == ("debate", "judge")
+    with pytest.raises(ValueError, match="even"):
+        replace(ce_only, train_minibatch_size=3)
+
     with pytest.raises(ValueError, match="order_sym_soft_logit"):
         replace(
             config,
