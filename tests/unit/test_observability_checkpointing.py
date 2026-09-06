@@ -149,3 +149,11 @@ def test_optimizer_batch_size_preserves_legacy_checkpoint_fingerprint():
     assert config_fingerprint({**legacy, "train_optimizer_batch_size": 32}) != original_hash
     assert config_fingerprint({**legacy, "train_optimizer_batch_size": 32}) != config_fingerprint(
         {**legacy, "train_optimizer_batch_size": 64})
+
+
+def test_prefix_cache_default_preserves_checkpoint_fingerprint():
+    from llm_local_rl.checkpointing import config_fingerprint
+    legacy = {"model_path": "/model"}
+    assert config_fingerprint(legacy) == config_fingerprint({**legacy, "sampler_prefix_caching": None})
+    for enabled in [False, True]:
+        assert config_fingerprint(legacy) != config_fingerprint({**legacy, "sampler_prefix_caching": enabled})

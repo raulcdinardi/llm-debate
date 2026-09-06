@@ -164,3 +164,41 @@ deterministically seeded group-local RNG. Register the policy before constructin
 or restoring `TrainRunConfig`; persist only its JSON parameters in
 `debate_depth_policy_params`. The policy name and parameters are stored in the run
 manifest, while the implementation is pinned by the run's source revision.
+
+## Reusing the R2 prefix in R3
+
+For the vLLM sampler, opt in with `--sampler-prefix-caching`. This passes
+`enable_prefix_caching=True` and `mamba_cache_mode="align"` to the engine and
+checks that both settings took effect. LFM2.5 needs aligned hybrid-state caching;
+its vLLM 0.26 implementation rejects the `all` mode.
+
+R3 already extends the exact R2 prompt and generated token IDs, using the same
+version of the debate LoRA. Prefix caching can reuse matching resident blocks.
+It is an engine-wide setting: other same-adapter matching prefixes can also hit.
+It does not guarantee reuse of the entire prefix, prevent eviction, or reuse
+state across different LoRA identities. The existing adapter identity changes
+when training saves a new version, preventing reuse of stale policy state.
+Prompts, token counts, rewards and optimizer behavior stay unchanged. Floating
+point differences between cached and uncached execution still require validation.
+
+Omitting the flag preserves the previous engine defaults. Explicit
+`--no-sampler-prefix-caching` disables it. Both flags are vLLM-only; specifying
+one for another backend fails configuration validation. Existing exact-resume
+fingerprints remain compatible when the flag is omitted.
+
+The GPU regression requires vLLM 0.26, a compatible GPU and local model/LoRA
+artifacts. Set `LLM_LOCAL_RL_BASE_MODEL`, `LLM_LOCAL_RL_ADAPTER_A` (debate), and
+`LLM_LOCAL_RL_ADAPTER_B` (a different compatible LoRA), then run:
+
+```bash
+PYTHONPATH=src python -m pytest -s tests/integration/test_vllm_prefix_cache.py
+```
+
+It checks actual R3 cache hits, cached versus cold greedy token equality and
+logprobs (absolute tolerance 0.01), plus zero cache hits across different and
+refreshed LoRA identities. This is a correctness/cache-hit gate, not a throughput
+benchmark. Run it on the intended GPU environment before enabling experimental
+training. CPU configuration tests do not establish real cache hits or speedup.
+
+Backend references: [LFM2 aligned-cache support](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/model_executor/models/lfm2.py#L424),
+[vLLM hybrid cache defaults](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/engine/arg_utils.py#L2391).
