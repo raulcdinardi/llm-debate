@@ -1162,3 +1162,113 @@ def test_selective_lm_head_compute_logprobs_matches_full_logits_on_all_completio
                 assert selective_logprob == pytest.approx(full_logprob, abs=1e-5)
             else:
                 assert selective_logprob == 0.0
+
+
+def _ce_only_pair_rows():
+    rows = []
+    for pair, targets, lengths in [('p0', (0, 1), (1, 5)), ('p1', (0, 0), (4, 2)), ('p2', (1, 1), (3, 1))]:
+        for member, target, length in zip(('forward', 'reverse'), targets, lengths, strict=True):
+            rows.append(TrainExample(
+                adapter_name='judge', input_ids=[0] * length,
+                target_ids=[target] * length, loss_mask=[0] * (length - 1) + [1],
+                behavior_logprob_mask=[0] * length, old_logprobs=[0.] * length,
+                advantages=[0.] * length,
+                metadata={'training_objective': 'supervised_label_ce_js',
+                          'behavior_policy_allowed_token_ids': [0, 1],
+                          'judge_coherence_pair_id': pair,
+                          'judge_coherence_pair_member': member},
+            ))
+    return rows
+
+
+@pytest.mark.parametrize('minibatch_size', [0, 2, 4])
+@pytest.mark.parametrize('bucket', [False, True])
+@pytest.mark.parametrize('seed', [0, 17])
+def test_ce_only_keeps_pairs_in_physical_batches_and_accumulates_exact_ce_gradient(
+    monkeypatch, minibatch_size, bucket, seed,
+):
+    import random
+    import llm_local_rl.trainer as trainer_module
+    rows = _ce_only_pair_rows()
+    random.Random(seed).shuffle(rows)
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_minibatch_size=minibatch_size,
+                             train_length_bucket_batches=bucket)
+    with torch.no_grad():
+        trainer.model.bias.fill_(1.)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=.1)
+    physical_batches = []
+    pad_batch = trainer_module._pad_batch
+    def capture_batch(**kwargs):
+        physical_batches.append([(row.metadata['judge_coherence_pair_id'],
+                                  row.metadata['judge_coherence_pair_member']) for row in kwargs['batch']])
+        return pad_batch(**kwargs)
+    monkeypatch.setattr(trainer_module, '_pad_batch', capture_batch)
+    gradients = []
+    step = trainer.optimizer.step
+    def capture_step(*args, **kwargs):
+        gradients.append(trainer.model.bias.grad.item())
+        return step(*args, **kwargs)
+    monkeypatch.setattr(trainer.optimizer, 'step', capture_step)
+    metrics = trainer.train_batch(adapter_name='judge', batch=rows,
+                                  objective='supervised_label_ce_js', judge_coherence_js_weight=0.)
+    expected_batches = 1 if minibatch_size == 0 else math.ceil(6 / minibatch_size)
+    assert len(physical_batches) == expected_batches
+    for batch in physical_batches:
+        assert len(batch) % 2 == 0
+        for forward, reverse in zip(batch[::2], batch[1::2], strict=True):
+            assert forward[0] == reverse[0]
+            assert (forward[1], reverse[1]) == ('forward', 'reverse')
+    assert sorted(pair for batch in physical_batches for pair, member in batch if member == 'forward') == ['p0', 'p1', 'p2']
+    expected_gradient = torch.sigmoid(torch.tensor(1.)).item() - .5
+    assert gradients == pytest.approx([expected_gradient], abs=1e-6)
+    assert trainer.model.bias.item() == pytest.approx(1. - .1 * expected_gradient, abs=1e-6)
+    assert metrics['loss'] == pytest.approx(math.log1p(math.exp(1.)) - .5, abs=1e-6)
+    assert metrics['judge_coherence_js'] > 0.0  # Nonzero diagnostic contributes no gradient.
+    assert metrics['judge_coherence_pair_count'] == 3
+
+
+@pytest.mark.parametrize('invalid', ['missing_member', 'duplicate_member', 'overlength', 'odd_minibatch'])
+def test_ce_only_rejects_pair_breaking_batches_before_optimizer_step(monkeypatch, invalid):
+    rows = _ce_only_pair_rows()
+    trainer = _fake_trainer()
+    if invalid == 'missing_member':
+        rows.pop()
+    elif invalid == 'duplicate_member':
+        rows.append(rows[0])
+    elif invalid == 'overlength':
+        trainer.config = replace(trainer.config, train_max_tokens=4)
+    else:
+        trainer.config = replace(trainer.config, train_minibatch_size=3)
+    steps = []
+    monkeypatch.setattr(trainer.optimizer, 'step', lambda: steps.append(True))
+    with pytest.raises(ValueError):
+        trainer.train_batch(adapter_name='judge', batch=rows,
+                            objective='supervised_label_ce_js', judge_coherence_js_weight=0.)
+    assert steps == []
+
+
+@pytest.mark.parametrize('backend', ['full_logits', 'selective_lm_head'])
+def test_ce_only_accumulated_update_matches_independent_ce_on_both_backends(backend):
+    with torch.random.fork_rng():
+        torch.manual_seed(7)
+        trainer = _tiny_causal_trainer(backend=backend, learning_rate=.1)
+    trainer.config = replace(trainer.config, train_minibatch_size=4,
+                             train_length_bucket_batches=True, max_grad_norm=0.,
+                             behavior_policy=BehaviorPolicySpec(temperature=1.0))
+    rows = _ce_only_pair_rows()[::-1]
+    initial = {name: value.detach().clone() for name, value in trainer.model.named_parameters()}
+    losses = []
+    for row in rows:
+        inputs = torch.tensor([row.input_ids])
+        logits = trainer.model(input_ids=inputs, attention_mask=torch.ones_like(inputs)).logits
+        losses.append(torch.nn.functional.cross_entropy(logits[:, -1, :2], torch.tensor([row.target_ids[-1]])))
+    independent_ce = torch.stack(losses).mean()
+    independent_ce.backward()
+    expected = {name: initial[name] - .1 * value.grad for name, value in trainer.model.named_parameters()}
+    metrics = trainer.train_batch(adapter_name='judge', batch=rows,
+                                  objective='supervised_label_ce_js', judge_coherence_js_weight=0.)
+    assert metrics['loss'] == pytest.approx(independent_ce.item(), abs=1e-6)
+    assert metrics['num_train_minibatches'] == 2
+    for name, value in trainer.model.named_parameters():
+        torch.testing.assert_close(value, expected[name], atol=1e-6, rtol=1e-5)

@@ -122,3 +122,34 @@ The R1 task-gap projection uses the same coefficient. JS is therefore neither
 mixed into sampled-action rewards nor duplicated as an unrelated diagnostic:
 it has exactly two explicit roles—judge coherence loss and debate-reward
 reliability.
+
+## CE-only judge training with paired orderings
+
+For an otherwise valid labeled direct-judge configuration, use:
+
+```text
+--train-judge
+--judge-training-objective supervised_label_ce_js
+--judge-coherence-js-weight 0
+--train-minibatch-size 32
+```
+
+The historical objective name is retained for configuration compatibility.
+With weight zero the judge loss is the mean gold-label cross entropy over all
+forward/reverse rows in the optimizer batch. JS remains a reported diagnostic;
+it contributes no loss or gradient. This does not change the detached
+reliability weighting of debate rewards, the dataset, initialization or batch
+geometry. Existing CE+JS and unsupervised-JS defaults are unchanged.
+
+Each physical judge minibatch contains complete forward/reverse pairs. Rows
+may arrive shuffled: the trainer groups by pair ID and restores forward/reverse
+adjacency. Optional length bucketing sorts whole pairs by their maximum length.
+Choose an even physical minibatch size; `0` uses the full optimizer batch. A
+short tail contains whole pairs. All physical minibatches accumulate into one
+optimizer step, with CE normalized by the full row count rather than by the
+tail size. Missing or duplicated members, an odd minibatch size, and overlength
+row dropping fail instead of silently training on a broken pair.
+
+CPU regressions exercise shuffled input, length bucketing, full/pair/tail
+minibatches and compare the accumulated gradient and parameter update against
+an independent analytic CE calculation with nonzero JS diagnostics.

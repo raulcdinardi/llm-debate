@@ -214,7 +214,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1.0,
         help=(
             "Coefficient lambda_js on normalized referent-aligned JS. The labeled objective "
-            "adds label CE; unsupervised_js uses only this weighted JS term."
+            "adds label CE; set this to 0 for CE-only with forward/reverse pairs kept "
+            "together in physical minibatches. unsupervised_js uses only this weighted JS term."
         ),
     )
     parser.add_argument(

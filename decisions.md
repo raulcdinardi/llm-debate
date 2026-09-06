@@ -14,3 +14,5 @@
 2026-02-03T01:31:21-03:00 | SID-20260202-2041 | local single_turn replay dry-run: qa test replay from logs/20260126_181535_n4_g2_single_turn_qa_test_api_canary; training_data 4; group z-score path exercised
 
 - 2026-09-05 | session main-consolidation-20260905 | User requests consolidation without breaking workflows. Isolated clone; preserve every legacy implementation/script/prompt file by hash, import local RL through 10ede7c with its own prompt root, merge frozen f7b7975 JS/prompt-GRPO lineage, explicit historical profiles, full CPU test discovery, preserved research recipes. No existing worktree, environment, job or artifact changed; no branch deletion. Details: docs/migration/README.md.
+
+- 2026-09-06 | session ce-only-paired-batching-20260906 | Raul scopes the next main update to CE-only paired-order batching. Existing supervised_label_ce_js with weight0 already preserves physical forward/reverse pairs; document it and regression-test shuffle, length bucketing, tail batches, gradient accumulation, invalid pair rejection and both logprob backends. No new objective/default, binary reward, benchmark launcher or experiment handoff changes.
