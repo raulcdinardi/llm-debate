@@ -142,6 +142,7 @@ class TrainRunConfig:
     on_policy_logprob_max_records_per_batch: int = 8
     sampler_gpu_memory_utilization: float = 0.55
     sampler_max_model_len: int = 512
+    sampler_prefix_caching: bool | None = None
     sampler_max_num_seqs: int = 0
     sampler_enforce_eager: bool = True
     sampler_max_lora_rank: int = 32
@@ -211,6 +212,8 @@ class TrainRunConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.sampler_prefix_caching is not None and self.sampler_backend != "vllm":
+            raise ValueError("sampler_prefix_caching is only supported by the vllm sampler")
         if self.train_optimizer_batch_size < 0:
             raise ValueError("train_optimizer_batch_size must be non-negative")
         for name, value in (
@@ -665,6 +668,7 @@ class TrainRunConfig:
             sampler_gpu_memory_utilization=data.get("sampler_gpu_memory_utilization", 0.55),
             sampler_max_model_len=data.get("sampler_max_model_len", 512),
             sampler_max_num_seqs=data.get("sampler_max_num_seqs", 0),
+            sampler_prefix_caching=data.get("sampler_prefix_caching", None),
             sampler_enforce_eager=data.get("sampler_enforce_eager", True),
             sampler_max_lora_rank=data.get("sampler_max_lora_rank", 32),
             sampler_max_loras=data.get("sampler_max_loras", 4),

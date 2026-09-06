@@ -594,6 +594,7 @@ class TrainingDriver:
                     gpu_memory_utilization=self.config.sampler_gpu_memory_utilization,
                     max_model_len=self.config.sampler_max_model_len,
                     max_num_seqs=None if self.config.sampler_max_num_seqs <= 0 else self.config.sampler_max_num_seqs,
+                    enable_prefix_caching=self.config.sampler_prefix_caching,
                     enforce_eager=self.config.sampler_enforce_eager,
                     enable_sleep_mode=self._should_sleep_sampler_before_training(),
                     max_lora_rank=self.config.sampler_max_lora_rank,

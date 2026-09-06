@@ -137,6 +137,7 @@ class VllmRuntimeConfig:
     max_num_seqs: int | None = None
     enforce_eager: bool = True
     enable_sleep_mode: bool = False
+    enable_prefix_caching: bool | None = None
     max_lora_rank: int = 32
     max_loras: int = 4
     logprobs_mode: str = "processed_logprobs"
@@ -343,6 +344,11 @@ class VllmSampler:
             "max_model_len": runtime.max_model_len,
             "enforce_eager": runtime.enforce_eager,
         }
+        if runtime.enable_prefix_caching is not None:
+            llm_kwargs["enable_prefix_caching"] = runtime.enable_prefix_caching
+            if runtime.enable_prefix_caching:
+                # LFM2 hybrid state supports align caching, not all-block snapshots.
+                llm_kwargs["mamba_cache_mode"] = "align"
         if runtime.max_num_seqs is not None:
             llm_kwargs["max_num_seqs"] = runtime.max_num_seqs
         if runtime.enable_sleep_mode:
@@ -356,6 +362,12 @@ class VllmSampler:
                 )
             llm_kwargs["logprobs_mode"] = runtime.logprobs_mode
         self._llm = LLM(**llm_kwargs)
+        if runtime.enable_prefix_caching is not None:
+            cache_config = self._llm.llm_engine.vllm_config.cache_config
+            if cache_config.enable_prefix_caching != runtime.enable_prefix_caching:
+                raise RuntimeError("vLLM did not honor the requested prefix-caching setting")
+            if runtime.enable_prefix_caching and cache_config.mamba_cache_mode != "align":
+                raise RuntimeError("vLLM did not honor hybrid align cache mode")
         self._engine_logprobs_mode: str | None = None
         if engine_supports_logprobs_mode:
             observed = _effective_engine_logprobs_mode(self._llm)

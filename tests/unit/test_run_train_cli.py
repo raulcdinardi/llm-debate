@@ -720,3 +720,19 @@ def test_optimizer_batch_size_cli_and_legacy_config_roundtrip():
     assert TrainRunConfig.from_dict(legacy).train_optimizer_batch_size == 0
     with pytest.raises(ValueError, match="non-negative"):
         replace(config, train_optimizer_batch_size=-1)
+
+
+@pytest.mark.parametrize("flags,expected", [([], None), (["--sampler-prefix-caching"], True),
+                                         (["--no-sampler-prefix-caching"], False)])
+def test_sampler_prefix_cache_cli_and_config(flags, expected):
+    args = parse_args(["--model-path", "/model", "--output-dir", "/out", *flags])
+    assert args.sampler_prefix_caching is expected
+    config = TrainRunConfig(model_path="/model", output_dir="/out",
+                            sampler_prefix_caching=args.sampler_prefix_caching)
+    assert TrainRunConfig.from_dict(config.to_dict()) == config
+    legacy = config.to_dict()
+    del legacy["sampler_prefix_caching"]
+    assert TrainRunConfig.from_dict(legacy).sampler_prefix_caching is None
+    if expected is not None:
+        with pytest.raises(ValueError, match="only supported"):
+            replace(config, sampler_backend="sglang")

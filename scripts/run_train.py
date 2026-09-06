@@ -314,6 +314,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sampler-gpu-memory-utilization", type=float, default=0.55)
     parser.add_argument("--sampler-max-model-len", type=int, default=512)
     parser.add_argument("--sampler-max-num-seqs", type=int, default=0)
+    parser.add_argument(
+        "--sampler-prefix-caching", action=argparse.BooleanOptionalAction, default=None,
+        help="Opt into vLLM prefix reuse (including same-LoRA R2 to R3), using hybrid align mode. "
+        "Omit to preserve engine defaults. Applies to all matching same-adapter prefixes.",
+    )
     parser.add_argument("--sampler-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--sampler-teardown-before-training",
@@ -511,6 +516,7 @@ def main() -> int:
                 sampler_gpu_memory_utilization=args.sampler_gpu_memory_utilization,
                 sampler_max_model_len=args.sampler_max_model_len,
                 sampler_max_num_seqs=args.sampler_max_num_seqs,
+                sampler_prefix_caching=args.sampler_prefix_caching,
                 sampler_enforce_eager=args.sampler_enforce_eager,
                 sampler_teardown_before_training=args.sampler_teardown_before_training,
                 sampler_sleep_before_training=args.sampler_sleep_before_training,

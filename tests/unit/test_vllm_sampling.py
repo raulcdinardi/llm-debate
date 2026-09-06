@@ -377,3 +377,39 @@ def test_unload_adapters_fails_closed_when_vllm_cannot_verify_eviction() -> None
 
     with pytest.raises(RuntimeError, match="refused to unload"):
         sampler.unload_adapters(adapter_names={"solution"})
+
+
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_prefix_cache_opt_in_preserves_engine_default_and_selects_align(monkeypatch, enabled):
+    calls = []
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            self.llm_engine = SimpleNamespace(vllm_config=SimpleNamespace(cache_config=SimpleNamespace(
+                enable_prefix_caching=enabled, mamba_cache_mode="align")))
+    monkeypatch.setattr(vllm_sampling, "_import_vllm_symbols", lambda: (FakeLLM, None, None))
+    monkeypatch.setattr(vllm_sampling, "_engine_accepts_logprobs_mode", lambda: False)
+    vllm_sampling.VllmSampler(runtime=vllm_sampling.VllmRuntimeConfig(
+        model_path="/model", enable_prefix_caching=enabled))
+    if enabled is None:
+        assert "enable_prefix_caching" not in calls[0]
+        assert "mamba_cache_mode" not in calls[0]
+    else:
+        assert calls[0]["enable_prefix_caching"] is enabled
+        if enabled:
+            assert calls[0]["mamba_cache_mode"] == "align"
+        else:
+            assert "mamba_cache_mode" not in calls[0]
+
+
+@pytest.mark.parametrize("actual_enabled,actual_mode", [(False, "align"), (True, "none")])
+def test_prefix_cache_requested_settings_must_take_effect(monkeypatch, actual_enabled, actual_mode):
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            self.llm_engine = SimpleNamespace(vllm_config=SimpleNamespace(cache_config=SimpleNamespace(
+                enable_prefix_caching=actual_enabled, mamba_cache_mode=actual_mode)))
+    monkeypatch.setattr(vllm_sampling, "_import_vllm_symbols", lambda: (FakeLLM, None, None))
+    monkeypatch.setattr(vllm_sampling, "_engine_accepts_logprobs_mode", lambda: False)
+    with pytest.raises(RuntimeError, match="did not honor"):
+        vllm_sampling.VllmSampler(runtime=vllm_sampling.VllmRuntimeConfig(
+            model_path="/model", enable_prefix_caching=True))
