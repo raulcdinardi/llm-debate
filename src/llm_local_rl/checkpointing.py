@@ -21,6 +21,10 @@ def _sha256(path: Path) -> str:
 
 
 def config_fingerprint(config: dict[str, Any]) -> str:
+    # The new default is identical to historical single-update checkpoints.
+    config = dict(config)
+    if config.get("train_optimizer_batch_size") == 0:
+        del config["train_optimizer_batch_size"]
     payload = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
 

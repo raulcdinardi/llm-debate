@@ -1272,3 +1272,131 @@ def test_ce_only_accumulated_update_matches_independent_ce_on_both_backends(back
     assert metrics['num_train_minibatches'] == 2
     for name, value in trainer.model.named_parameters():
         torch.testing.assert_close(value, expected[name], atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("physical_size", [0, 1, 2, 4])
+def test_optimizer_batches_match_sequential_ppo_updates_with_frozen_rollout(physical_size):
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_optimizer_batch_size=3,
+                             train_minibatch_size=physical_size, max_grad_norm=0.0)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.7)
+    # Deliberately large updates activate clipping against the ORIGINAL rollout policy.
+    advantages = [1.0, 0.5, -0.2, 1.0, 0.3, -0.4, -1.0]
+    batch = [TrainExample("shared", [0], [0], [1], [1], [-math.log(2)], [a])
+             for a in advantages]
+    expected = torch.tensor(0.0, requires_grad=True)
+    reference_optimizer = torch.optim.SGD([expected], lr=0.7)
+    observed_losses = []
+    for start in range(0, len(batch), 3):
+        adv = torch.tensor(advantages[start:start + 3])
+        ratio = 2 * torch.sigmoid(expected)
+        clipped = ratio.clamp(1 - trainer.config.ppo_clip_epsilon,
+                              1 + trainer.config.ppo_clip_epsilon)
+        loss = -torch.minimum(ratio * adv, clipped * adv).mean()
+        observed_losses.append(loss.item() * len(adv) / len(batch))
+        loss.backward()
+        reference_optimizer.step()
+        reference_optimizer.zero_grad()
+    metrics = trainer.train_batch(adapter_name="shared", batch=batch)
+    assert trainer.model.bias.item() == pytest.approx(expected.item(), abs=1e-7)
+    assert metrics["loss"] == pytest.approx(sum(observed_losses), abs=1e-7)
+    assert metrics["num_optimizer_steps"] == 3
+    assert metrics["completion_tokens_checked"] == len(batch)
+    assert metrics["on_policy_logprob_violations"] == 0
+    assert metrics["ratio_max"] > 1.01
+    assert all(row.old_logprobs == [-math.log(2)] for row in batch)
+    assert [row.advantages[0] for row in batch] == advantages
+
+
+@pytest.mark.parametrize("bad_advantage", [0.0, 1.0])
+def test_optimizer_batches_check_last_rollout_row_before_first_update(bad_advantage):
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_optimizer_batch_size=1)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    batch = [TrainExample("shared", [0], [0], [1], [1], [-math.log(2)], [1.0]),
+             TrainExample("shared", [0], [0], [1], [1], [-10.0], [bad_advantage])]
+    with pytest.raises(BehaviorPolicyLogprobMismatchError):
+        trainer.train_batch(adapter_name="shared", batch=batch)
+    assert trainer.model.bias.item() == 0.0
+    assert trainer.model.bias.grad is None
+
+
+@pytest.mark.parametrize("physical_size", [0, 2, 4])
+@pytest.mark.parametrize("bucket", [False, True])
+def test_optimizer_batches_ce_preserve_pairs_and_match_individual_updates(physical_size, bucket):
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_optimizer_batch_size=4,
+                             train_minibatch_size=physical_size,
+                             train_length_bucket_batches=bucket)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    baseline = _fake_trainer()
+    baseline.optimizer = torch.optim.SGD(baseline.model.parameters(), lr=0.1)
+    batch = _ce_only_pair_rows()
+    ordered = _order_paired_js_batch_for_minibatching(
+        batch=batch, max_tokens=0,
+        length_bucket_batches=bucket and 0 < physical_size < len(batch))
+    for start in range(0, len(ordered), 4):
+        baseline.train_batch(adapter_name="judge", batch=ordered[start:start + 4],
+                             objective="supervised_label_ce_js", judge_coherence_js_weight=0)
+    metrics = trainer.train_batch(adapter_name="judge", batch=batch,
+                                  objective="supervised_label_ce_js", judge_coherence_js_weight=0)
+    assert metrics["num_optimizer_steps"] == 2
+    assert metrics["judge_coherence_pair_count"] == 3
+    assert trainer.model.bias.item() == pytest.approx(baseline.model.bias.item(), abs=1e-7)
+
+
+def test_optimizer_batches_skip_zero_advantage_updates():
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_optimizer_batch_size=1)
+    trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=0.1, weight_decay=0.1)
+    batch = [TrainExample("shared", [0], [0], [1], [1], [-math.log(2)], [a])
+             for a in [0.0, 1.0, 0.0]]
+    metrics = trainer.train_batch(adapter_name="shared", batch=batch)
+    assert metrics["num_optimizer_steps"] == 1
+    assert trainer.optimizer.state[trainer.model.bias]["step"] == 1
+    assert metrics["completion_tokens_checked"] == 3
+
+
+@pytest.mark.parametrize("size", [0, 7, 100])
+def test_single_optimizer_batch_preserves_update_without_extra_forward(size):
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_optimizer_batch_size=size, train_minibatch_size=2)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    trainer.compute_logprobs = lambda **kwargs: pytest.fail("single update must not preflight")
+    batch = [TrainExample("shared", [0], [0], [1], [1], [-math.log(2)], [1.0]) for _ in range(7)]
+    metrics = trainer.train_batch(adapter_name="shared", batch=batch)
+    assert trainer.model.bias.item() == pytest.approx(0.05)
+    assert metrics["num_optimizer_steps"] == 1
+    assert metrics["num_train_minibatches"] == 4
+
+
+@pytest.mark.parametrize("backend", ["full_logits", "selective_lm_head"])
+def test_optimizer_batches_both_backends_match_independent_updates(backend):
+    trainer = _tiny_causal_trainer(backend=backend, learning_rate=0.1)
+    trainer.config = replace(trainer.config, train_optimizer_batch_size=2, max_grad_norm=0.1)
+    batch = [TrainExample("shared", [i], [i + 1], [1], [1], [0.0], [a])
+             for i, a in enumerate([1.0, -0.3, 0.5, -0.7, 0.4])]
+    old = trainer.compute_logprobs(adapter_name="shared", batch=batch)
+    batch = [replace(row, old_logprobs=lp) for row, lp in zip(batch, old, strict=True)]
+    import copy
+    expected = copy.deepcopy(trainer.model)
+    optimizer = torch.optim.SGD(expected.parameters(), lr=0.1)
+    for start in range(0, len(batch), 2):
+        rows = batch[start:start + 2]
+        ids = torch.tensor([row.input_ids for row in rows])
+        logits = expected(input_ids=ids, attention_mask=torch.ones_like(ids)).logits / 0.8
+        logp = logits.log_softmax(-1).gather(-1, torch.tensor([[row.target_ids] for row in rows])).squeeze(-1)
+        ratios = (logp - torch.tensor([row.old_logprobs for row in rows])).exp()
+        advantages = torch.tensor([row.advantages for row in rows])
+        epsilon = trainer.config.ppo_clip_epsilon
+        loss = -torch.minimum(ratios * advantages, ratios.clamp(1-epsilon, 1+epsilon) * advantages).sum() / len(rows)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(expected.parameters(), 0.1)
+        optimizer.step()
+        optimizer.zero_grad()
+    metrics = trainer.train_batch(adapter_name="shared", batch=batch)
+    assert metrics["num_optimizer_steps"] == 3
+    assert metrics["num_preflight_minibatches"] == 5
+    assert metrics["on_policy_logprob_violations"] == 0
+    for actual, wanted in zip(trainer.model.parameters(), expected.parameters(), strict=True):
+        torch.testing.assert_close(actual, wanted, rtol=1e-5, atol=1e-7)

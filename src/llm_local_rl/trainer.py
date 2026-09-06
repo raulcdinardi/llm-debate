@@ -62,6 +62,7 @@ class TrainerConfig:
     target_parameters: tuple[str, ...] = ()
     ppo_clip_epsilon: float = 0.2
     train_minibatch_size: int = 0
+    train_optimizer_batch_size: int = 0
     train_max_tokens: int = 0
     train_length_bucket_batches: bool = False
     train_logprob_backend: str = TRAIN_LOGPROB_BACKEND_FULL_LOGITS
@@ -75,6 +76,8 @@ class TrainerConfig:
     behavior_policy: BehaviorPolicySpec = field(default_factory=BehaviorPolicySpec)
 
     def __post_init__(self) -> None:
+        if self.train_optimizer_batch_size < 0:
+            raise ValueError("train_optimizer_batch_size must be non-negative")
         if self.train_logprob_backend not in TRAIN_LOGPROB_BACKENDS:
             raise ValueError(
                 f"Unsupported train_logprob_backend={self.train_logprob_backend!r}; "
@@ -1061,6 +1064,8 @@ class MultiAdapterTrainer:
                 "num_input_examples": 0.0,
                 "num_dropped_overlength": 0.0,
                 "num_trained_tokens": 0.0,
+                "num_optimizer_steps": 0.0,
+                "num_preflight_minibatches": 0.0,
                 "training_objective": objective,
                 "judge_coherence_js_weight": float(judge_coherence_js_weight),
                 "train_logprob_backend": self.config.train_logprob_backend,
@@ -1123,8 +1128,87 @@ class MultiAdapterTrainer:
                 max_tokens=self.config.train_max_tokens,
                 length_bucket_batches=self.config.train_length_bucket_batches and minibatch_size < len(trainable_batch),
             )
-        normalization_sample_count = len(ordered_batch)
-        normalization_pair_count = len(ordered_batch) // 2 if direct_js_objective else 0
+        optimizer_batch_size = self.config.train_optimizer_batch_size or len(ordered_batch)
+        if direct_js_objective and optimizer_batch_size % 2:
+            raise ValueError("direct JS objectives require an even train_optimizer_batch_size")
+        # Physical chunks never straddle an optimizer boundary, including short tails.
+        chunks = []
+        for optimizer_start in range(0, len(ordered_batch), optimizer_batch_size):
+            optimizer_end = min(optimizer_start + optimizer_batch_size, len(ordered_batch))
+            for start in range(optimizer_start, optimizer_end, minibatch_size):
+                chunks.append((start, min(start + minibatch_size, optimizer_end),
+                               optimizer_start, optimizer_end - optimizer_start))
+
+        def check_minibatch(minibatch, current_logprob_rows, start_idx):
+            check_result = check_on_policy_logprobs(
+                adapter_name=adapter_name,
+                examples=minibatch,
+                current_logprob_rows=current_logprob_rows,
+                tokenizer=self.tokenizer,
+                abs_tol=self.config.on_policy_logprob_abs_tol,
+                max_tokens=self.config.train_max_tokens,
+                max_records=self.config.on_policy_logprob_max_records_per_batch,
+                minibatch_start=start_idx,
+            )
+            if check_result.records:
+                self._write_on_policy_logprob_records(records=check_result.records)
+            if check_result.num_violations > 0:
+                event = {
+                    "event": "behavior_policy_logprob_contract_violation",
+                    "adapter_name": adapter_name,
+                    "minibatch_start": start_idx,
+                    "completion_tokens_checked": check_result.num_checked_tokens,
+                    "trained_tokens_checked": check_result.num_trained_tokens_checked,
+                    "zero_advantage_loss_mask_tokens_checked": (
+                        check_result.num_zero_advantage_loss_mask_tokens_checked
+                    ),
+                    "injected_loss_mask_tokens_skipped": (
+                        check_result.num_injected_loss_mask_tokens_skipped
+                    ),
+                    "violations": check_result.num_violations,
+                    "trained_token_violations": check_result.num_trained_token_violations,
+                    "max_abs_diff": check_result.max_abs_logprob_diff,
+                    "trained_token_max_abs_diff": check_result.trained_token_max_abs_logprob_diff,
+                    "mean_abs_diff": (
+                        check_result.sum_abs_logprob_diff / check_result.num_checked_tokens
+                        if check_result.num_checked_tokens > 0
+                        else 0.0
+                    ),
+                    "trained_token_mean_abs_diff": (
+                        check_result.trained_token_sum_abs_logprob_diff
+                        / check_result.num_trained_tokens_checked
+                        if check_result.num_trained_tokens_checked > 0
+                        else 0.0
+                    ),
+                    "first_offending_token": check_result.first_offending_token,
+                    "first_offending_trained_token": check_result.first_offending_trained_token,
+                    "report_path": self.config.on_policy_logprob_warning_path,
+                    "behavior_policy": self.config.behavior_policy.to_dict(),
+                    "gate_mode": (
+                        "warn_only" if self.config.on_policy_logprob_warn_only else "fail_closed"
+                    ),
+                }
+                print(json.dumps(event, sort_keys=True), flush=True)
+                if not self.config.on_policy_logprob_warn_only:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    raise BehaviorPolicyLogprobMismatchError(
+                        "Behavior-policy logprob parity failed before PPO ratio/backward: "
+                        f"adapter={adapter_name!r}, minibatch_start={start_idx}, "
+                        f"violations={check_result.num_violations}/"
+                        f"{check_result.num_checked_tokens}, "
+                        f"max_abs_diff={check_result.max_abs_logprob_diff:.9g}, "
+                        f"abs_tol={self.config.on_policy_logprob_abs_tol:.9g}."
+                    )
+            return check_result
+
+        preflight_checks = {}
+        if optimizer_batch_size < len(ordered_batch) and not direct_js_objective:
+            # Check every sampled token at the rollout policy BEFORE any update.
+            # Later ratios deliberately compare the updated policy to frozen rollout logprobs.
+            for start, end, _, _ in chunks:
+                minibatch = ordered_batch[start:end]
+                rows = self.compute_logprobs(adapter_name=adapter_name, batch=minibatch)
+                preflight_checks[start] = check_minibatch(minibatch, rows, start)
         total_loss_value = 0.0
         total_trained_tokens = 0
         approx_kl_numerator = 0.0
@@ -1159,8 +1243,68 @@ class MultiAdapterTrainer:
         mem_step_idx = -1
         if self._mem_trace_active():
             mem_step_idx = self._mem_rec.next_step()
-        for start_idx in range(0, len(ordered_batch), minibatch_size):
-            minibatch = ordered_batch[start_idx : start_idx + minibatch_size]
+
+        def optimizer_step():
+            grad_params = [param for param in self.model.parameters() if param.requires_grad and param.grad is not None]
+            nonfinite_gradient_count = sum(
+                int((~torch.isfinite(param.grad)).sum().detach().cpu().item()) for param in grad_params
+            )
+            if nonfinite_gradient_count:
+                self.optimizer.zero_grad(set_to_none=True)
+                raise FloatingPointError(
+                    f"Non-finite gradients before optimizer step: {nonfinite_gradient_count}."
+                )
+            grad_max_abs = max(
+                (float(param.grad.detach().abs().max().cpu().item()) for param in grad_params),
+                default=0.0,
+            )
+            if grad_params:
+                clip_limit = self.config.max_grad_norm if self.config.max_grad_norm > 0.0 else math.inf
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(grad_params, max_norm=clip_limit).detach().cpu().item()
+                )
+            else:
+                grad_norm = 0.0
+            if self._mem_trace_active():
+                reset_peak(self.compute_device)
+            self.optimizer.step()
+            selected_layer_metrics = self._selected_layer_optimizer_metrics()
+            if self._mem_trace_active():
+                alloc_after_optim = current_alloc_bytes(self.compute_device)
+                peak_after_optim = peak_alloc_bytes(self.compute_device)
+                self._mem_rec.maybe_capture_optim_state_baseline(alloc_after_optim)
+                # Append one "optim-step summary row" tagged minibatch_idx=-1
+                # per optimizer update. Mirrors nvidia-smi peak-after-step intent and
+                # lets the plot script draw the optimizer/state baseline band.
+                self._mem_rec.append(
+                    {
+                        "step": mem_step_idx,
+                        "adapter_name": adapter_name,
+                        "minibatch_idx": -1,
+                        "seq_len_max": 0,
+                        "num_examples": 0,
+                        "num_trained_tokens": total_trained_tokens,
+                        "num_padded_positions": total_padded_input_tokens,
+                        "train_logprob_backend": self.config.train_logprob_backend,
+                        "alloc_after_optim_step": alloc_after_optim,
+                        "peak_during_optim_step": peak_after_optim,
+                        "reserved_bytes_end": reserved_bytes(self.compute_device),
+                        "wall_clock_s": 0.0,
+                    }
+                )
+
+            return grad_norm, grad_max_abs, selected_layer_metrics
+
+        optimizer_metrics = []
+        trained_tokens_at_update_start = 0
+        for start_idx, end_idx, optimizer_start, normalization_sample_count in chunks:
+            if start_idx == optimizer_start and start_idx > 0:
+                if total_trained_tokens > trained_tokens_at_update_start:
+                    optimizer_metrics.append(optimizer_step())
+                self.optimizer.zero_grad(set_to_none=True)
+                trained_tokens_at_update_start = total_trained_tokens
+            normalization_pair_count = normalization_sample_count // 2 if direct_js_objective else 0
+            minibatch = ordered_batch[start_idx:end_idx]
             if self._mem_trace_active():
                 reset_peak(self.compute_device)
                 _mem_t_start = now_seconds()
@@ -1329,15 +1473,9 @@ class MultiAdapterTrainer:
                 raise ValueError(f"Unsupported train_logprob_backend={self.config.train_logprob_backend!r}.")
 
             if self.config.on_policy_logprob_check and not direct_js_objective:
-                check_result = check_on_policy_logprobs(
-                    adapter_name=adapter_name,
-                    examples=minibatch,
-                    current_logprob_rows=current_logprob_rows,
-                    tokenizer=self.tokenizer,
-                    abs_tol=self.config.on_policy_logprob_abs_tol,
-                    max_tokens=self.config.train_max_tokens,
-                    max_records=self.config.on_policy_logprob_max_records_per_batch,
-                    minibatch_start=start_idx,
+                check_result = (
+                    preflight_checks[start_idx] if preflight_checks else
+                    check_minibatch(minibatch, current_logprob_rows, start_idx)
                 )
                 on_policy_checked_tokens += check_result.num_checked_tokens
                 on_policy_trained_tokens_checked += check_result.num_trained_tokens_checked
@@ -1356,55 +1494,6 @@ class MultiAdapterTrainer:
                     on_policy_trained_max_abs_diff,
                     check_result.trained_token_max_abs_logprob_diff,
                 )
-                if check_result.records:
-                    self._write_on_policy_logprob_records(records=check_result.records)
-                if check_result.num_violations > 0:
-                    event = {
-                        "event": "behavior_policy_logprob_contract_violation",
-                        "adapter_name": adapter_name,
-                        "minibatch_start": start_idx,
-                        "completion_tokens_checked": check_result.num_checked_tokens,
-                        "trained_tokens_checked": check_result.num_trained_tokens_checked,
-                        "zero_advantage_loss_mask_tokens_checked": (
-                            check_result.num_zero_advantage_loss_mask_tokens_checked
-                        ),
-                        "injected_loss_mask_tokens_skipped": (
-                            check_result.num_injected_loss_mask_tokens_skipped
-                        ),
-                        "violations": check_result.num_violations,
-                        "trained_token_violations": check_result.num_trained_token_violations,
-                        "max_abs_diff": check_result.max_abs_logprob_diff,
-                        "trained_token_max_abs_diff": check_result.trained_token_max_abs_logprob_diff,
-                        "mean_abs_diff": (
-                            check_result.sum_abs_logprob_diff / check_result.num_checked_tokens
-                            if check_result.num_checked_tokens > 0
-                            else 0.0
-                        ),
-                        "trained_token_mean_abs_diff": (
-                            check_result.trained_token_sum_abs_logprob_diff
-                            / check_result.num_trained_tokens_checked
-                            if check_result.num_trained_tokens_checked > 0
-                            else 0.0
-                        ),
-                        "first_offending_token": check_result.first_offending_token,
-                        "first_offending_trained_token": check_result.first_offending_trained_token,
-                        "report_path": self.config.on_policy_logprob_warning_path,
-                        "behavior_policy": self.config.behavior_policy.to_dict(),
-                        "gate_mode": (
-                            "warn_only" if self.config.on_policy_logprob_warn_only else "fail_closed"
-                        ),
-                    }
-                    print(json.dumps(event, sort_keys=True), flush=True)
-                    if not self.config.on_policy_logprob_warn_only:
-                        self.optimizer.zero_grad(set_to_none=True)
-                        raise BehaviorPolicyLogprobMismatchError(
-                            "Behavior-policy logprob parity failed before PPO ratio/backward: "
-                            f"adapter={adapter_name!r}, minibatch_start={start_idx}, "
-                            f"violations={check_result.num_violations}/"
-                            f"{check_result.num_checked_tokens}, "
-                            f"max_abs_diff={check_result.max_abs_logprob_diff:.9g}, "
-                            f"abs_tol={self.config.on_policy_logprob_abs_tol:.9g}."
-                        )
             if trained_tokens == 0:
                 continue
 
@@ -1540,7 +1629,9 @@ class MultiAdapterTrainer:
                     }
                 )
             total_trained_tokens += trained_tokens
-            total_loss_value += float(loss.detach().cpu().item())
+            total_loss_value += (
+                float(loss.detach().cpu().item()) * (normalization_sample_count / len(ordered_batch))
+            )
             if not direct_js_objective:
                 approx_kl_numerator += float(
                     torch.sum(old_logprobs - selected_logprobs)
@@ -1558,6 +1649,8 @@ class MultiAdapterTrainer:
                 "num_input_examples": float(len(batch)),
                 "num_dropped_overlength": float(num_dropped_overlength),
                 "num_trained_tokens": 0.0,
+                "num_optimizer_steps": 0.0,
+                "num_preflight_minibatches": float(len(preflight_checks)),
                 "training_objective": objective,
                 "on_policy_logprob_checked_tokens": float(on_policy_checked_tokens),
                 "completion_tokens_checked": float(on_policy_checked_tokens),
@@ -1628,53 +1721,11 @@ class MultiAdapterTrainer:
                 ),
             }
 
-        grad_params = [param for param in self.model.parameters() if param.requires_grad and param.grad is not None]
-        nonfinite_gradient_count = sum(
-            int((~torch.isfinite(param.grad)).sum().detach().cpu().item()) for param in grad_params
-        )
-        if nonfinite_gradient_count:
-            self.optimizer.zero_grad(set_to_none=True)
-            raise FloatingPointError(
-                f"Non-finite gradients before optimizer step: {nonfinite_gradient_count}."
-            )
-        grad_max_abs = max(
-            (float(param.grad.detach().abs().max().cpu().item()) for param in grad_params),
-            default=0.0,
-        )
-        if grad_params:
-            clip_limit = self.config.max_grad_norm if self.config.max_grad_norm > 0.0 else math.inf
-            grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(grad_params, max_norm=clip_limit).detach().cpu().item()
-            )
-        else:
-            grad_norm = 0.0
-        if self._mem_trace_active():
-            reset_peak(self.compute_device)
-        self.optimizer.step()
-        selected_layer_metrics = self._selected_layer_optimizer_metrics()
-        if self._mem_trace_active():
-            alloc_after_optim = current_alloc_bytes(self.compute_device)
-            peak_after_optim = peak_alloc_bytes(self.compute_device)
-            self._mem_rec.maybe_capture_optim_state_baseline(alloc_after_optim)
-            # Append one "optim-step summary row" tagged minibatch_idx=-1
-            # per train_batch. Mirrors nvidia-smi peak-after-step intent and
-            # lets the plot script draw the optimizer/state baseline band.
-            self._mem_rec.append(
-                {
-                    "step": mem_step_idx,
-                    "adapter_name": adapter_name,
-                    "minibatch_idx": -1,
-                    "seq_len_max": 0,
-                    "num_examples": 0,
-                    "num_trained_tokens": total_trained_tokens,
-                    "num_padded_positions": total_padded_input_tokens,
-                    "train_logprob_backend": self.config.train_logprob_backend,
-                    "alloc_after_optim_step": alloc_after_optim,
-                    "peak_during_optim_step": peak_after_optim,
-                    "reserved_bytes_end": reserved_bytes(self.compute_device),
-                    "wall_clock_s": 0.0,
-                }
-            )
+        if total_trained_tokens > trained_tokens_at_update_start:
+            optimizer_metrics.append(optimizer_step())
+        grad_norm = max(item[0] for item in optimizer_metrics)
+        grad_max_abs = max(item[1] for item in optimizer_metrics)
+        selected_layer_metrics = optimizer_metrics[-1][2]
 
         sorted_ratios = sorted(ratio_values)
         sorted_delta_logp_abs = sorted(abs(value) for value in delta_logp_values)
@@ -1696,6 +1747,8 @@ class MultiAdapterTrainer:
             "num_input_examples": float(len(batch)),
             "num_dropped_overlength": float(num_dropped_overlength),
             "num_trained_tokens": float(total_trained_tokens),
+            "num_optimizer_steps": float(len(optimizer_metrics)),
+            "num_preflight_minibatches": float(len(preflight_checks)),
             "approx_kl": approx_kl_numerator / total_trained_tokens,
             "supervised_label_nll": (
                 -mean(supervised_correct_label_logprobs)

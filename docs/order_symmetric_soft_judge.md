@@ -145,9 +145,11 @@ Each physical judge minibatch contains complete forward/reverse pairs. Rows
 may arrive shuffled: the trainer groups by pair ID and restores forward/reverse
 adjacency. Optional length bucketing sorts whole pairs by their maximum length.
 Choose an even physical minibatch size; `0` uses the full optimizer batch. A
-short tail contains whole pairs. All physical minibatches accumulate into one
-optimizer step, with CE normalized by the full row count rather than by the
-tail size. Missing or duplicated members, an odd minibatch size, and overlength
+short tail contains whole pairs. By default, all physical minibatches accumulate
+into one optimizer step, with CE normalized by the full row count rather than by
+the physical tail size. To take multiple updates from a rollout, set an even
+`--train-optimizer-batch-size`; physical minibatches then accumulate within each
+optimizer batch, with CE normalized by that optimizer batch's row count. Missing or duplicated members, an odd minibatch size, and overlength
 row dropping fail instead of silently training on a broken pair.
 
 CPU regressions exercise shuffled input, length bucketing, full/pair/tail

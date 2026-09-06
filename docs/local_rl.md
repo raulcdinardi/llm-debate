@@ -22,6 +22,38 @@ The key split is:
 
 This avoids the previous shape where debate mechanics and task/environment logic leaked into each other.
 
+## Multiple optimizer updates per rollout
+
+`--train-optimizer-batch-size 32 --train-minibatch-size 8` takes four optimizer
+updates from a rollout with 128 training examples **for that adapter**. Each
+update accumulates four physical forward/backward minibatches of eight examples.
+There is one pass through the rollout: each example is used once, with the
+original rollout logprobs, rewards and group-computed advantages held fixed.
+The default optimizer batch size `0` retains one update over the full batch.
+
+The size counts `TrainExample` rows, not prompts or tokens. Adapter batches may
+have different row counts and therefore different update counts. A short final
+optimizer batch gets its own update, normalized by its actual row count. An
+all-zero-advantage PPO optimizer batch performs no update (including no weight
+decay). Existing row order is retained; optional length bucketing still applies.
+Direct CE/JS judge training keeps forward/reverse pairs together and requires
+both batch sizes to be zero or even. No extra epochs or shuffling are added.
+
+**Cost:** multiple PPO updates add a forward-only pass over the rollout, in
+physical minibatches, to verify all rollout logprobs before any weights change.
+Later PPO ratios/clipping use the updated policy against those same original
+logprobs. This parity pass is unnecessary for direct CE/JS judge objectives.
+
+`--steps`, rollout accumulation and checkpoint cadence still count rollout
+batches. Metrics include per-adapter `num_optimizer_steps` and
+`num_preflight_minibatches`. Loss is the example-weighted mean across optimizer
+batches, token diagnostics include the whole rollout, and gradient norm/max
+metrics report the maximum across updates. Selected-layer optimizer diagnostics
+report the last update. Existing forward-token/minibatch counters count training
+passes; the additional parity pass is counted separately. Old exact-resume
+checkpoints remain compatible with the default; changing optimizer batch size
+changes the configuration fingerprint and requires a new run.
+
 ## Test strata
 
 - unit tests: mask construction, routing, environment behavior
