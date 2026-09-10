@@ -1206,6 +1206,7 @@ class TrainingDriver:
             r1_judge_delta_q=self.config.debate_r1_judge_delta_q,
             incoherent_r23_reward=self.config.debate_incoherent_r23_reward,
             r23_format_failure_penalty=self.config.debate_r23_format_failure_penalty,
+            r23_format_contract=("qwen35_instruct_three_points" if self.config.debate_prompt_format == "qwen35_instruct_three_points" else "legacy_base"),
         )
         judge_grpo_record: dict[str, float | int | str] | None = None
         if self.config.train_judge:
@@ -1234,7 +1235,7 @@ class TrainingDriver:
         }
         if self.config.debate_r23_format_failure_penalty != 0.0:
             projection_record["debate_format"] = summarize_generated_debate_format(
-                debates
+                debates, format_contract=("qwen35_instruct_three_points" if self.config.debate_prompt_format == "qwen35_instruct_three_points" else "legacy_base")
             )
         if judge_grpo_record is not None:
             if self.config.judge_training_objective == "supervised_label_ce_js":

@@ -11,6 +11,7 @@ from llm_local_rl.debate_depth import validate_debate_depth_policy
 from llm_local_rl.judge_harness import (
     CHAT_SOLUTION_TAGGED_V1,
     CONSTITUTION_SINGLE_TOKEN_V1,
+    QWEN35_CHAT_SINGLE_TOKEN_V1,
     JudgeHarnessSpec,
     SOLUTION_R1_RATIONALE_V1,
     get_judge_harness,
@@ -21,6 +22,7 @@ from llm_local_rl.soft_judge import (
     JUDGE_LABEL_TOKEN_CONTRACTS,
     LFM25_AB_WHITESPACE_COMPAT_V1,
     LFM25_OPENBOOKQA_SPACED_AB_V1,
+    QWEN35_INSTRUCT_AB_V1,
 )
 
 
@@ -215,6 +217,9 @@ class TrainRunConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.debate_prompt_format == "qwen35_instruct_three_points":
+            if self.thinking_mode != "no_think" or self.debate_rounds != 3 or self.debate_stop_on_concluded:
+                raise ValueError("Qwen instruct three-point contract requires no_think, exactly three rounds, and native EOS termination")
         if self.train_shadow_judge:
             if not self.train_judge or self.judge_training_objective != "supervised_label_ce_js":
                 raise ValueError("shadow judge requires train_judge with supervised_label_ce_js")
@@ -340,11 +345,11 @@ class TrainRunConfig:
                 raise ValueError("direct JS judge objectives require bidirectional judge sampling")
             if not self.debate_judge_constrain_single_token:
                 raise ValueError("direct JS judge objectives require constrained single-token judging")
-            if self.judge_label_token_contract != LFM25_OPENBOOKQA_SPACED_AB_V1:
+            if self.judge_label_token_contract not in (LFM25_OPENBOOKQA_SPACED_AB_V1, QWEN35_INSTRUCT_AB_V1):
                 raise ValueError(
                     "direct JS judge objectives require the strict two-token contract"
                 )
-            if self.debate_judge_harness != CONSTITUTION_SINGLE_TOKEN_V1:
+            if (self.judge_label_token_contract, self.debate_judge_harness) not in ((LFM25_OPENBOOKQA_SPACED_AB_V1, CONSTITUTION_SINGLE_TOKEN_V1), (QWEN35_INSTRUCT_AB_V1, QWEN35_CHAT_SINGLE_TOKEN_V1)):
                 raise ValueError(
                     "direct JS judge objectives require constitution_single_token_v1"
                 )
@@ -373,6 +378,7 @@ class TrainRunConfig:
             if self.judge_label_token_contract not in (
                 LFM25_AB_WHITESPACE_COMPAT_V1,
                 LFM25_OPENBOOKQA_SPACED_AB_V1,
+                QWEN35_INSTRUCT_AB_V1,
             ):
                 raise ValueError(
                     "order_sym_soft_logit requires an explicit tokenizer-bound A/B token contract"
@@ -382,7 +388,7 @@ class TrainRunConfig:
             if not self.debate_judge_constrain_single_token:
                 raise ValueError("order_sym_soft_logit requires constrained single-token judging")
             if self.train_judge:
-                if self.judge_label_token_contract != LFM25_OPENBOOKQA_SPACED_AB_V1:
+                if self.judge_label_token_contract not in (LFM25_OPENBOOKQA_SPACED_AB_V1, QWEN35_INSTRUCT_AB_V1):
                     raise ValueError(
                         "trainable soft judge requires the strict two-token OpenBookQA contract"
                     )
@@ -393,7 +399,7 @@ class TrainRunConfig:
                     )
                 if float(self.debate_judge_temperature) <= 0.0:
                     raise ValueError("trainable soft judge requires stochastic temperature > 0")
-                if self.debate_judge_harness != CONSTITUTION_SINGLE_TOKEN_V1:
+                if (self.judge_label_token_contract, self.debate_judge_harness) not in ((LFM25_OPENBOOKQA_SPACED_AB_V1, CONSTITUTION_SINGLE_TOKEN_V1), (QWEN35_INSTRUCT_AB_V1, QWEN35_CHAT_SINGLE_TOKEN_V1)):
                     raise ValueError(
                         "strict OpenBookQA token boundary is bound to constitution_single_token_v1"
                     )

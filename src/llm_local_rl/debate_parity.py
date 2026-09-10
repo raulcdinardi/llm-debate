@@ -50,13 +50,18 @@ def _legacy_numbered_completion_would_truncate(text: str) -> bool:
     return bool(truncated and truncated != clean)
 
 
-def audit_base_text_debate_format(*, text: str, round_num: int) -> dict[str, Any]:
+def audit_base_text_debate_format(*, text: str, round_num: int, contract: str = "legacy_base") -> dict[str, Any]:
     """Audit the exact visible later-round contract used by the base-text harness.
 
     The canonical header and ``1)`` are prompt-side prefill.  They are checked
     to ensure the expected harness was used, but only sampled completion tokens
     receive advantages, so no reward is assigned to the prefill itself.
     """
+    if contract == "qwen35_instruct_three_points":
+        from llm_local_rl.qwen35_instruct_format import audit_three_points
+        return audit_three_points(text=text, round_num=round_num)
+    if contract != "legacy_base":
+        raise ValueError(f"Unknown debate format contract: {contract}")
     if round_num < 2:
         raise ValueError(f"round_num must be at least 2, got {round_num!r}")
     header = _BASE_R2_HEADER if round_num == 2 else _BASE_R3_HEADER
@@ -160,7 +165,7 @@ class DebateResult:
 
 
 def summarize_generated_debate_format(
-    debates: list[DebateResult],
+    debates: list[DebateResult], *, format_contract: str = "legacy_base",
 ) -> dict[str, Any]:
     """Audit exactly the generated post-R1 transitions in ``debates``."""
     audits_by_round: dict[int, list[dict[str, Any]]] = {}
@@ -173,7 +178,7 @@ def summarize_generated_debate_format(
                     continue
                 audit = audit_base_text_debate_format(
                     text=str(trajectory.metrics.get(f"r{transition.round_num}", "")),
-                    round_num=transition.round_num,
+                    round_num=transition.round_num, contract=format_contract,
                 )
                 audits_by_round.setdefault(transition.round_num, []).append(audit)
                 trajectory_audits.append(audit)
@@ -196,7 +201,7 @@ def summarize_generated_debate_format(
 
     per_round: dict[str, dict[str, float | int]] = {}
     summary: dict[str, Any] = {
-        "schema": "base_text_raw_exact_generated_rounds_terminal_concluded_v3",
+        "schema": ("qwen35_three_points_30_words_v1" if format_contract == "qwen35_instruct_three_points" else "base_text_raw_exact_generated_rounds_terminal_concluded_v3"),
         "generated_round_numbers": round_numbers,
         "generated_round_min": min(round_numbers) if round_numbers else None,
         "generated_round_max": max(round_numbers) if round_numbers else None,
@@ -1320,6 +1325,7 @@ def assemble_split_train_examples(
     r1_judge_delta_q: float = 1.0,
     incoherent_r23_reward: float = -0.5,
     r23_format_failure_penalty: float = 0.0,
+    r23_format_contract: str = "legacy_base",
     pointwise_reward_map: dict[int, float] | None = None,
     r23_advantage_scope: Literal["per_round", "merged_r23"] = "per_round",
 ) -> dict[str, list[TrainExample]]:
@@ -1664,6 +1670,7 @@ def assemble_split_train_examples(
                     ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
                 format_audits = [
                     audit_base_text_debate_format(
+                        contract=r23_format_contract,
                         text=str(traj.metrics.get(f"r{transition.round_num}", "")),
                         round_num=transition.round_num,
                     )
@@ -1784,6 +1791,7 @@ def assemble_split_train_examples(
                         winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
                     ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
                 r2_format = audit_base_text_debate_format(
+                        contract=r23_format_contract,
                     text=str(traj.metrics.get("r2", "")), round_num=2
                 ) if r23_format_failure_penalty != 0.0 else {"strict_ok": True, "failures": []}
                 r2_format_penalty = 0.0 if r2_format["strict_ok"] else r23_format_failure_penalty
@@ -1794,6 +1802,7 @@ def assemble_split_train_examples(
                     if len(t3.completion_tokens) == 0:
                         raise ValueError("R3 completion tokens empty.")
                     r3_format = audit_base_text_debate_format(
+                        contract=r23_format_contract,
                         text=str(traj.metrics.get("r3", "")), round_num=3
                     ) if r23_format_failure_penalty != 0.0 else {"strict_ok": True, "failures": []}
                     r3_format_penalty = 0.0 if r3_format["strict_ok"] else r23_format_failure_penalty
@@ -1919,6 +1928,7 @@ def assemble_split_train_examples(
                         winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
                     ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
                 r3_format = audit_base_text_debate_format(
+                        contract=r23_format_contract,
                     text=str(traj.metrics.get("r3", "")), round_num=3
                 ) if r23_format_failure_penalty != 0.0 else {"strict_ok": True, "failures": []}
                 r3_format_penalty = 0.0 if r3_format["strict_ok"] else r23_format_failure_penalty

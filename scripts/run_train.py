@@ -179,7 +179,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--judge-label-token-contract",
         default="none",
-        choices=["none", "lfm25_ab_whitespace_compat_v1", "lfm25_openbookqa_spaced_ab_v1"],
+        choices=["none", "lfm25_ab_whitespace_compat_v1", "lfm25_openbookqa_spaced_ab_v1", "qwen35_instruct_ab_v1"],
         help=(
             "Temporary tokenizer compatibility contract for soft judge scoring. "
             "Replace and Phase-0 validate when the judge tokenizer or answer stem changes."
@@ -238,7 +238,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--debate-prompt-format",
         default="chat",
-        choices=["chat", "qwen35_base_text_prefill"],
+        choices=["chat", "qwen35_base_text_prefill", "qwen35_instruct_three_points"],
     )
     parser.add_argument(
         "--debate-stop-on-concluded",

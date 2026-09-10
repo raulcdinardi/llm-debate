@@ -10,7 +10,7 @@ from statistics import mean, pstdev
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from llm_local_rl.behavior_policy import BehaviorPolicySpec
 from llm_local_rl.memory_trace import (
@@ -810,7 +810,12 @@ class MultiAdapterTrainer:
         return tokenizer
 
     def _build_base_model(self):
-        base_model = AutoModelForCausalLM.from_pretrained(
+        model_config = AutoConfig.from_pretrained(self.config.base_model_path)
+        model_cls = AutoModelForCausalLM
+        if model_config.model_type == "qwen3_5":
+            from transformers import Qwen3_5ForConditionalGeneration
+            model_cls = Qwen3_5ForConditionalGeneration
+        base_model = model_cls.from_pretrained(
             self.config.base_model_path,
             torch_dtype=_resolve_dtype(self.config.torch_dtype),
         )

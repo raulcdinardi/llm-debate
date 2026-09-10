@@ -21,6 +21,7 @@ from llm_local_rl.judge_harness import (
 from llm_local_rl.soft_judge import (
     JUDGE_LABEL_TOKEN_CONTRACT_NONE,
     LFM25_OPENBOOKQA_SPACED_AB_V1,
+    QWEN35_INSTRUCT_AB_V1,
     order_symmetric_soft_judge_score,
     resolve_judge_label_token_contract,
     validate_judge_prompt_label_boundary,
@@ -442,7 +443,7 @@ class DebateRuntime:
         return step_seed + round_num * 100000 + request_idx
 
     def _use_base_text_prefill(self) -> bool:
-        if self.runtime_config.prompt_format == "chat":
+        if self.runtime_config.prompt_format in ("chat", "qwen35_instruct_three_points"):
             return False
         if self.runtime_config.prompt_format == "qwen35_base_text_prefill":
             return True
@@ -677,6 +678,9 @@ class DebateRuntime:
         )
 
     def _chat_continuation_parts(self, *, round_num: int) -> tuple[list[int], list[int]]:
+        if self.runtime_config.prompt_format == "qwen35_instruct_three_points":
+            from llm_local_rl.qwen35_instruct_format import continuation_parts
+            return continuation_parts(self.tokenizer, round_num=round_num)
         if round_num == 2:
             template = self.task.debate_r2_user_template() or load_prompt("debate/r2_token_template.md")
             marker = "{opponent_r1}"
@@ -893,11 +897,18 @@ class DebateRuntime:
                     validated.add(cache_key)
                     self._validated_judge_label_boundaries = validated
             return prompt_tokens
-        return get_chat_adapter(self.tokenizer).encode_messages(
+        prompt_tokens = get_chat_adapter(self.tokenizer).encode_messages(
             list(rendered.messages),
             add_generation_prompt=True,
             enable_thinking=False,
         )
+
+        if self.runtime_config.judge_label_token_contract == QWEN35_INSTRUCT_AB_V1:
+            contract = resolve_judge_label_token_contract(tokenizer=self.tokenizer, contract_name=QWEN35_INSTRUCT_AB_V1)
+            prompt_text = self.tokenizer.decode(prompt_tokens, skip_special_tokens=False)
+            validate_judge_prompt_label_boundary(tokenizer=self.tokenizer, prompt_text=prompt_text,
+                                                prompt_token_ids=prompt_tokens, contract=contract)
+        return prompt_tokens
 
     def _judge_max_tokens(self) -> int:
         if self.runtime_config.judge_max_tokens > 0:
@@ -1063,6 +1074,14 @@ class DebateRuntime:
                         + list(self.tokenizer.encode(opponent_response, add_special_tokens=False))
                         + chat_suffix
                     )
+                # A sampled EOS already closes the previous assistant turn.
+                # Remove the duplicate from the new segment, never from history.
+                if self.runtime_config.prompt_format == "qwen35_instruct_three_points":
+                    stop_id = get_chat_adapter(self.tokenizer).stop_token_id
+                    if previous.completion_tokens and previous.completion_tokens[-1] == stop_id:
+                        if not continuation or continuation[0] != stop_id:
+                            raise ValueError("Qwen continuation missing native turn boundary")
+                        continuation = continuation[1:]
                 prompt_tokens_list.append(
                     previous.prompt_tokens + previous.completion_tokens + continuation
                 )
@@ -1081,7 +1100,7 @@ class DebateRuntime:
                 texts=raw_texts,
                 strip_stop_sentinel=self.runtime_config.stop_on_concluded,
                 preserve_sampled_text=(
-                    use_base_text_prefill and not self.runtime_config.stop_on_concluded
+                    (use_base_text_prefill or self.runtime_config.prompt_format == "qwen35_instruct_three_points") and not self.runtime_config.stop_on_concluded
                 ),
             )
             argument_texts = (
