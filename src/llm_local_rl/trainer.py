@@ -651,12 +651,14 @@ def _patch_weight_converter_compat() -> None:
         operations,
         distributed_operation=None,
         quantization_operation=None,
+        **kwargs,
     ):
         original_init(
             self,
             source_patterns=source_patterns,
             target_patterns=target_patterns,
             operations=operations,
+            **kwargs,
         )
         self.distributed_operation = distributed_operation
         self.quantization_operation = quantization_operation
@@ -781,8 +783,14 @@ class MultiAdapterTrainer:
             is_trainable=True,
         )
         if not trainer.single_target_parameter_adapter_mode:
+            from llm_local_rl.shadow_judge import SHADOW_JUDGE, preserve_rng_state
+
             for adapter_name in config.adapter_names[1:]:
-                model.load_adapter(adapter_dirs[adapter_name], adapter_name=adapter_name, is_trainable=True)
+                if adapter_name == SHADOW_JUDGE:
+                    with preserve_rng_state():
+                        model.load_adapter(adapter_dirs[adapter_name], adapter_name=adapter_name, is_trainable=True)
+                else:
+                    model.load_adapter(adapter_dirs[adapter_name], adapter_name=adapter_name, is_trainable=True)
         model.set_adapter(first_name)
         model.train()
         model.to(torch.device("cpu"))
@@ -815,6 +823,8 @@ class MultiAdapterTrainer:
         return base_model
 
     def _build_new_model(self):
+        from llm_local_rl.shadow_judge import SHADOW_JUDGE, preserve_rng_state
+
         base_model = self._build_base_model()
         lora_config = LoraConfig(
             r=self.config.lora_rank,
@@ -827,11 +837,46 @@ class MultiAdapterTrainer:
         )
         model = get_peft_model(base_model, lora_config, adapter_name=self.config.adapter_names[0])
         for adapter_name in self.config.adapter_names[1:]:
-            model.add_adapter(adapter_name, lora_config)
+            if adapter_name == SHADOW_JUDGE:
+                with preserve_rng_state():
+                    model.add_adapter(adapter_name, lora_config)
+            else:
+                model.add_adapter(adapter_name, lora_config)
         model.set_adapter(self.config.adapter_names[0])
         model.train()
         model.to(torch.device("cpu"))
         return model
+
+    def initialize_shadow_judge(self, *, seed: int, std: float) -> dict[str, object]:
+        """Pair fresh judges with identical A and B=0 versus B~Normal(0,std)."""
+        from llm_local_rl.shadow_judge import SHADOW_JUDGE
+
+        if not math.isfinite(std) or std <= 0 or seed < 0:
+            raise ValueError("shadow initialization requires positive finite std and non-negative seed")
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        parameters = dict(self.model.named_parameters())
+        a_names = [name for name in parameters if ".lora_A.judge." in name]
+        b_names = [name for name in parameters if ".lora_B.judge." in name]
+        if not a_names or len(a_names) != len(b_names):
+            raise ValueError("paired judges require ordinary linear LoRA A/B factors")
+        if any(torch.count_nonzero(parameters[name]).item() for name in b_names):
+            raise ValueError("active judge must have zero effective delta (B=0) for fresh paired initialization")
+        b_squared_norm = 0.0
+        with torch.no_grad():
+            for name in a_names + b_names:
+                source = parameters[name]
+                target = parameters[name.replace(".judge.", f".{SHADOW_JUDGE}.")]
+                if name in a_names:
+                    target.copy_(source)
+                else:
+                    draw = torch.randn(source.shape, generator=generator, dtype=torch.float32, device="cpu") * std
+                    target.copy_(draw.to(device=target.device, dtype=target.dtype))
+                    b_squared_norm += float(target.detach().float().square().sum().item())
+        if not math.isfinite(b_squared_norm) or b_squared_norm == 0.0:
+            raise ValueError("shadow B initialization must be finite and nonzero; choose a representable std")
+        return {"seed": seed, "b_normal_std": std, "paired_modules": len(a_names),
+                "a_copied_from": "judge", "active_b_l2": 0.0,
+                "shadow_b_l2": math.sqrt(b_squared_norm)}
 
     def _build_optimizer(self):
         params = [
@@ -1759,6 +1804,10 @@ class MultiAdapterTrainer:
                 mean(math.exp(value) for value in supervised_correct_label_logprobs)
                 if supervised_correct_label_logprobs
                 else 0.0
+            ),
+            "supervised_label_brier": (
+                mean((1.0 - math.exp(value)) ** 2 for value in supervised_correct_label_logprobs)
+                if supervised_correct_label_logprobs else 0.0
             ),
             "supervised_label_accuracy": (
                 mean(float(math.exp(value) >= 0.5) for value in supervised_correct_label_logprobs)

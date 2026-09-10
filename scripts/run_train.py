@@ -196,6 +196,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--train-judge-coherence-grpo spelling is retained as a CLI alias."
         ),
     )
+    parser.add_argument("--train-shadow-judge", action="store_true", help="Train a passive random-delta judge on the active judge's gold CE examples.")
+    parser.add_argument("--shadow-judge-init-seed", type=int, default=None)
+    parser.add_argument("--shadow-judge-init-std", type=float, default=None, help="Explicit standard deviation of shadow LoRA B ~ Normal(0, std); A is copied from the active judge.")
     parser.add_argument(
         "--judge-training-objective",
         choices=["grpo", "supervised_label_ce_js", "unsupervised_js"],
@@ -484,6 +487,9 @@ def main() -> int:
                 debate_judge_score_mode=args.debate_judge_score_mode,
                 judge_label_token_contract=args.judge_label_token_contract,
                 train_judge=args.train_judge,
+                train_shadow_judge=args.train_shadow_judge,
+                shadow_judge_init_seed=args.shadow_judge_init_seed,
+                shadow_judge_init_std=args.shadow_judge_init_std,
                 judge_training_objective=args.judge_training_objective,
                 judge_coherence_js_weight=args.judge_coherence_js_weight,
                 judge_grpo_reward_mode=args.judge_grpo_reward_mode,

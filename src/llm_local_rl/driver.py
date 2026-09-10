@@ -44,6 +44,7 @@ from llm_local_rl.registry import build_debate_task, build_environment, build_ep
 from llm_local_rl.resource_monitor import ResourceMonitor
 from llm_local_rl.observability import RunObservability, WandbSettings, rollback_rollout_shards
 from llm_local_rl.sglang_sampling import SglangRuntimeConfig, SglangSampler
+from llm_local_rl.shadow_judge import SHADOW_JUDGE, preserve_rng_state, shadow_label_examples
 from llm_local_rl.types import EpisodeSample, EpisodeTurn, SamplingRequest
 from llm_local_rl.vllm_sampling import VllmRuntimeConfig, VllmSampler
 
@@ -128,7 +129,7 @@ class TrainingDriver:
                 adapter_name=adapter_name,
                 adapter_dir=self.current_adapter_dirs[adapter_name],
             )
-        self.reference_adapter_dirs = dict(self.current_adapter_dirs)
+        self.reference_adapter_dirs = self._sampler_adapter_dirs()
         if self.config.reference_kl_every > 0:
             self.trainer.load_reference_adapters(adapter_dirs=self.reference_adapter_dirs)
         with self._stage("trainer_sleep", step=0):
@@ -287,7 +288,8 @@ class TrainingDriver:
         return sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys, strict=True)) / math.sqrt(x_var * y_var)
 
     def _add_temporal_metrics(self, record: dict[str, object]) -> None:
-        train_metrics = record.get("train_metrics", {})
+        train_metrics = {name: metrics for name, metrics in record.get("train_metrics", {}).items()
+                         if name != SHADOW_JUDGE}
         entropy_values = [float(item["entropy"]) for item in train_metrics.values() if "entropy" in item]
         kl_values = [float(item["ppo_sampled_approx_kl"]) for item in train_metrics.values() if "ppo_sampled_approx_kl" in item]
         rollout_metrics = record.setdefault("rollout_metrics", {})
@@ -329,21 +331,27 @@ class TrainingDriver:
         if self.config.adapter_layout == "shared":
             return ("shared",)
         if self.config.debate_judge_adapter == "judge":
-            return ("solution", "debate", "judge")
+            names = ("solution", "debate", "judge")
+            return (*names, SHADOW_JUDGE) if self.config.train_shadow_judge else names
         return ("solution", "debate")
 
+    def _sampler_adapter_dirs(self) -> dict[str, str]:
+        # Passive adapters never enter reward inference or occupy a sampler slot.
+        return {name: path for name, path in self.current_adapter_dirs.items() if name != SHADOW_JUDGE}
+
     def _validate_judge_adapter_harness(self, adapter_dirs: dict[str, str]) -> None:
-        judge_dir = adapter_dirs.get("judge")
-        if judge_dir is None or self.config.debate_judge_adapter != "judge":
+        if self.config.debate_judge_adapter != "judge":
             return
-        validate_judge_harness_manifest(
-            adapter_dir=judge_dir,
-            harness_id=self.config.judge_harness().harness_id,
-            max_rounds=self.config.effective_debate_max_rounds(),
-        )
+        for name in ("judge", SHADOW_JUDGE) if self.config.train_shadow_judge else ("judge",):
+            if name in adapter_dirs:
+                validate_judge_harness_manifest(
+                    adapter_dir=adapter_dirs[name],
+                    harness_id=self.config.judge_harness().harness_id,
+                    max_rounds=self.config.effective_debate_max_rounds(),
+                )
 
     def _write_saved_judge_harness(self, *, adapter_name: str, adapter_dir: str) -> None:
-        if adapter_name != "judge" or self.config.debate_judge_adapter != "judge":
+        if adapter_name not in ("judge", SHADOW_JUDGE) or self.config.debate_judge_adapter != "judge":
             return
         if not self.config.train_judge and self.config.init_adapter_dirs:
             source = self.config.init_adapter_dirs.get("judge")
@@ -547,7 +555,14 @@ class TrainingDriver:
     def _make_fresh_trainer(self) -> MultiAdapterTrainer:
         from llm_local_rl.trainer import MultiAdapterTrainer
 
-        return MultiAdapterTrainer(config=self._trainer_config(device="cuda"))
+        trainer = MultiAdapterTrainer(config=self._trainer_config(device="cuda"))
+        if self.config.train_shadow_judge:
+            receipt = trainer.initialize_shadow_judge(
+                seed=self.config.shadow_judge_init_seed,
+                std=self.config.shadow_judge_init_std,
+            )
+            (self.output_dir / "shadow_judge_initialization.json").write_text(json.dumps(receipt, indent=2))
+        return trainer
 
     def _make_trainer_from_init_adapters(self) -> MultiAdapterTrainer:
         from llm_local_rl.trainer import MultiAdapterTrainer
@@ -600,7 +615,7 @@ class TrainingDriver:
                     max_lora_rank=self.config.sampler_max_lora_rank,
                     max_loras=self.config.sampler_max_loras,
                 ),
-                adapter_paths=dict(self.current_adapter_dirs),
+                adapter_paths=self._sampler_adapter_dirs(),
             )
         if self.config.sampler_backend == "sglang":
             return SglangSampler(
@@ -611,7 +626,7 @@ class TrainingDriver:
                     unload_stale_adapters=self.config.sampler_sglang_unload_stale_adapters,
                     memory_saver=self.config.sampler_sleep_before_training,
                 ),
-                adapter_paths=dict(self.current_adapter_dirs),
+                adapter_paths=self._sampler_adapter_dirs(),
             )
         raise ValueError(f"Unsupported sampler_backend={self.config.sampler_backend!r}.")
 
@@ -1207,6 +1222,8 @@ class TrainingDriver:
                     debates, reward_mode=self.config.judge_grpo_reward_mode
                 )
             grouped.setdefault("judge", []).extend(judge_examples)
+            if self.config.train_shadow_judge:
+                grouped[SHADOW_JUDGE] = shadow_label_examples(grouped["judge"])
         projection_record: dict[str, object] = {
             "source_exact_shared_equivalent": False,
             "reason": "split_layout_per_round_projection",
@@ -1304,6 +1321,21 @@ class TrainingDriver:
                 "r23_constant_ignored": True,
             }
         return grouped, projection_record
+
+    def _train_adapter_batch(self, *, adapter_name: str, batch: list, step_num: int) -> dict:
+        direct_judge = adapter_name in ("judge", SHADOW_JUDGE) and self.config.judge_training_objective in (
+            "supervised_label_ce_js", "unsupervised_js"
+        )
+        context = preserve_rng_state() if adapter_name == SHADOW_JUDGE else nullcontext()
+        with context:
+            return self.trainer.train_batch(
+                adapter_name=adapter_name,
+                batch=batch,
+                objective=self.config.judge_training_objective if direct_judge else "ppo",
+                judge_coherence_js_weight=self.config.judge_coherence_js_weight,
+                measure_reference_kl=(not direct_judge and self.config.reference_kl_every > 0
+                                      and step_num % self.config.reference_kl_every == 0),
+            )
 
     def _adapter_output_dir(self, *, step: int, adapter_name: str, durable: bool) -> Path:
         if durable:
@@ -1417,7 +1449,7 @@ class TrainingDriver:
                         self._progress("sampler_wake_start", step=step_num)
                         self.sampler.wake_up()
                         self._progress("sampler_wake_done", step=step_num)
-                    self.sampler.set_adapter_paths(adapter_paths=self.current_adapter_dirs)
+                    self.sampler.set_adapter_paths(adapter_paths=self._sampler_adapter_dirs())
                     if self.config.rollout.mode == "single_turn":
                         with self._stage("rollout_single_turn", step=step_num), trace_context(
                             step=step_num, rollout_mode="single_turn"
@@ -1543,7 +1575,7 @@ class TrainingDriver:
                                 step=step_num,
                                 adapter_names=sorted(adapter_names_to_unload),
                             )
-                            self.sampler.unload_adapters(adapter_names=adapter_names_to_unload)
+                            self.sampler.unload_adapters(adapter_names=adapter_names_to_unload - {SHADOW_JUDGE})
                             self._progress(
                                 "sampler_unload_trainable_loras_done",
                                 step=step_num,
@@ -1585,27 +1617,8 @@ class TrainingDriver:
                                 adapter_name=adapter_name,
                                 num_examples=len(batch),
                             )
-                            train_metrics[adapter_name] = self.trainer.train_batch(
-                                adapter_name=adapter_name,
-                                batch=batch,
-                                objective=(
-                                    self.config.judge_training_objective
-                                    if adapter_name == "judge"
-                                    and self.config.judge_training_objective
-                                    in ("supervised_label_ce_js", "unsupervised_js")
-                                    else "ppo"
-                                ),
-                                judge_coherence_js_weight=self.config.judge_coherence_js_weight,
-                                measure_reference_kl=(
-                                    not (
-                                        adapter_name == "judge"
-                                        and self.config.judge_training_objective
-                                        in ("supervised_label_ce_js", "unsupervised_js")
-                                    )
-                                    and
-                                    self.config.reference_kl_every > 0
-                                    and step_num % self.config.reference_kl_every == 0
-                                ),
+                            train_metrics[adapter_name] = self._train_adapter_batch(
+                                adapter_name=adapter_name, batch=batch, step_num=step_num,
                             )
                             self._progress(
                                 "train_adapter_done",

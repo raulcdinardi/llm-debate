@@ -242,6 +242,48 @@ def _formatted_round(round_num: int) -> str:
     return header + " first\n2) second\n3) third\nCONCLUDED"
 
 
+def test_shadow_projection_preserves_active_rewards_and_gold_pairs():
+    import copy
+    from llm_local_rl.config import TrainRunConfig
+    from llm_local_rl.driver import TrainingDriver
+
+    config = TrainRunConfig(
+        model_path="/unused", output_dir="/unused", adapter_layout="split",
+        debate_judge_adapter="judge", debate_judge_harness="constitution_single_token_v1",
+        debate_judge_bidirectional=True, debate_judge_constrain_single_token=True,
+        debate_judge_score_mode="order_sym_soft_logit",
+        judge_label_token_contract="lfm25_openbookqa_spaced_ab_v1",
+        train_judge=True, judge_training_objective="supervised_label_ce_js",
+        judge_coherence_js_weight=0., debate_r1_reward="none", debate_r23_reward="soft_judge_raw",
+        train_adapter_names=("debate", "judge"),
+    )
+    debate = _make_debate(judge_raw_response={
+        "bidirectional_judge": True, "order_invariant": False, "soft_judge": True,
+        "judge_label_token_contract": {"a_token_ids": [334], "b_token_ids": [378]},
+        "soft_score": {"score": .6, "referent_js_divergence_normalized": .8, "coherence_reliability": .2},
+        "_training_judge_turns": [
+            {"order": order, "verdict": verdict, "prompt_tokens": tokens,
+             "behavior_policy_allowed_token_ids": [334, 378]}
+            for order, verdict, tokens in (("forward", "B", [101, 102]), ("reverse", "A", [201, 202]))
+        ],
+    })
+    original = copy.deepcopy(debate)
+    driver = object.__new__(TrainingDriver)
+    driver.config = config
+    driver._debate_runtime = lambda: None
+    baseline, record = driver._group_debate_examples(debates=[debate], step_seed=17)
+    driver.config = replace(config, train_shadow_judge=True, shadow_judge_init_seed=17,
+                            shadow_judge_init_std=.03, train_adapter_names=("debate", "judge", "judge_shadow"))
+    paired, paired_record = driver._group_debate_examples(debates=[debate], step_seed=17)
+    assert debate == original
+    assert record == paired_record
+    assert {name: rows for name, rows in paired.items() if name != "judge_shadow"} == baseline
+    assert "solution" not in driver._train_adapter_names()  # fixed R1 never receives a policy update
+    assert [row.target_ids[-1] for row in paired["judge_shadow"]] == [334, 378]
+    for active, shadow in zip(paired["judge"], paired["judge_shadow"], strict=True):
+        assert replace(shadow, adapter_name="judge", metadata=active.metadata) == active
+
+
 def _append_fourth_round(debate: DebateResult) -> DebateResult:
     for trajectory, offset in ((debate.trajectory_a, 0), (debate.trajectory_b, 20)):
         trajectory.transitions.append(

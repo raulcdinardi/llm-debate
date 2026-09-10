@@ -111,6 +111,9 @@ class TrainRunConfig:
     debate_judge_score_mode: str = "hard_verdict"
     judge_label_token_contract: str = JUDGE_LABEL_TOKEN_CONTRACT_NONE
     train_judge: bool = False
+    train_shadow_judge: bool = False
+    shadow_judge_init_seed: int | None = None
+    shadow_judge_init_std: float | None = None
     judge_training_objective: str = "grpo"
     judge_coherence_js_weight: float = 1.0
     judge_grpo_reward_mode: str = "coherence"
@@ -212,6 +215,25 @@ class TrainRunConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.train_shadow_judge:
+            if not self.train_judge or self.judge_training_objective != "supervised_label_ce_js":
+                raise ValueError("shadow judge requires train_judge with supervised_label_ce_js")
+            if self.judge_coherence_js_weight != 0.0:
+                raise ValueError("paired shadow judges require CE-only: judge_coherence_js_weight=0")
+            if self.shadow_judge_init_seed is None or self.shadow_judge_init_seed < 0:
+                raise ValueError("shadow judge requires an explicit non-negative initialization seed")
+            if self.shadow_judge_init_std is None or not math.isfinite(self.shadow_judge_init_std) or self.shadow_judge_init_std <= 0:
+                raise ValueError("shadow judge requires an explicit positive finite initialization std")
+            if self.target_parameters:
+                raise ValueError("shadow judge requires target_modules, not target_parameters")
+            if self.rollout.mode != "debate":
+                raise ValueError("shadow judge requires debate mode")
+            if "judge_shadow" in self.resolved_debate_round_adapter_names():
+                raise ValueError("shadow judge cannot generate debate rounds")
+            if self.train_adapter_names and "judge_shadow" not in self.train_adapter_names:
+                raise ValueError("shadow judge must be included in train_adapter_names")
+        elif self.shadow_judge_init_seed is not None or self.shadow_judge_init_std is not None:
+            raise ValueError("shadow initialization settings require train_shadow_judge")
         if self.sampler_prefix_caching is not None and self.sampler_backend != "vllm":
             raise ValueError("sampler_prefix_caching is only supported by the vllm sampler")
         if self.train_optimizer_batch_size < 0:
@@ -326,9 +348,9 @@ class TrainRunConfig:
                 raise ValueError(
                     "direct JS judge objectives require constitution_single_token_v1"
                 )
-            if self.debate_r23_reward != "soft_judge":
+            if self.debate_r23_reward not in ("soft_judge", "soft_judge_raw"):
                 raise ValueError(
-                    "direct JS judge objectives require reliability-weighted soft_judge rewards"
+                    "direct judge objectives require soft_judge or soft_judge_raw rewards"
                 )
             if self.train_optimizer_batch_size % 2 != 0:
                 raise ValueError("direct JS judge objectives require an even train_optimizer_batch_size")
@@ -375,9 +397,9 @@ class TrainRunConfig:
                     raise ValueError(
                         "strict OpenBookQA token boundary is bound to constitution_single_token_v1"
                     )
-                if self.debate_r23_reward != "soft_judge":
+                if self.debate_r23_reward not in ("soft_judge", "soft_judge_raw"):
                     raise ValueError(
-                        "trainable soft judge requires reliability-weighted soft_judge debate rewards"
+                        "trainable soft judge requires soft_judge or soft_judge_raw debate rewards"
                     )
             elif float(self.debate_judge_temperature) != 0.0:
                 raise ValueError("frozen order_sym_soft_logit requires debate_judge_temperature=0")
@@ -634,6 +656,9 @@ class TrainRunConfig:
                 data.get("judge_label_token_contract", JUDGE_LABEL_TOKEN_CONTRACT_NONE)
             ),
             train_judge=train_judge,
+            train_shadow_judge=bool(data.get("train_shadow_judge", False)),
+            shadow_judge_init_seed=data.get("shadow_judge_init_seed"),
+            shadow_judge_init_std=data.get("shadow_judge_init_std"),
             judge_grpo_reward_mode=judge_grpo_reward_mode,
             judge_training_objective=judge_training_objective,
             judge_coherence_js_weight=float(data.get("judge_coherence_js_weight", 1.0)),

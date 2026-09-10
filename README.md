@@ -5,6 +5,8 @@ Two supported entry points share this repository:
 - **Current local RL:** `PYTHONPATH=src python scripts/run_train.py --help`.
   See [local RL usage](docs/local_rl.md) for vLLM/LoRA training, checkpoints,
   judge contracts and arbitrary debate depths.
+  See [paired shadow judges](docs/paired_shadow_judge.md) for training a passive
+  randomized judge alongside the reward-setting judge on identical gold labels.
 - **Legacy Tinker:** existing `scripts/train.py`, `src/tinker_debate`,
   `tinker-local`, and `requirements.txt` remain at their original paths.
   See [the preserved Tinker guide](docs/legacy_tinker.md).

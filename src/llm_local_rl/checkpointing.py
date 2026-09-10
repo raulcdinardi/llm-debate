@@ -23,6 +23,12 @@ def _sha256(path: Path) -> str:
 def config_fingerprint(config: dict[str, Any]) -> str:
     # The new default is identical to historical single-update checkpoints.
     config = dict(config)
+    # An opt-out run remains compatible with pre-shadow exact-resume manifests.
+    if not config.get("train_shadow_judge", False):
+        config.pop("train_shadow_judge", None)
+        for key in ("shadow_judge_init_seed", "shadow_judge_init_std"):
+            if config.get(key) is None:
+                config.pop(key, None)
     if config.get("train_optimizer_batch_size") == 0:
         del config["train_optimizer_batch_size"]
     if "sampler_prefix_caching" in config and config["sampler_prefix_caching"] is None:
