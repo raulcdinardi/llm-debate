@@ -13,12 +13,13 @@ CATEGORY_NAMES = {
 
 
 def metadata(config, output_dir):
-    env = str(config.get('env_name', '')).lower()
+    rollout = config.get('rollout', {})
+    env = str(config.get('env_name', rollout.get('env_name', ''))).lower()
     category = ('mixed4' if env == 'mixed_label_pairwise' else
                 'mbpp' if 'python' in env or 'mbpp' in env else
                 'cw' if 'writing' in env or 'story' in env else
                 'warmup' if any(x in env for x in ('qa', 'mmlu', 'openbook')) else 'training')
-    category = config.get('observability_category', 'sft' if config.get('mode') == 'sft' else category)
+    category = config.get('observability_category', 'sft' if config.get('mode', rollout.get('mode')) == 'sft' else category)
     if category not in CATEGORY_NAMES:
         raise ValueError(f'Unknown dashboard category: {category}')
     phase = 'phase0' if any(word in str(output_dir).lower() for word in ('phase0', 'smoke', 'preflight', 'disposable')) else 'full'
@@ -136,8 +137,11 @@ class DashboardSync:
         self.published = set()
         self.url = saved.get('url')
         self.category_url = saved.get('category_url')
-        self.attempts = 0
+        self.attempts = saved.get("attempts", 0)
+        self.final_attempted = saved.get("final_attempted", False)
         self.last_attempt = 0
+        if saved.get("needs_intervention"):
+            print(f"NEEDS_INTERVENTION: dashboard publication retries exhausted; receipt={self.path}", flush=True)
 
     def observe(self, metrics):
         with self.lock:
@@ -146,7 +150,9 @@ class DashboardSync:
     def publish(self, force=False):
         with self.lock:
             metrics = set(self.metrics)
-        if not metrics or metrics == self.published or self.attempts >= 3:
+        if not metrics or metrics == self.published:
+            return
+        if self.attempts >= 3 and (not force or self.final_attempted):
             return
         if not force and time.monotonic() - self.last_attempt < 60:
             return
@@ -154,6 +160,10 @@ class DashboardSync:
         from wandb_workspaces.workspaces import Workspace
         self.last_attempt = time.monotonic()
         self.attempts += 1
+        if force and self.attempts > 3:
+            self.final_attempted = True
+        # Persist aggregate attempts even when the remote publication fails.
+        self._receipt(metrics)
         configs = [json.loads(p.read_text()) for p in sorted((self.state / "llm_scoring").glob("*/config.json"))]
         sections = layout(metrics, configs, training_x=self.training_x)
         (self.state / 'dashboard.json').write_text(json.dumps(sections, indent=2))
@@ -175,12 +185,16 @@ class DashboardSync:
             self.run.summary['dashboard_category_url'] = self.category_url
         self.published = metrics
         self.attempts = 0
+        self.final_attempted = False
         self._receipt(metrics)
         print(f'Organized W&B dashboard: {self.url}', flush=True)
 
     def _receipt(self, metrics):
         tmp = self.path.with_suffix('.tmp')
         tmp.write_text(json.dumps({'run_id': self.run.id, 'url': self.url, 'category_url': self.category_url,
-                                   'metrics': sorted(metrics)}, indent=2))
+                                   'metrics': sorted(metrics), 'attempts': self.attempts,
+                                   'final_attempted': self.final_attempted,
+                                   'needs_intervention': self.attempts >= 4}, indent=2))
         tmp.replace(self.path)
-        (self.state / 'dashboard_url.txt').write_text(self.url + '\n')
+        if self.url:
+            (self.state / 'dashboard_url.txt').write_text(self.url + '\n')

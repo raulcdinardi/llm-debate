@@ -142,3 +142,38 @@ def test_archive_check_catches_git_archive_omitting_new_modules(tmp_path):
         check_archive(archive,canonical)
     build(FILES)
     assert len(check_archive(archive,canonical))==len(FILES)
+
+
+def test_driver_nested_rollout_selects_category():
+    from llm_local_rl.config import TrainRunConfig, RolloutConfig
+    from llm_local_rl.dashboard_sync import metadata
+    for env, expected in [("python_optimization", "mbpp"), ("constrained_writing", "cw"),
+                          ("mixed_label_pairwise", "mixed4")]:
+        config = TrainRunConfig(model_path="model", output_dir="full", mmlu_pro_data_path="tasks.jsonl", rollout=RolloutConfig(env_name=env))
+        assert metadata(config.to_dict(), "full")["observability_category"] == expected
+
+
+def test_failed_publication_has_one_persisted_final_retry(tmp_path, monkeypatch):
+    import json
+    import llm_local_rl.dashboard_sync as module
+    run = SimpleNamespace(id='run', entity='entity', project='project', name='Run', summary={})
+    cfg = metadata({'env_name': 'mixed_label_pairwise'}, '/full')
+    calls = []
+    def unavailable(view):
+        calls.append(view)
+        raise ConnectionError('transient service outage')
+    monkeypatch.setattr(module, 'save_verified', unavailable)
+    d = DashboardSync(tmp_path, run, cfg)
+    d.observe({'rollout/mean_reward': 1})
+    for attempt in range(3):
+        d.last_attempt = -100
+        with pytest.raises(ConnectionError):
+            d.publish()
+    resumed = DashboardSync(tmp_path, run, cfg)
+    resumed.publish()
+    assert len(calls) == 3
+    with pytest.raises(ConnectionError):
+        resumed.publish(force=True)
+    resumed.publish(force=True)
+    assert len(calls) == 4
+    assert json.loads((tmp_path/'dashboard_state.json').read_text())['needs_intervention']

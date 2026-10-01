@@ -198,6 +198,7 @@ class TrainingDriver:
         driver.latest_exact_resume_checkpoint = manifest.exact_resume_checkpoint
         driver._metric_history = {}
         driver.reference_adapter_dirs = dict(manifest.reference_adapter_dirs or {})
+        trainer_state = None
         if manifest.exact_resume_checkpoint is not None:
             exact_path = Path(manifest.exact_resume_checkpoint)
             exact_manifest = validate_exact_resume_checkpoint(
@@ -205,6 +206,12 @@ class TrainingDriver:
             )
             driver.start_step = int(exact_manifest["completed_step"])
             driver.current_adapter_dirs = checkpoint_adapter_dirs(exact_path)
+            import torch
+            trainer_state = torch.load(exact_path / "trainer_state.pt", map_location="cpu", weights_only=False)
+            if trainer_state["schema"] == "multi_adapter_trainer_state_v1":
+                driver._resume_adapter_names = tuple(trainer_state["adapter_names"])
+                if set(driver._resume_adapter_names) != set(driver.current_adapter_dirs):
+                    raise ValueError("Exact-resume adapter state and file inventory differ")
             driver._rollback_step_records_to(step=driver.start_step)
         else:
             if manifest.current_step > 0:
@@ -221,6 +228,7 @@ class TrainingDriver:
                     path=manifest.exact_resume_checkpoint,
                     trainer=driver.trainer,
                     run_config=config.to_dict(),
+                    trainer_state=trainer_state,
                 )
             if config.reference_kl_every > 0 and driver.reference_adapter_dirs:
                 driver.trainer.load_reference_adapters(adapter_dirs=driver.reference_adapter_dirs)
@@ -328,6 +336,8 @@ class TrainingDriver:
                 self._add_temporal_metrics(json.loads(line))
 
     def _adapter_names(self) -> tuple[str, ...]:
+        if hasattr(self, "_resume_adapter_names"):
+            return self._resume_adapter_names
         if self.config.rollout.mode == "debate":
             names = list(dict.fromkeys(self.config.resolved_debate_round_adapter_names()))
             judge = self.config.debate_judge_adapter

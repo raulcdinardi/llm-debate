@@ -237,6 +237,8 @@ class TrainRunConfig:
         )
 
     def __post_init__(self) -> None:
+        if not self.debate_r23_penalize_word_limit and self.debate_prompt_format != "qwen35_instruct_three_points":
+            raise ValueError("Word-limit penalty opt-out requires the Qwen three-point format")
         if self.train_keep_groups_together and self.rollout.mode == "debate":
             if self.uses_legacy_shared_projection() or (self.effective_debate_max_rounds() == 1 and self.debate_r1_reward == "judge"):
                 raise ValueError("Group-preserving optimizer batches require round-wise trajectory projection")

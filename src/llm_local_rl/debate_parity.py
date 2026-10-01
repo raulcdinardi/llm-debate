@@ -59,9 +59,15 @@ def audit_base_text_debate_format(*, text: str, round_num: int, contract: str = 
     to ensure the expected harness was used, but only sampled completion tokens
     receive advantages, so no reward is assigned to the prefill itself.
     """
-    if contract == "qwen35_instruct_three_points":
+    if contract in ("qwen35_instruct_three_points", "qwen35_instruct_three_points_structure_only"):
         from llm_local_rl.qwen35_instruct_format import audit_three_points
-        return audit_three_points(text=text, round_num=round_num)
+        audit = audit_three_points(text=text, round_num=round_num)
+        if contract.endswith("_structure_only"):
+            audit["failures"] = [failure for failure in audit["failures"]
+                                 if failure != "one_to_30_whitespace_words_per_point"]
+            audit["strict_ok"] = not audit["failures"]
+            audit["word_limit_ok"] = None
+        return audit
     if contract != "legacy_base":
         raise ValueError(f"Unknown debate format contract: {contract}")
     if round_num < 2:

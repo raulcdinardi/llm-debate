@@ -20,9 +20,16 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def config_fingerprint(config: dict[str, Any]) -> str:
+_NEUTRAL_DEFAULTS = {"python_optimization_config": None, "debate_r23_penalize_word_limit": True}
+
+
+def config_fingerprint(config: dict[str, Any], *, normalize_new_defaults: bool = True) -> str:
     # The new default is identical to historical single-update checkpoints.
     config = dict(config)
+    if normalize_new_defaults:
+        for key, value in _NEUTRAL_DEFAULTS.items():
+            if config.get(key, value) == value:
+                config.pop(key, None)
     if config.get("train_keep_groups_together") is False:
         del config["train_keep_groups_together"]
     # Newly explicit kernel defaults preserve historical dispatch. Non-default
@@ -42,6 +49,27 @@ def config_fingerprint(config: dict[str, Any]) -> str:
         del config["sampler_prefix_caching"]
     payload = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def compatible_config_fingerprints(config: dict[str, Any]) -> set[str]:
+    """Accept historical serialization of neutral defaults, never other edits.
+
+    Deployed checkpoints span pre-field and explicitly serialized-default eras.
+    Only fields equal to their neutral defaults may be present or absent.
+    """
+    from itertools import product
+    neutral = {key: value for key, value in _NEUTRAL_DEFAULTS.items()
+               if config.get(key, value) == value}
+    result = set()
+    for included in product((False, True), repeat=len(neutral)):
+        candidate = dict(config)
+        for (key, value), keep in zip(neutral.items(), included, strict=True):
+            if keep:
+                candidate[key] = value
+            else:
+                candidate.pop(key, None)
+        result.add(config_fingerprint(candidate, normalize_new_defaults=False))
+    return result
 
 
 def capture_rng_state() -> dict[str, Any]:
@@ -143,7 +171,7 @@ def validate_exact_resume_checkpoint(
     manifest = json.loads((path / "checkpoint_manifest.json").read_text())
     if manifest.get("schema") != CHECKPOINT_SCHEMA:
         raise ValueError(f"Unsupported checkpoint schema: {manifest.get('schema')!r}")
-    if run_config is not None and manifest["run_config_sha256"] != config_fingerprint(run_config):
+    if run_config is not None and manifest["run_config_sha256"] not in compatible_config_fingerprints(run_config):
         raise ValueError("Exact-resume checkpoint run configuration fingerprint mismatch.")
     for relative, expected in manifest["files"].items():
         candidate = path / relative
@@ -154,12 +182,15 @@ def validate_exact_resume_checkpoint(
     return manifest
 
 
-def load_exact_resume_checkpoint(*, path: str | Path, trainer: Any, run_config: dict[str, Any]) -> dict[str, Any]:
+def load_exact_resume_checkpoint(*, path: str | Path, trainer: Any, run_config: dict[str, Any],
+                                 trainer_state: dict[str, Any] | None = None) -> dict[str, Any]:
     import torch
 
     path = Path(path)
     manifest = validate_exact_resume_checkpoint(path, run_config=run_config)
-    trainer.load_training_state_dict(torch.load(path / "trainer_state.pt", map_location="cpu", weights_only=False))
+    if trainer_state is None:
+        trainer_state = torch.load(path / "trainer_state.pt", map_location="cpu", weights_only=False)
+    trainer.load_training_state_dict(trainer_state)
     restore_rng_state(torch.load(path / "rng_state.pt", map_location="cpu", weights_only=False))
     return manifest
 

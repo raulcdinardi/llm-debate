@@ -31,3 +31,11 @@ def test_history_aligns_late_scores_and_excludes_init_probe():
         SimpleNamespace(x="Step", y=["reward"]), SimpleNamespace(x="evaluation_step", y=["score"])])])
     assert source_rows(run, view) == [{"step": 1, "metrics": {"reward": 10, "score": 1}},
                                      {"step": 2, "metrics": {"reward": 20, "score": .5}}]
+
+
+def test_exact_resume_replay_keeps_latest_measurement():
+    rows=[{"train_step":1,"reward":1},{"train_step":2,"reward":2},
+          {"train_step":1,"reward":3},{"train_step":2,"reward":4}]
+    run=SimpleNamespace(scan_history=lambda **_:iter(rows))
+    view=SimpleNamespace(sections=[SimpleNamespace(panels=[SimpleNamespace(x="train_step",y=["reward"])])])
+    assert source_rows(run,view)==[{"step":1,"metrics":{"reward":3}}, {"step":2,"metrics":{"reward":4}}]

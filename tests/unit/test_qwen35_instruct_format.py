@@ -83,6 +83,7 @@ def test_tiny_native_qwen_loading_paired_ce_and_selective_head(tmp_path, monkeyp
         adapter_names=('solution','debate','judge','judge_shadow'),device='cpu',torch_dtype='float32',
         lora_rank=2,target_modules=('q_proj','v_proj','in_proj_qkv','in_proj_z','out_proj','gate_proj'),
         train_logprob_backend='selective_lm_head',gradient_checkpointing=False,on_policy_logprob_check=True))
+    assert trainer.model.config.text_config.use_cache is False
     trainer.initialize_shadow_judge(seed=17,std=.02)
     trainer.set_adapter('judge');trainer.model.eval()
     x=dict(input_ids=torch.tensor([[2,3,4]]),attention_mask=torch.ones((1,3),dtype=torch.long))

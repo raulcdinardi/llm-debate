@@ -540,6 +540,8 @@ def test_soft_judge_r1_preserves_task_baseline_and_scales_only_adjustment(js: fl
 
 def test_soft_judge_r23_is_exactly_zero_sum_even_when_hard_labels_disagree() -> None:
     debate = _make_debate(judge_raw_response=_soft_judge_audit(0.5, js=0.5))
+    for trajectory in (debate.trajectory_a, debate.trajectory_b):
+        trajectory.transitions = trajectory.transitions[:2]
     split = assemble_split_train_examples(
         debates=[debate],
         num_rounds=2,

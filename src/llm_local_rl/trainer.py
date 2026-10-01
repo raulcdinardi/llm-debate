@@ -911,6 +911,9 @@ class MultiAdapterTrainer:
             torch_dtype=_resolve_dtype(self.config.torch_dtype),
         )
         base_model.config.use_cache = False
+        # Native multimodal Qwen delegates decoder settings to text_config.
+        if hasattr(base_model.config, "text_config"):
+            base_model.config.text_config.use_cache = False
         if self.config.train_gdn_backend == "fla":
             if torch.device(self.config.device).type != "cuda":
                 raise ValueError("train_gdn_backend='fla' requires CUDA training")

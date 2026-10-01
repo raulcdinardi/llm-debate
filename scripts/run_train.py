@@ -55,6 +55,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "countdown_code",
             "constrained_writing",
             "mmlu_pro_pairwise",
+            "mixed_label_pairwise",
+            "python_optimization",
         ],
     )
     parser.add_argument("--mode", default="debate", choices=["single_turn", "debate"])
@@ -82,6 +84,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--quality-topic-contains", default="Science fiction")
     parser.add_argument("--quality-download", action="store_true")
     parser.add_argument("--mmlu-pro-data-path", default=None)
+    parser.add_argument("--python-optimization-config", default=None)
+    parser.add_argument("--debate-r23-penalize-word-limit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--thinking-mode", default="default", choices=["default", "no_think", "force_think"])
     parser.add_argument("--advantage-mode", default="zscore", choices=["identity", "centered_mean", "zscore"])
     parser.add_argument("--ppo-clip-epsilon", type=float, default=0.2)
@@ -462,6 +466,8 @@ def main() -> int:
                 quality_topic_contains=args.quality_topic_contains,
                 quality_download=args.quality_download,
                 mmlu_pro_data_path=args.mmlu_pro_data_path,
+                python_optimization_config=args.python_optimization_config,
+                debate_r23_penalize_word_limit=args.debate_r23_penalize_word_limit,
                 thinking_mode=args.thinking_mode,
                 advantage_mode=args.advantage_mode,
                 ppo_clip_epsilon=args.ppo_clip_epsilon,

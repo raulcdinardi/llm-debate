@@ -37,8 +37,8 @@ def source_rows(run, view):
             point = by_step.setdefault(int(step), {})
             for metric in metrics:
                 if metric in row and row[metric] is not None:
-                    if metric in point and point[metric] != row[metric]:
-                        raise ValueError(f"Conflicting measurements at step {step}: {metric}")
+                    # Exact resume may replay steps after the last checkpoint.
+                    # History is append-only; latest logged value is canonical.
                     point[metric] = row[metric]
     return [{"step": step, "metrics": values} for step, values in sorted(by_step.items()) if values]
 
