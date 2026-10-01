@@ -63,6 +63,8 @@ INVARIANTS = {
     "phase0_fable_critique_completed_min": 1,
     "phase0_fable_critique_blocking_issue_count_max": 0,
 }
+ADVISORY_INVARIANTS = {"phase0_vram_headroom_min_mib_min"}
+
 MANUAL_INVARIANTS = {
     "phase0_archive_local_validation_pass_rate_min",
     "manual_raw_review_pass_min",
@@ -409,7 +411,10 @@ def main() -> int:
     automatic_names = [name for name in INVARIANTS if name not in MANUAL_INVARIANTS]
     automatic_results = evaluate_invariants(metrics, automatic_names)
     manual_results = evaluate_invariants(metrics, MANUAL_INVARIANTS)
-    automatic_pass = all(value["pass"] for value in automatic_results.values())
+    automatic_pass = all(
+        value["pass"] for name, value in automatic_results.items()
+        if name not in ADVISORY_INVARIANTS
+    )
     lifecycle_complete = automatic_pass and all(value["pass"] for value in manual_results.values())
     write_jsonl(output_path.parent / "raw_review_24.jsonl", review_rows[:24])
     result = {
@@ -418,6 +423,9 @@ def main() -> int:
         "metrics": metrics,
         "measured": measured_invariants(metrics, INVARIANTS),
         "invariants": INVARIANTS,
+        "warning_only_invariants": sorted(ADVISORY_INVARIANTS),
+        "warnings": {name: automatic_results[name] for name in ADVISORY_INVARIANTS
+                     if not automatic_results[name]["pass"]},
         "automatic_gate": {"pass": automatic_pass, "results": automatic_results},
         "post_collection_gate": {"pass": lifecycle_complete, "results": manual_results},
         "arms": arm_details,

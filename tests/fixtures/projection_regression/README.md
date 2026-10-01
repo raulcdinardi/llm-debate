@@ -18,3 +18,12 @@ the recorded test invocation uses its explicit current name `soft_judge_raw`.
 No scoring API or model generation was used to create these synthetic
 regression inputs. These fixtures establish projection compatibility for the
 recorded cases, not GPU numerical parity for an entire run.
+
+2026-09-10 correction (SID-20260910-shared-actor): the synthetic helper previously
+left unoffset R1/R2 tokens in later prompts and used Agent A's R3 history for
+Agent B's R4. Corrected the input histories to exact sampled-token prefixes,
+then regenerated these fixtures in isolated Python processes from the same
+three unmodified Git revisions (`git archive <revision> src prompts`). Verified
+that only `input_ids`/`target_ids` changed: every mask, behavior logprob and
+advantage is identical to the previous archived expectation. The implementation
+now rejects equal-length but mismatching histories instead of silently merging.

@@ -135,7 +135,7 @@ class VllmRuntimeConfig:
     gpu_memory_utilization: float = 0.55
     max_model_len: int = 64
     max_num_seqs: int | None = None
-    enforce_eager: bool = True
+    enforce_eager: bool = False
     enable_sleep_mode: bool = False
     enable_prefix_caching: bool | None = None
     max_lora_rank: int = 32

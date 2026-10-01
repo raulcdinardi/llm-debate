@@ -99,3 +99,13 @@ def test_tiny_native_qwen_loading_paired_ce_and_selective_head(tmp_path, monkeyp
         assert metrics['supervised_label_nll'] > 0
         assert any(not torch.equal(before[n],p) for n,p in trainer.model.named_parameters() if f'.{name}.' in n)
         assert all(torch.equal(before[n],p) for n,p in trainer.model.named_parameters() if f'.{name}.' not in n)
+
+
+def test_structure_only_preserves_word_diagnostic_and_structure_penalty():
+    from llm_local_rl.debate_parity import audit_base_text_debate_format
+    text = "1) " + "word " * 31 + "\n2) A claim.\n3) Another claim.\nCONCLUDED"
+    strict = audit_base_text_debate_format(text=text, round_num=2, contract="qwen35_instruct_three_points")
+    structural = audit_base_text_debate_format(text=text, round_num=2, contract="qwen35_instruct_three_points_structure_only")
+    assert not strict["strict_ok"]
+    assert structural["strict_ok"] and not structural["word_limit_ok"]
+    assert not audit_base_text_debate_format(text=text.replace("3)", "4)"), round_num=2, contract="qwen35_instruct_three_points_structure_only")["strict_ok"]

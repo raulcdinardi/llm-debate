@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import hashlib
 import math
 import re
 from typing import Any, Callable, Literal
 
 from llm_local_rl.prompts import load_prompt
 from llm_local_rl.types import TrainExample
+from llm_local_rl.trajectory_batching import merge_trajectory_examples
 
 Verdict = Literal["A", "B", "INVALID"]
 
@@ -554,9 +556,9 @@ def _merge_transition_pair_with_adv_values(
         raise ValueError(f"Non-zero R{second.round_num} advantage with zero completion tokens.")
 
     first_full_len = len(first.prompt_tokens) + len(first.completion_tokens)
-    if len(second.prompt_tokens) < first_full_len:
+    if second.prompt_tokens[:first_full_len] != first.prompt_tokens + first.completion_tokens:
         raise ValueError(
-            f"R{second.round_num} prompt shorter than R{first.round_num} history; "
+            f"R{second.round_num} prompt does not extend exact R{first.round_num} token history; "
             "extension property violated."
         )
     continuation_tokens = second.prompt_tokens[first_full_len:]
@@ -619,9 +621,9 @@ def _merge_transition_sequence_with_adv_values(
             )
         if previous is not None:
             previous_full_len = len(previous.prompt_tokens) + len(previous.completion_tokens)
-            if len(transition.prompt_tokens) < previous_full_len:
+            if transition.prompt_tokens[:previous_full_len] != previous.prompt_tokens + previous.completion_tokens:
                 raise ValueError(
-                    f"R{transition.round_num} prompt shorter than R{previous.round_num} history; "
+                    f"R{transition.round_num} prompt does not extend exact R{previous.round_num} token history; "
                     "extension property violated."
                 )
             continuation = transition.prompt_tokens[previous_full_len:]
@@ -1312,6 +1314,20 @@ def assemble_training_data_by_mode(
     raise ValueError(f"Unsupported num_rounds={num_rounds!r}")
 
 
+def _debate_group_key(debate: DebateResult) -> str:
+    instance_id_a = debate.trajectory_a.metrics.get("instance_id")
+    instance_id_b = debate.trajectory_b.metrics.get("instance_id")
+    if instance_id_a is not None and instance_id_b is not None and instance_id_a != instance_id_b:
+        raise ValueError(f"Debate trajectories disagree on instance_id: A={instance_id_a!r}, B={instance_id_b!r}")
+    instance_id = instance_id_a if instance_id_a is not None else instance_id_b
+    return debate.question if instance_id is None else f"{debate.question}\0{instance_id}"
+
+
+def _optimizer_group_metadata(group_key: str) -> dict[str, str]:
+    # Full normalization identity, not the truncated question in display metadata.
+    return {"optimizer_group_id": hashlib.sha256(group_key.encode()).hexdigest()}
+
+
 def assemble_split_train_examples(
     *,
     debates: list[DebateResult],
@@ -1328,6 +1344,7 @@ def assemble_split_train_examples(
     r23_format_contract: str = "legacy_base",
     pointwise_reward_map: dict[int, float] | None = None,
     r23_advantage_scope: Literal["per_round", "merged_r23"] = "per_round",
+    keep_optimizer_groups: bool = False,
 ) -> dict[str, list[TrainExample]]:
     if not round_adapter_names:
         raise ValueError("Need at least one round adapter name")
@@ -1371,6 +1388,8 @@ def assemble_split_train_examples(
 
 
     if num_rounds == 1 and r1_reward_mode == "judge":
+        if keep_optimizer_groups:
+            raise ValueError("Group-preserving batches require the round-wise trajectory projection")
         result = assemble_training_data_r1_only_compare(
             debates,
             r1_reward=float(r23_constant),
@@ -1390,10 +1409,6 @@ def assemble_split_train_examples(
 
     selected_r1_trajectory_ids: set[int] | None = None
     if r1_reward_mode == "judge_rejection_task":
-        if round_adapter_names[0] in round_adapter_names[1:num_rounds]:
-            raise ValueError(
-                "judge_rejection_task requires an R1 adapter distinct from all later-round adapters"
-            )
         selected_r1_trajectory_ids = set()
 
     groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
@@ -1469,17 +1484,10 @@ def assemble_split_train_examples(
         else:
             r1_a = 0.0
             r1_b = 0.0
-        instance_id_a = traj_a.metrics.get("instance_id")
-        instance_id_b = traj_b.metrics.get("instance_id")
-        if instance_id_a is not None and instance_id_b is not None and instance_id_a != instance_id_b:
-            raise ValueError(
-                "Debate trajectories disagree on instance_id: "
-                f"A={instance_id_a!r}, B={instance_id_b!r}"
-            )
-        instance_id = instance_id_a if instance_id_a is not None else instance_id_b
-        group_key = debate.question if instance_id is None else f"{debate.question}\0{instance_id}"
+        group_key = _debate_group_key(debate)
         groups.setdefault(group_key, []).extend([(traj_a, debate, float(r1_a)), (traj_b, debate, float(r1_b))])
 
+    projected_trajectories: list[tuple[str, dict[str, list[TrainExample]]]] = []
     for group_index, (question, group) in enumerate(groups.items()):
         _ = question
         selected_group = [
@@ -1517,7 +1525,14 @@ def assemble_split_train_examples(
             prompt_grpo_std = 0.0
 
         for traj, debate, r1_reward in group:
+            # Reward normalization above remains across the original prompt
+            # group. Only physical training rows are coalesced, within one
+            # agent trajectory; repeated questions must never be deduplicated.
+            grouped = {}
+            projected_trajectories.append((question, grouped))
             r1_selected = selected_r1_trajectory_ids is None or id(traj) in selected_r1_trajectory_ids
+            if isinstance(traj.transitions[0].raw_response, dict) and traj.transitions[0].raw_response.get("fixed_r1"):
+                r1_selected = False
             if r1_selected:
                 t1 = traj.transitions[0]
                 if len(t1.completion_tokens) == 0:
@@ -1638,7 +1653,7 @@ def assemble_split_train_examples(
                     advantages=r1_advantages,
                     metadata=r1_metadata,
                 )
-            if num_rounds >= 4 or len(traj.transitions) < num_rounds:
+            if num_rounds == 2 or num_rounds >= 4 or len(traj.transitions) < num_rounds:
                 if len(traj.transitions) > num_rounds:
                     raise ValueError(
                         f"Trajectory has {len(traj.transitions)} rounds, above configured maximum {num_rounds}"
@@ -1973,6 +1988,13 @@ def assemble_split_train_examples(
                         "r23_reliability_applied": False if r23_reward_mode == "soft_judge_prompt_grpo" else None,
                     },
                 )
+    grouped = {}
+    for group_key, trajectory in projected_trajectories:
+        for adapter_name, examples in trajectory.items():
+            example = merge_trajectory_examples(examples)
+            if keep_optimizer_groups:
+                example = replace(example, metadata={**example.metadata, **_optimizer_group_metadata(group_key)})
+            grouped.setdefault(adapter_name, []).append(example)
     return grouped
 
 
@@ -1981,6 +2003,7 @@ def assemble_judge_coherence_grpo_examples(
     *,
     adapter_name: str = "judge",
     reward_mode: str = "coherence",
+    keep_optimizer_groups: bool = False,
 ) -> tuple[list[TrainExample], dict[str, float | int | str]]:
     """Build one global judge-GRPO group from both transcript orderings.
 
@@ -2084,6 +2107,7 @@ def assemble_judge_coherence_grpo_examples(
                 "judge_coherence_reward": reward if reward_mode == "coherence" else None,
                 "behavior_policy_allowed_token_ids": list(allowed_token_ids),
                 "judge_grpo_group_index": 0,
+                **({"optimizer_group_id": "judge_grpo_global"} if keep_optimizer_groups else {}),
                 "judge_grpo_group_size": len(turns),
                 "judge_grpo_reward_mean": reward_mean,
                 "judge_grpo_reward_std": reward_std,
@@ -2115,6 +2139,7 @@ def assemble_judge_supervised_label_examples(
     debates: list[DebateResult],
     *,
     adapter_name: str = "judge",
+    keep_optimizer_groups: bool = False,
 ) -> tuple[list[TrainExample], dict[str, float | int | str]]:
     """Build paired examples for direct label CE plus differentiable JS coherence.
 
@@ -2189,6 +2214,7 @@ def assemble_judge_supervised_label_examples(
                 completion_advantages=[0.0],
                 metadata={
                     "reason": "judge_bidirectional_supervised_label_ce_js",
+                    **(_optimizer_group_metadata(_debate_group_key(debate)) if keep_optimizer_groups else {}),
                     "training_objective": "supervised_label_ce_js",
                     "question": debate.question[:100],
                     "judge_coherence_pair_id": f"{pair_index}:{debate.question[:100]}",
@@ -2231,6 +2257,7 @@ def assemble_judge_unsupervised_js_examples(
     debates: list[DebateResult],
     *,
     adapter_name: str = "judge",
+    keep_optimizer_groups: bool = False,
 ) -> tuple[list[TrainExample], dict[str, float | int | str]]:
     """Build paired referent probes for differentiable JS-only judge training.
 
@@ -2297,6 +2324,7 @@ def assemble_judge_unsupervised_js_examples(
                 metadata={
                     "reason": "judge_bidirectional_unsupervised_js",
                     "training_objective": "unsupervised_js",
+                    **(_optimizer_group_metadata(_debate_group_key(debate)) if keep_optimizer_groups else {}),
                     "question": debate.question[:100],
                     "judge_coherence_pair_id": f"{pair_index}:{debate.question[:100]}",
                     "judge_coherence_pair_member": order,
@@ -2335,6 +2363,18 @@ def summarize_judge_rejection_r1_projection(
     r1_examples: list[TrainExample],
     debates: list[DebateResult],
 ) -> dict[str, int]:
+    # A shared actor row can contain winner R1 and later-round objectives.
+    # Count the R1 projection, not its container or the later advantages.
+    r1_only = []
+    for example in r1_examples:
+        if "round_projections" in example.metadata:
+            for projection in example.metadata["round_projections"]:
+                if projection.get("round_num") == 1:
+                    r1_only.append(replace(example, metadata=projection,
+                                           advantages=[projection["r1_zscore"]]))
+        elif example.metadata.get("round_num") == 1:
+            r1_only.append(example)
+    r1_examples = r1_only
     valid_verdict_count = sum(debate.verdict in ("A", "B") for debate in debates)
     winner_r1_example_count = 0
     loser_r1_example_count = 0

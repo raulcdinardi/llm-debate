@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import gzip
+import fcntl
 import hashlib
 import json
 import math
@@ -13,6 +14,8 @@ import threading
 import time
 from typing import Any
 import shutil
+import secrets
+from llm_local_rl.judge_accuracy import judge_accuracy_metrics
 
 
 def _numeric(value: Any) -> bool:
@@ -43,6 +46,7 @@ def flatten_step_metrics(record: dict[str, Any]) -> dict[str, float]:
     for key, value in record.get("rollout_metrics", {}).items():
         if _numeric(value):
             out[f"rollout/{key}"] = float(value)
+    out.update(judge_accuracy_metrics(record))
     return out
 
 
@@ -72,6 +76,12 @@ class RunObservability:
         self.failures_path = self.state_dir / "wandb_failures.jsonl"
         self.run = None
         self._wandb = None
+        self._log_lock = threading.RLock()
+        self._score_stop = threading.Event()
+        self._score_worker = None
+        self._writer_lock = None
+        self._score_inbox = None
+        self._dashboard = None
         self._queue: Queue[tuple[str, Path, dict[str, Any]] | None] = Queue()
         self._worker: threading.Thread | None = None
         if settings.enabled:
@@ -84,16 +94,22 @@ class RunObservability:
     def _start_wandb(self, *, config: dict[str, Any]) -> None:
         try:
             import wandb
+            from llm_local_rl.score_sync import ScoreInbox, define_axes
+            from llm_local_rl.dashboard_sync import metadata, DashboardSync, default_name
+
+            self._writer_lock = (self.state_dir / "wandb_writer.lock").open("a")
+            fcntl.flock(self._writer_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            (self.state_dir / "wandb_finished").unlink(missing_ok=True)
 
             run_id_path = self.state_dir / "wandb_run_id.txt"
-            run_id = run_id_path.read_text().strip() if run_id_path.exists() else wandb.util.generate_id()
+            run_id = run_id_path.read_text().strip() if run_id_path.exists() else secrets.token_hex(4)
             run_id_path.write_text(run_id + "\n")
             self._wandb = wandb
             self.run = wandb.init(
                 project=self.settings.project,
                 entity=self.settings.entity,
                 group=self.settings.group,
-                name=self.settings.name,
+                name=default_name(config, self.output_dir, self.settings.name),
                 id=run_id,
                 resume="allow",
                 mode=self.settings.mode,
@@ -103,17 +119,56 @@ class RunObservability:
             (self.state_dir / "wandb_run_url.txt").write_text(
                 str(self.run.url or "") + "\n"
             )
+            define_axes(self.run)
+            meta = metadata(config, self.output_dir)
+            self.run.config.update(meta)
+            if self.settings.mode == "online":
+                self._dashboard = DashboardSync(self.state_dir, self.run, meta)
+            self._score_inbox = ScoreInbox(self.state_dir, run_id)
+            self._score_worker = threading.Thread(target=self._score_loop, name="wandb-scores", daemon=True)
+            self._score_worker.start()
             self._worker = threading.Thread(target=self._artifact_worker, name="wandb-artifacts", daemon=True)
             self._worker.start()
         except BaseException as exc:
             self._failure("init", exc)
+            if self.run is not None:
+                try:
+                    self.run.finish()
+                except Exception:
+                    pass
             self.run = None
+            if self._writer_lock is not None:
+                self._writer_lock.close()
+
+    def _drain_scores(self):
+        if self.run is not None and self._score_inbox is not None:
+            try:
+                with self._log_lock:
+                    self._score_inbox.drain(self.run, on_metrics=self._dashboard.observe if self._dashboard else None)
+            except Exception as exc:
+                self._failure("score_ingestion", exc)
+
+    def _score_loop(self):
+        while not self._score_stop.wait(5):
+            self._drain_scores()
+            self._publish_dashboard()
+
+    def _publish_dashboard(self, force=False):
+        if self._dashboard is not None:
+            try:
+                self._dashboard.publish(force=force)
+            except Exception as exc:
+                self._failure("dashboard_publish", exc)
 
     def log_step(self, record: dict[str, Any]) -> None:
         if self.run is None:
             return
         try:
-            self.run.log(flatten_step_metrics(record), step=int(record["step"]), commit=True)
+            with self._log_lock:
+                metrics = flatten_step_metrics(record)
+                self.run.log({"train_step": int(record["step"]), **metrics}, commit=True)
+                if self._dashboard:
+                    self._dashboard.observe(metrics)
         except BaseException as exc:
             self._failure("log_step", exc)
 
@@ -196,7 +251,8 @@ class RunObservability:
             return
         try:
             table = self._wandb.Table(columns=["step", "sample_id", "reward", "sample_json"], data=rows)
-            self.run.log({f"rollouts/table_ending_{step:06d}": table}, step=step, commit=False)
+            with self._log_lock:
+                self.run.log({"train_step": step, "rollouts/samples": table}, commit=True)
         except BaseException as exc:
             self._failure("log_rollout_table", exc)
 
@@ -230,6 +286,14 @@ class RunObservability:
                 self._queue.task_done()
 
     def finish(self) -> None:
+        self._score_stop.set()
+        if self._score_worker is not None:
+            self._score_worker.join(timeout=120)
+            if self._score_worker.is_alive():
+                self._failure("finish_score_timeout", TimeoutError("Score publisher still active"))
+                return
+        self._drain_scores()
+        self._publish_dashboard(force=True)
         if self._worker is not None:
             deadline = time.monotonic() + 1800.0
             while self._queue.unfinished_tasks and time.monotonic() < deadline:
@@ -254,6 +318,8 @@ class RunObservability:
             try:
                 self.run.finish()
                 (self.state_dir / "wandb_finished").write_text("finished\n")
+                if self._writer_lock is not None:
+                    self._writer_lock.close()
             except BaseException as exc:
                 self._failure("finish", exc)
 

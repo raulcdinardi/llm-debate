@@ -436,7 +436,7 @@ _HARNESSES: dict[JudgeHarnessId, JudgeHarnessSpec] = {
     QWEN35_CHAT_SINGLE_TOKEN_V1: JudgeHarnessSpec(
         harness_id=QWEN35_CHAT_SINGLE_TOKEN_V1, serialization="chat",
         objective="select_best_original_response", output_contract="single_token_a_or_b",
-        assistant_prefill="<think>\n\n</think>\n\n", default_max_tokens=1, required_rounds=3,
+        assistant_prefill="<think>\n\n</think>\n\n", default_max_tokens=1, required_rounds=2,
         render=_render_qwen35_chat_single_token, parse_verdict=extract_single_token_verdict,
         required_phrases=("Do not reward confidence, rhetoric, or debate skill by itself.",),
         forbidden_phrases=("more convincing case", "rebuttal effectiveness"),

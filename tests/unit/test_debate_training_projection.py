@@ -206,8 +206,8 @@ def _make_debate(
         agent="A",
         transitions=[
             Transition(prompt_tokens=[1, 2], completion_tokens=[3 + token_offset, 4 + token_offset], completion_logprobs=[-0.1, -0.2], round_num=1),
-            Transition(prompt_tokens=[1, 2, 3, 4, 5], completion_tokens=[6 + token_offset, 7 + token_offset], completion_logprobs=[-0.3, -0.4], round_num=2),
-            Transition(prompt_tokens=[1, 2, 3, 4, 5, 6, 7, 8], completion_tokens=[9 + token_offset, 10 + token_offset], completion_logprobs=[-0.5, -0.6], round_num=3),
+            Transition(prompt_tokens=[1, 2, 3 + token_offset, 4 + token_offset, 5], completion_tokens=[6 + token_offset, 7 + token_offset], completion_logprobs=[-0.3, -0.4], round_num=2),
+            Transition(prompt_tokens=[1, 2, 3 + token_offset, 4 + token_offset, 5, 6 + token_offset, 7 + token_offset, 8], completion_tokens=[9 + token_offset, 10 + token_offset], completion_logprobs=[-0.5, -0.6], round_num=3),
         ],
         frozen_solution="A",
         metrics={"task_reward": reward_a, "instance_id": instance_id},
@@ -216,8 +216,8 @@ def _make_debate(
         agent="B",
         transitions=[
             Transition(prompt_tokens=[1, 2], completion_tokens=[11 + token_offset, 12 + token_offset], completion_logprobs=[-0.1, -0.2], round_num=1),
-            Transition(prompt_tokens=[1, 2, 11, 12, 13], completion_tokens=[14 + token_offset, 15 + token_offset], completion_logprobs=[-0.3, -0.4], round_num=2),
-            Transition(prompt_tokens=[1, 2, 11, 12, 13, 14, 15, 16], completion_tokens=[17 + token_offset, 18 + token_offset], completion_logprobs=[-0.5, -0.6], round_num=3),
+            Transition(prompt_tokens=[1, 2, 11 + token_offset, 12 + token_offset, 13], completion_tokens=[14 + token_offset, 15 + token_offset], completion_logprobs=[-0.3, -0.4], round_num=2),
+            Transition(prompt_tokens=[1, 2, 11 + token_offset, 12 + token_offset, 13, 14 + token_offset, 15 + token_offset, 16], completion_tokens=[17 + token_offset, 18 + token_offset], completion_logprobs=[-0.5, -0.6], round_num=3),
         ],
         frozen_solution="B",
         metrics={"task_reward": reward_b, "instance_id": instance_id},
@@ -242,20 +242,21 @@ def _formatted_round(round_num: int) -> str:
     return header + " first\n2) second\n3) third\nCONCLUDED"
 
 
-def test_shadow_projection_preserves_active_rewards_and_gold_pairs():
+@pytest.mark.parametrize("layout, actor", [("split", "debate"), ("shared", "shared")])
+def test_shadow_projection_preserves_active_rewards_and_gold_pairs(layout, actor):
     import copy
     from llm_local_rl.config import TrainRunConfig
     from llm_local_rl.driver import TrainingDriver
 
     config = TrainRunConfig(
-        model_path="/unused", output_dir="/unused", adapter_layout="split",
+        model_path="/unused", output_dir="/unused", adapter_layout=layout,
         debate_judge_adapter="judge", debate_judge_harness="constitution_single_token_v1",
         debate_judge_bidirectional=True, debate_judge_constrain_single_token=True,
         debate_judge_score_mode="order_sym_soft_logit",
         judge_label_token_contract="lfm25_openbookqa_spaced_ab_v1",
         train_judge=True, judge_training_objective="supervised_label_ce_js",
         judge_coherence_js_weight=0., debate_r1_reward="none", debate_r23_reward="soft_judge_raw",
-        train_adapter_names=("debate", "judge"),
+        train_adapter_names=(actor, "judge"),
     )
     debate = _make_debate(judge_raw_response={
         "bidirectional_judge": True, "order_invariant": False, "soft_judge": True,
@@ -273,7 +274,7 @@ def test_shadow_projection_preserves_active_rewards_and_gold_pairs():
     driver._debate_runtime = lambda: None
     baseline, record = driver._group_debate_examples(debates=[debate], step_seed=17)
     driver.config = replace(config, train_shadow_judge=True, shadow_judge_init_seed=17,
-                            shadow_judge_init_std=.03, train_adapter_names=("debate", "judge", "judge_shadow"))
+                            shadow_judge_init_std=.03, train_adapter_names=(actor, "judge", "judge_shadow"))
     paired, paired_record = driver._group_debate_examples(debates=[debate], step_seed=17)
     assert debate == original
     assert record == paired_record
@@ -288,7 +289,7 @@ def _append_fourth_round(debate: DebateResult) -> DebateResult:
     for trajectory, offset in ((debate.trajectory_a, 0), (debate.trajectory_b, 20)):
         trajectory.transitions.append(
             Transition(
-                prompt_tokens=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                prompt_tokens=trajectory.transitions[-1].prompt_tokens + trajectory.transitions[-1].completion_tokens,
                 completion_tokens=[21 + offset, 22 + offset],
                 completion_logprobs=[-0.7, -0.8],
                 round_num=4,
@@ -982,18 +983,24 @@ def test_judge_rejection_task_zeroes_equal_rewards_and_drops_invalid_debates() -
     assert len(split["debate"]) == 4
 
 
-def test_judge_rejection_task_requires_distinct_r1_and_debate_adapters() -> None:
-    with pytest.raises(ValueError, match="R1 adapter distinct"):
-        assemble_split_train_examples(
-            debates=[_make_debate()],
-            num_rounds=3,
-            round_adapter_names=("solution", "solution", "solution"),
-            r1_reward_mode="judge_rejection_task",
-            r23_reward_mode="constant",
-            r23_constant=0.5,
-            r23_symmetric=True,
-            task_reward_fn=lambda traj, _debate: float(traj.metrics["task_reward"]),
-        )
+def test_judge_rejection_shared_actor_keeps_only_winner_r1_mask() -> None:
+    debates = [_make_debate()]
+    rows = assemble_split_train_examples(
+        debates=debates, num_rounds=3,
+        round_adapter_names=("debate",) * 3,
+        r1_reward_mode="judge_rejection_task", r23_reward_mode="constant",
+        r23_constant=0.5, r23_symmetric=True,
+        task_reward_fn=lambda traj, _: float(traj.metrics["task_reward"]),
+    )["debate"]
+    assert len(rows) == 2
+    assert sum(rows[0].behavior_logprob_mask) == 6
+    assert sum(rows[1].behavior_logprob_mask) == 4
+    assert rows[1].behavior_logprob_mask[1:3] == [0, 0]
+    summary = summarize_judge_rejection_r1_projection(r1_examples=rows, debates=debates)
+    assert summary["emitted_r1_example_count"] == 1
+    assert summary["winner_r1_example_count"] == 1
+    assert summary["loser_r1_example_count"] == 0
+    assert summary["zero_advantage_r1_example_count"] == 1
 
 
 def test_judge_rejection_projection_summary_measures_emitted_losers() -> None:
@@ -1070,3 +1077,123 @@ def test_merged_reward_modes_preserve_mixed_depth_signals(mode, expected):
     assert [sum(e.advantages) for e in examples] == pytest.approx(expected)
     if mode == "soft_judge_prompt_grpo":
         assert all(e.metadata["r23_reliability_applied"] is False for e in examples)
+
+
+@pytest.mark.parametrize("rounds", [1, 2, 3, 4])
+@pytest.mark.parametrize("scope", ["per_round", "merged_r23"])
+def test_shared_actor_unions_round_masks_without_changing_advantages(rounds, scope):
+    debate = _make_debate()
+    if rounds == 4:
+        debate = _append_fourth_round(debate)
+    for trajectory in (debate.trajectory_a, debate.trajectory_b):
+        trajectory.transitions[:] = trajectory.transitions[:rounds]
+    kwargs = dict(
+        debates=[debate], num_rounds=rounds,
+        r1_reward_mode="task", r23_reward_mode="constant",
+        r23_constant=.7, r23_symmetric=True, r23_advantage_scope=scope,
+        task_reward_fn=lambda trajectory, _: trajectory.metrics["task_reward"],
+    )
+    separate = assemble_split_train_examples(
+        **kwargs, round_adapter_names=("solution",) + ("debate",) * (rounds - 1),
+    )
+    merged = assemble_split_train_examples(**kwargs, round_adapter_names=("debate",) * rounds)
+    assert set(merged) == {"debate"}
+    assert len(merged["debate"]) == 2
+    for trajectory, row in zip((debate.trajectory_a, debate.trajectory_b), merged["debate"], strict=True):
+        last = trajectory.transitions[-1]
+        full = last.prompt_tokens + last.completion_tokens
+        assert row.input_ids == full[:-1]
+        assert row.target_ids == full[1:]
+        expected = {}
+        for adapter_rows in separate.values():
+            for old in adapter_rows:
+                if old.metadata["agent"] != trajectory.agent:
+                    continue
+                for index, sampled in enumerate(old.behavior_logprob_mask):
+                    if sampled:
+                        assert index not in expected
+                        expected[index] = (old.old_logprobs[index], old.advantages[index])
+        assert sum(row.behavior_logprob_mask) == sum(len(t.completion_tokens) for t in trajectory.transitions)
+        assert {i: (row.old_logprobs[i], row.advantages[i]) for i, mask in enumerate(row.behavior_logprob_mask) if mask} == expected
+        if rounds > 1:
+            assert row.loss_mask == row.behavior_logprob_mask
+
+
+def test_shared_actor_does_not_merge_different_debates_or_train_fixed_r1():
+    debates = [_make_debate(), _make_debate()]
+    for debate in debates:
+        for trajectory in (debate.trajectory_a, debate.trajectory_b):
+            trajectory.transitions[0].raw_response = {"fixed_r1": True, "sampled": False}
+    rows = assemble_split_train_examples(
+        debates=debates, num_rounds=3, round_adapter_names=("debate",) * 3,
+        r1_reward_mode="none", r23_reward_mode="constant", r23_constant=1.,
+        r23_symmetric=True, task_reward_fn=lambda t, _: t.metrics["task_reward"],
+    )["debate"]
+    assert len(rows) == 4
+    assert all(sum(row.behavior_logprob_mask) == 4 for row in rows)
+    assert all(row.behavior_logprob_mask[1:3] == [0, 0] for row in rows)
+
+
+def test_shared_actor_rejects_changed_history_even_at_same_length():
+    debate = _make_debate()
+    debate.trajectory_a.transitions[1].prompt_tokens[0] = 999
+    with pytest.raises(ValueError, match="exact.*(history|prefix)"):
+        assemble_split_train_examples(
+            debates=[debate], num_rounds=3, round_adapter_names=("debate",) * 3,
+            r1_reward_mode="task", r23_reward_mode="constant", r23_constant=1.,
+            r23_symmetric=True, task_reward_fn=lambda t, _: t.metrics["task_reward"],
+        )
+
+
+def test_reused_actor_across_intervening_adapter_has_disjoint_masks():
+    rows = assemble_split_train_examples(
+        debates=[_make_debate()], num_rounds=3,
+        round_adapter_names=("debate", "solution", "debate"),
+        r1_reward_mode="task", r23_reward_mode="constant", r23_constant=1.,
+        r23_symmetric=True, task_reward_fn=lambda t, _: t.metrics["task_reward"],
+    )
+    assert len(rows["debate"]) == len(rows["solution"]) == 2
+    for actor, other in zip(rows["debate"], rows["solution"], strict=True):
+        assert actor.metadata["round_nums"] == [1, 3]
+        assert sum(actor.behavior_logprob_mask) == 4
+        assert sum(other.behavior_logprob_mask) == 2
+        assert not any(a and b for a, b in zip(actor.behavior_logprob_mask, other.behavior_logprob_mask))
+
+
+@pytest.mark.parametrize("group_count", [8, 64])
+def test_fixed_r1_actor_and_judge_keep_the_same_complete_groups(group_count):
+    from collections import Counter
+    from llm_local_rl.optimizer_batching import pack_optimizer_groups
+    debates = []
+    for i in range(64):
+        turns = _judge_turns()
+        for turn in turns:
+            turn.update(behavior_policy_allowed_token_ids=[334, 378], verdict="A")
+        debate = _make_debate(question="identical displayed question", instance_id=f"group{i % group_count}",
+            reward_a=1., reward_b=0., judge_raw_response={
+                "bidirectional_judge": True, "order_invariant": False,
+                "judge_label_token_contract": {"a_token_ids": [334], "b_token_ids": [378]},
+                "_training_judge_turns": turns})
+        def fixed(traj):
+            return replace(traj, transitions=[replace(traj.transitions[0], raw_response={"fixed_r1": True}),
+                                             *traj.transitions[1:]])
+        debates.append(replace(debate, trajectory_a=fixed(debate.trajectory_a),
+                               trajectory_b=fixed(debate.trajectory_b)))
+    kwargs = dict(debates=debates, num_rounds=3, round_adapter_names=("solution", "debate", "debate"),
+                  r1_reward_mode="task", r23_reward_mode="constant", r23_constant=1.,
+                  r23_symmetric=True, task_reward_fn=lambda t, _: t.metrics["task_reward"])
+    actor = assemble_split_train_examples(**kwargs, keep_optimizer_groups=True)["debate"]
+    old_actor = assemble_split_train_examples(**kwargs)["debate"]
+    judge, _ = assemble_judge_supervised_label_examples(debates, keep_optimizer_groups=True)
+    old_judge, _ = assemble_judge_supervised_label_examples(debates)
+    assert len(actor) == len(judge) == 128
+    assert all(r.metadata["round_nums"] == [2, 3] for r in actor)
+    counts = Counter(r.metadata["optimizer_group_id"] for r in actor)
+    assert counts == Counter(r.metadata["optimizer_group_id"] for r in judge)
+    assert len(counts) == group_count and set(counts.values()) == {128 // group_count}
+    for new_rows, old_rows in ((actor, old_actor), (judge, old_judge)):
+        assert [len(b) for b in pack_optimizer_groups(new_rows, max_rows=32)] == [32] * 4
+        for new, old in zip(new_rows, old_rows, strict=True):
+            metadata = dict(new.metadata)
+            del metadata["optimizer_group_id"]
+            assert replace(new, metadata=metadata) == old

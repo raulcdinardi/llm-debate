@@ -328,6 +328,18 @@ class TrainingDriver:
                 self._add_temporal_metrics(json.loads(line))
 
     def _adapter_names(self) -> tuple[str, ...]:
+        if self.config.rollout.mode == "debate":
+            names = list(dict.fromkeys(self.config.resolved_debate_round_adapter_names()))
+            judge = self.config.debate_judge_adapter
+            if judge == "policy":
+                judge = self.config.resolved_debate_round_adapter_names()[-1]
+            elif self.config.adapter_layout == "shared" and judge in ("solution", "debate"):
+                judge = "shared"
+            if judge != "base" and judge not in names:
+                names.append(judge)
+            if self.config.train_shadow_judge:
+                names.append(SHADOW_JUDGE)
+            return tuple(names)
         if self.config.adapter_layout == "shared":
             return ("shared",)
         if self.config.debate_judge_adapter == "judge":
@@ -514,10 +526,13 @@ class TrainingDriver:
             ppo_clip_epsilon=self.config.ppo_clip_epsilon,
             train_minibatch_size=self.config.train_minibatch_size,
             train_optimizer_batch_size=self.config.train_optimizer_batch_size,
+            train_keep_groups_together=self.config.train_keep_groups_together,
             train_max_tokens=self.config.train_max_tokens,
             train_length_bucket_batches=self.config.train_length_bucket_batches,
             train_logprob_backend=self.config.train_logprob_backend,
             compile_train_logprob_helper=self.config.compile_train_logprob_helper,
+            train_lm_head_kernel=self.config.train_lm_head_kernel,
+            train_gdn_backend=self.config.train_gdn_backend,
             gradient_checkpointing=self.config.gradient_checkpointing,
             on_policy_logprob_check=self.config.on_policy_logprob_check,
             on_policy_logprob_warn_only=self.config.on_policy_logprob_warn_only,
@@ -720,7 +735,12 @@ class TrainingDriver:
                     make_train_example(
                         turn=turn,
                         advantage_per_token=sample_advantage / len(turn.completion_token_ids),
-                        extra_metadata={"instance_id": sample.instance_id},
+                        extra_metadata={"instance_id": sample.instance_id, **(
+                            {"optimizer_group_id": str(sample.instance_id)
+                             if self.config.rollout.num_rollouts_per_instance > 1 or self.config.advantage_mode == "identity"
+                             else "single_turn_global"}
+                            if self.config.train_keep_groups_together else {}
+                        )},
                     )
                 )
         return grouped
@@ -1168,7 +1188,7 @@ class TrainingDriver:
         if self.config.debate_r1_reward == "judge_pointwise":
             pointwise_reward_map = runtime.sample_pointwise_judge_rewards(debates=debates, step_seed=step_seed)
 
-        if self.config.adapter_layout == "shared":
+        if self.config.uses_legacy_shared_projection():
             training_data = assemble_training_data_by_mode(
                 debates=debates,
                 num_rounds=self.config.effective_debate_max_rounds(),
@@ -1193,6 +1213,7 @@ class TrainingDriver:
             }
 
         grouped = assemble_split_train_examples(
+            keep_optimizer_groups=self.config.train_keep_groups_together,
             debates=debates,
             num_rounds=self.config.effective_debate_max_rounds(),
             round_adapter_names=self.config.resolved_debate_round_adapter_names(),
@@ -1206,21 +1227,22 @@ class TrainingDriver:
             r1_judge_delta_q=self.config.debate_r1_judge_delta_q,
             incoherent_r23_reward=self.config.debate_incoherent_r23_reward,
             r23_format_failure_penalty=self.config.debate_r23_format_failure_penalty,
-            r23_format_contract=("qwen35_instruct_three_points" if self.config.debate_prompt_format == "qwen35_instruct_three_points" else "legacy_base"),
+            r23_format_contract=(("qwen35_instruct_three_points" if self.config.debate_r23_penalize_word_limit else "qwen35_instruct_three_points_structure_only") if self.config.debate_prompt_format == "qwen35_instruct_three_points" else "legacy_base"),
         )
         judge_grpo_record: dict[str, float | int | str] | None = None
         if self.config.train_judge:
             if self.config.judge_training_objective == "supervised_label_ce_js":
                 judge_examples, judge_grpo_record = assemble_judge_supervised_label_examples(
-                    debates
+                    debates, keep_optimizer_groups=self.config.train_keep_groups_together,
                 )
             elif self.config.judge_training_objective == "unsupervised_js":
                 judge_examples, judge_grpo_record = assemble_judge_unsupervised_js_examples(
-                    debates
+                    debates, keep_optimizer_groups=self.config.train_keep_groups_together,
                 )
             else:
                 judge_examples, judge_grpo_record = assemble_judge_coherence_grpo_examples(
-                    debates, reward_mode=self.config.judge_grpo_reward_mode
+                    debates, reward_mode=self.config.judge_grpo_reward_mode,
+                    keep_optimizer_groups=self.config.train_keep_groups_together,
                 )
             grouped.setdefault("judge", []).extend(judge_examples)
             if self.config.train_shadow_judge:
@@ -1250,7 +1272,7 @@ class TrainingDriver:
                     else "judge_coherence_grpo"
                 ] = judge_grpo_record
         if self.config.debate_r1_reward == "judge_rejection_task":
-            r1_adapter_name = self.config.debate_round_adapter_names[0]
+            r1_adapter_name = self.config.resolved_debate_round_adapter_names()[0]
             projection_record["r1_projection"] = {
                 "mode": "judge_rejection_task",
                 "selection": "judge_winner_only",

@@ -7,20 +7,20 @@ PROMPT_FORMAT = "qwen35_instruct_three_points"
 EMPTY_THINK = "<think>\n\n</think>\n\n"
 ASSISTANT_HEADER = "<|im_start|>assistant\n" + EMPTY_THINK
 INSTRUCTION = (
-    "Defend your original story against the opponent. Make three separate arguments "
-    "grounded in the actual stories. Each point must make one claim and explain its "
+    "Defend your original completion against the opponent. Make three separate arguments "
+    "grounded in the actual completions and the evaluation constitution. Each point must make one claim and explain its "
     "relevance. Output only three lines numbered 1), 2), 3), followed by CONCLUDED "
-    "on a new line. At most 30 words per point. Do not rewrite the story or add an introduction."
+    "on a new line. At most 30 words per point. Do not rewrite the completion or add an introduction."
 )
 
 
 def continuation_parts(tokenizer, *, round_num: int):
-    if round_num not in (2, 3):
-        raise ValueError("Qwen three-point contract requires exactly R2/R3")
-    pre = INSTRUCTION + ("\n\nOpponent's story:\n" if round_num == 2
+    if not 2 <= round_num <= 6:
+        raise ValueError("Qwen three-point contract requires R2 through R6")
+    pre = INSTRUCTION + ("\n\nOpponent's completion:\n" if round_num == 2
                          else "\n\nOpponent's previous argument:\n")
     post = ("" if round_num == 2 else
-            "\n\nRespond to these criticisms while defending your original story.")
+            "\n\nRespond to these criticisms while defending your original completion.")
     # Render the official template, then extract only the new turn. Never
     # re-render the history: Qwen can remove earlier thinking delimiters.
     marker = "__QWEN_OPPONENT_CONTENT_BOUNDARY_9dc2__"
@@ -36,8 +36,8 @@ def continuation_parts(tokenizer, *, round_num: int):
 
 
 def audit_three_points(*, text: str, round_num: int):
-    if round_num not in (2, 3):
-        raise ValueError("Three-point contract requires R2/R3")
+    if not 2 <= round_num <= 6:
+        raise ValueError("Three-point contract requires R2 through R6")
     lines = text.strip().splitlines()
     points = [re.fullmatch(rf"{i}\) (\S.*)", line) for i, line in enumerate(lines[:3], 1)]
     numbering = len(points) == 3 and all(points)

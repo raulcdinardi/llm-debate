@@ -72,6 +72,7 @@ class TrainRunConfig:
     constrained_writing_reward_mode: str = "additive"
     constrained_writing_letter_temperature: float = 1.0
     constrained_writing_anchors: str = "on"
+    python_optimization_config: str | None = None
     quality_data_dir: str | None = None
     quality_split: str = "train"
     quality_hard_only: bool = True
@@ -91,6 +92,7 @@ class TrainRunConfig:
     debate_r1_judge_delta_q: float = 1.0
     debate_incoherent_r23_reward: float = -0.5
     debate_r23_format_failure_penalty: float = 0.0
+    debate_r23_penalize_word_limit: bool = True
     debate_r23_mode: str = "symmetric"
     debate_r23_advantage_scope: str = "per_round"
     debate_judge_adapter: str = "policy"
@@ -132,14 +134,17 @@ class TrainRunConfig:
     rollout_assistant_prefill: str | None = None
     train_minibatch_size: int = 0
     train_optimizer_batch_size: int = 0
+    train_keep_groups_together: bool = False
     train_max_tokens: int = 0
     train_length_bucket_batches: bool = False
     train_logprob_backend: str = "full_logits"
     compile_train_logprob_helper: bool = False
+    train_lm_head_kernel: str = "torch"
+    train_gdn_backend: str = "auto"
     train_adapter_names: tuple[str, ...] = ()
     stop_parsed_reward_hacking_min: float | None = None
     stop_parsed_reward_hacking_max: float | None = None
-    gradient_checkpointing: bool = True
+    gradient_checkpointing: bool = False
     on_policy_logprob_check: bool = True
     on_policy_logprob_warn_only: bool = False
     on_policy_logprob_abs_tol: float = 1e-3
@@ -149,7 +154,7 @@ class TrainRunConfig:
     sampler_max_model_len: int = 512
     sampler_prefix_caching: bool | None = None
     sampler_max_num_seqs: int = 0
-    sampler_enforce_eager: bool = True
+    sampler_enforce_eager: bool = False
     sampler_max_lora_rank: int = 32
     sampler_max_loras: int = 4
     sampler_teardown_before_training: bool = False
@@ -209,6 +214,8 @@ class TrainRunConfig:
         return self.debate_rounds
 
     def resolved_debate_round_adapter_names(self) -> tuple[str, ...]:
+        if self.adapter_layout == "shared":
+            return ("shared",) * self.effective_debate_max_rounds()
         if not self.debate_round_adapter_names:
             raise ValueError("debate_round_adapter_names must not be empty")
         return tuple(
@@ -216,10 +223,33 @@ class TrainRunConfig:
             for index in range(self.effective_debate_max_rounds())
         )
 
+    def uses_legacy_shared_projection(self) -> bool:
+        # Keep historical shared-policy experiments numerically reproducible.
+        # New judge/objective combinations use the round-wise reward projection,
+        # independently of whether their actor parameters are shared.
+        return (
+            self.adapter_layout == "shared"
+            and self.debate_judge_adapter != "judge"
+            and self.debate_judge_score_mode != "order_sym_soft_logit"
+            and self.debate_r1_reward in ("task", "judge", "judge_pointwise", "none")
+            and self.debate_r23_reward in ("constant", "none")
+            and self.debate_r23_format_failure_penalty == 0.0
+        )
+
     def __post_init__(self) -> None:
+        if self.train_keep_groups_together and self.rollout.mode == "debate":
+            if self.uses_legacy_shared_projection() or (self.effective_debate_max_rounds() == 1 and self.debate_r1_reward == "judge"):
+                raise ValueError("Group-preserving optimizer batches require round-wise trajectory projection")
+        from llm_local_rl.training_kernels import validate_training_kernels
+        validate_training_kernels(
+            train_gdn_backend=self.train_gdn_backend,
+            train_lm_head_kernel=self.train_lm_head_kernel,
+            train_logprob_backend=self.train_logprob_backend,
+            compile_train_logprob_helper=self.compile_train_logprob_helper,
+        )
         if self.debate_prompt_format == "qwen35_instruct_three_points":
-            if self.thinking_mode != "no_think" or self.debate_rounds != 3 or self.debate_stop_on_concluded:
-                raise ValueError("Qwen instruct three-point contract requires no_think, exactly three rounds, and native EOS termination")
+            if self.thinking_mode != "no_think" or not 2 <= self.debate_rounds <= 6 or self.debate_stop_on_concluded:
+                raise ValueError("Qwen instruct three-point contract requires no_think, two through six total rounds, and native EOS termination")
         if self.train_shadow_judge:
             if not self.train_judge or self.judge_training_objective != "supervised_label_ce_js":
                 raise ValueError("shadow judge requires train_judge with supervised_label_ce_js")
@@ -413,8 +443,6 @@ class TrainRunConfig:
                 self.debate_judge_max_tokens == 0 and judge_harness.default_max_tokens != 1
             ):
                 raise ValueError("order_sym_soft_logit requires exactly one judge output token")
-            if self.adapter_layout != "split":
-                raise ValueError("order_sym_soft_logit currently requires adapter_layout='split'")
         elif self.judge_label_token_contract != JUDGE_LABEL_TOKEN_CONTRACT_NONE:
             raise ValueError(
                 "judge_label_token_contract is temporary and may only be enabled with "
@@ -449,7 +477,7 @@ class TrainRunConfig:
         ):
             if self.sampler_backend != "vllm":
                 raise ValueError("Raw-Base judge harnesses currently require sampler_backend='vllm'")
-        if self.rollout.env_name == "mmlu_pro_pairwise" and not self.mmlu_pro_data_path:
+        if self.rollout.env_name in {"mmlu_pro_pairwise", "mixed_label_pairwise"} and not self.mmlu_pro_data_path:
             raise ValueError("mmlu_pro_pairwise requires mmlu_pro_data_path")
         self.behavior_policy().assert_exact_trainer_reconstruction_supported()
         if not self.on_policy_logprob_check:
@@ -473,22 +501,9 @@ class TrainRunConfig:
         if self.debate_r1_reward == "judge_rejection_task":
             if self.rollout.mode != "debate":
                 raise ValueError("judge_rejection_task is only valid for debate rollouts")
-            if self.adapter_layout != "split":
-                raise ValueError("judge_rejection_task requires adapter_layout='split'")
-            expected_round_adapters = ("solution",) + (
-                "debate",
-            ) * (self.effective_debate_max_rounds() - 1)
-            configured_round_adapters = self.resolved_debate_round_adapter_names()
-            if configured_round_adapters != expected_round_adapters:
-                raise ValueError(
-                    "judge_rejection_task requires round adapters "
-                    f"{expected_round_adapters!r}, got {configured_round_adapters!r}"
-                )
         if self.debate_r1_reward == "judge_delta_task":
             if self.rollout.mode != "debate":
                 raise ValueError("judge_delta_task is only valid for debate rollouts")
-            if self.adapter_layout != "split":
-                raise ValueError("judge_delta_task requires adapter_layout='split'")
             if not math.isfinite(self.debate_r1_judge_delta_q) or self.debate_r1_judge_delta_q < 0:
                 raise ValueError("debate_r1_judge_delta_q must be finite and non-negative")
             if not math.isfinite(self.debate_incoherent_r23_reward):
@@ -535,8 +550,6 @@ class TrainRunConfig:
                 raise ValueError("judge training requires bidirectional judge sampling")
             if self.debate_judge_adapter != "judge":
                 raise ValueError("judge training requires debate_judge_adapter='judge'")
-            if self.adapter_layout != "split":
-                raise ValueError("judge training requires adapter_layout='split'")
             if self.train_adapter_names and "judge" not in self.train_adapter_names:
                 raise ValueError("judge training requires judge in train_adapter_names")
             judge_behavior_policy = BehaviorPolicySpec(
@@ -613,6 +626,7 @@ class TrainRunConfig:
             constrained_writing_reward_mode=data.get("constrained_writing_reward_mode", "additive"),
             constrained_writing_letter_temperature=float(data.get("constrained_writing_letter_temperature", 1.0)),
             constrained_writing_anchors=data.get("constrained_writing_anchors", "on"),
+            python_optimization_config=data.get("python_optimization_config"),
             quality_data_dir=data.get("quality_data_dir"),
             quality_split=data.get("quality_split", "train"),
             quality_hard_only=data.get("quality_hard_only", True),
@@ -632,6 +646,7 @@ class TrainRunConfig:
             debate_r1_judge_delta_q=data.get("debate_r1_judge_delta_q", 1.0),
             debate_incoherent_r23_reward=data.get("debate_incoherent_r23_reward", -0.5),
             debate_r23_format_failure_penalty=data.get("debate_r23_format_failure_penalty", 0.0),
+            debate_r23_penalize_word_limit=data.get("debate_r23_penalize_word_limit", True),
             debate_r23_mode=data.get("debate_r23_mode", "symmetric"),
             debate_r23_advantage_scope=data.get("debate_r23_advantage_scope", "per_round"),
             debate_judge_adapter=data.get("debate_judge_adapter", "policy"),
@@ -683,14 +698,17 @@ class TrainRunConfig:
             ),
             train_minibatch_size=data.get("train_minibatch_size", 0),
             train_optimizer_batch_size=data.get("train_optimizer_batch_size", 0),
+            train_keep_groups_together=data.get("train_keep_groups_together", False),
             train_max_tokens=data.get("train_max_tokens", 0),
             train_length_bucket_batches=data.get("train_length_bucket_batches", False),
             train_logprob_backend=data.get("train_logprob_backend", "full_logits"),
             compile_train_logprob_helper=data.get("compile_train_logprob_helper", False),
+            train_lm_head_kernel=data.get("train_lm_head_kernel", "torch"),
+            train_gdn_backend=data.get("train_gdn_backend", "auto"),
             train_adapter_names=tuple(data.get("train_adapter_names", ())),
             stop_parsed_reward_hacking_min=data.get("stop_parsed_reward_hacking_min"),
             stop_parsed_reward_hacking_max=data.get("stop_parsed_reward_hacking_max"),
-            gradient_checkpointing=data.get("gradient_checkpointing", True),
+            gradient_checkpointing=data.get("gradient_checkpointing", False),
             on_policy_logprob_check=data.get("on_policy_logprob_check", True),
             on_policy_logprob_warn_only=data.get("on_policy_logprob_warn_only", False),
             on_policy_logprob_abs_tol=data.get("on_policy_logprob_abs_tol", 1e-3),
@@ -700,7 +718,7 @@ class TrainRunConfig:
             sampler_max_model_len=data.get("sampler_max_model_len", 512),
             sampler_max_num_seqs=data.get("sampler_max_num_seqs", 0),
             sampler_prefix_caching=data.get("sampler_prefix_caching", None),
-            sampler_enforce_eager=data.get("sampler_enforce_eager", True),
+            sampler_enforce_eager=data.get("sampler_enforce_eager", False),
             sampler_max_lora_rank=data.get("sampler_max_lora_rank", 32),
             sampler_max_loras=data.get("sampler_max_loras", 4),
             sampler_teardown_before_training=data.get("sampler_teardown_before_training", False),

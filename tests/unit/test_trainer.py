@@ -1400,3 +1400,566 @@ def test_optimizer_batches_both_backends_match_independent_updates(backend):
     assert metrics["on_policy_logprob_violations"] == 0
     for actual, wanted in zip(trainer.model.parameters(), expected.parameters(), strict=True):
         torch.testing.assert_close(actual, wanted, rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("backend", ["full_logits", "selective_lm_head"])
+def test_all_rounds_shared_actor_one_backward_matches_union_objective(backend):
+    from llm_local_rl.debate_parity import assemble_split_train_examples
+
+    torch.manual_seed(1701)
+    trainer = _tiny_causal_trainer(backend=backend, learning_rate=0.)
+    # Every round extends the exact previous token sequence. Injected tokens 5
+    # and 8 must contribute context but never a policy-gradient loss.
+    transitions = [
+        Transition(prompt_tokens=[1, 2], completion_tokens=[3, 4], completion_logprobs=[0., 0.], round_num=1),
+        Transition(prompt_tokens=[1, 2, 3, 4, 5], completion_tokens=[6, 7], completion_logprobs=[0., 0.], round_num=2),
+        Transition(prompt_tokens=[1, 2, 3, 4, 5, 6, 7, 8], completion_tokens=[9, 10], completion_logprobs=[0., 0.], round_num=3),
+    ]
+    debate = DebateResult(
+        question="Q", ground_truth=None,
+        trajectory_a=DebateTrajectory(agent="A", transitions=transitions, frozen_solution="A", metrics={"task_reward": 1.}),
+        trajectory_b=DebateTrajectory(agent="B", transitions=transitions, frozen_solution="B", metrics={"task_reward": 0.}),
+        verdict="A", judge_reasoning="",
+    )
+    rows = assemble_split_train_examples(
+        debates=[debate], num_rounds=3, round_adapter_names=("debate",) * 3,
+        r1_reward_mode="task", r23_reward_mode="constant", r23_constant=.7,
+        r23_symmetric=True, task_reward_fn=lambda t, _: t.metrics["task_reward"],
+    )["debate"]
+    assert len(rows) == 2  # one per agent; test A to avoid cancelling +/- gradients
+    example = rows[0]
+    current = trainer.compute_logprobs(adapter_name="debate", batch=[example])[0]
+    example = replace(example, old_logprobs=current)
+
+    # An independent sum over the three original round losses is normalized by
+    # one trajectory, rather than by three rows. Compare actual parameter grads.
+    reference_gradients = None
+    for transition, advantage in zip(transitions, (.5, .35, .35), strict=True):
+        tokens = transition.prompt_tokens + transition.completion_tokens
+        inputs = torch.tensor([tokens[:-1]])
+        outputs = trainer.model(input_ids=inputs, attention_mask=torch.ones_like(inputs))
+        logps = torch.log_softmax(outputs.logits.float() / .8, dim=-1)
+        targets = torch.tensor(tokens[1:])
+        selected = logps[0, torch.arange(len(targets)), targets]
+        loss = -(advantage * selected[-2:]).sum()
+        loss.backward()
+    reference_gradients = [p.grad.detach().clone() for p in trainer.model.parameters()]
+    # Disable clipping only for this gradient-equivalence test.
+    trainer.config = replace(trainer.config, max_grad_norm=1e9)
+    grad_enabled_forwards = []
+    hook = trainer.model.model.register_forward_hook(
+        lambda _m, _i, _o: grad_enabled_forwards.append(torch.is_grad_enabled())
+    )
+    metrics = trainer.train_batch(adapter_name="debate", batch=[example])
+    hook.remove()
+    assert sum(grad_enabled_forwards) == 1
+    assert metrics["num_examples"] == 1
+    assert metrics["num_optimizer_steps"] == 1
+    assert metrics["num_trained_tokens"] == 6
+    assert metrics["completion_tokens_checked"] == 6
+    assert metrics["on_policy_logprob_violations"] == 0
+    for parameter, expected in zip(trainer.model.parameters(), reference_gradients, strict=True):
+        torch.testing.assert_close(parameter.grad, expected, rtol=1e-5, atol=1e-6)
+
+
+# Capacity retries preserve optimizer groups; completed groups may only replay
+# after a full rollback. A failure inside optimizer.step is always fatal.
+def _capacity_rows(count):
+    return [TrainExample('shared', [0], [0], [1], [1], [-math.log(2)], [1.0])
+            for _ in range(count)]
+
+
+def test_capacity_is_reused_per_adapter_and_only_decreases(monkeypatch):
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_minibatch_size=128, train_optimizer_batch_size=128)
+    configured = trainer.config
+    calls = []
+    limit = 32
+    forward = trainer.model.forward
+
+    def bounded_forward(**kwargs):
+        size = kwargs['input_ids'].shape[0]
+        calls.append(size)
+        if size > limit:
+            raise torch.OutOfMemoryError('injected capacity limit')
+        return forward(**kwargs)
+
+    monkeypatch.setattr(trainer.model, 'forward', bounded_forward)
+    result = trainer.train_batch(adapter_name='shared', batch=_capacity_rows(128))
+    assert calls == [128, 64, 32, 32, 32, 32]
+    assert result['microbatch_oom_attempts'] == 2
+    assert result['num_optimizer_steps'] == 1
+    assert trainer.config is configured
+    calls.clear()
+    result = trainer.train_batch(adapter_name='shared', batch=_capacity_rows(128))
+    assert calls == [32] * 4
+    assert result['microbatch_oom_attempts'] == 0
+    assert result['microbatch_initial_size'] == 32
+    # A short tail is not evidence that the device's capacity fell to two rows.
+    trainer.train_batch(adapter_name='shared', batch=_capacity_rows(2))
+    calls.clear()
+    trainer.train_batch(adapter_name='shared', batch=_capacity_rows(128))
+    assert calls == [32] * 4
+    # Judge capacity is independent of the debate/shared adapter.
+    calls.clear()
+    trainer.train_batch(adapter_name='judge', batch=_capacity_rows(128))
+    assert calls[:3] == [128, 64, 32]
+    # Longer inputs or less available memory may force a further reduction.
+    limit = 16
+    calls.clear()
+    trainer.train_batch(adapter_name='shared', batch=_capacity_rows(128))
+    assert calls == [32] + [16] * 8
+    limit = 32
+    calls.clear()
+    trainer.train_batch(adapter_name='shared', batch=_capacity_rows(128))
+    assert calls == [16] * 8
+    assert trainer._microbatch_limits == {'shared': 16, 'judge': 32}
+    trainer.config = replace(configured, train_minibatch_size=8)
+    calls.clear()
+    trainer.train_batch(adapter_name='shared', batch=_capacity_rows(128))
+    assert calls == [8] * 16
+    assert trainer._microbatch_limits['shared'] == 16
+
+
+def test_capacity_retry_discards_partial_gradients_and_restores_all_rng(monkeypatch):
+    import random
+    import numpy as np
+
+    actual = _fake_trainer()
+    expected = _fake_trainer()
+    for trainer, size in [(actual, 4), (expected, 2)]:
+        trainer.config = replace(trainer.config, train_minibatch_size=size)
+        trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=0.1)
+    attempts = []
+
+    def install(trainer, fail):
+        forward = trainer.model.forward
+        count = 0
+        def stochastic_forward(**kwargs):
+            nonlocal count
+            count += 1
+            draws = (random.random(), float(np.random.random()), torch.rand(()).item())
+            if fail:
+                attempts.append(draws)
+            if fail and count == 2:
+                assert trainer.model.bias.grad is not None  # First chunk already accumulated.
+                raise torch.OutOfMemoryError('after partial backward')
+            return forward(**kwargs)
+        monkeypatch.setattr(trainer.model, 'forward', stochastic_forward)
+
+    install(actual, True)
+    install(expected, False)
+    tails = []
+    for trainer in (expected, actual):
+        random.seed(42); np.random.seed(42); torch.manual_seed(42)
+        result = trainer.train_batch(adapter_name='shared', batch=_capacity_rows(8))
+        tails.append((random.random(), float(np.random.random()), torch.rand(()).item()))
+        assert result['num_optimizer_steps'] == 1
+    assert attempts[0] == attempts[2]
+    assert tails[0] == tails[1]
+    torch.testing.assert_close(actual.model.bias, expected.model.bias, rtol=0, atol=0)
+    a = actual.optimizer.state[actual.model.bias]
+    b = expected.optimizer.state[expected.model.bias]
+    for key in a:
+        torch.testing.assert_close(a[key], b[key], rtol=0, atol=0)
+    assert a['step'] == 1
+    assert actual.config.train_minibatch_size == 4
+
+
+@pytest.mark.parametrize('optimizer_size', [0, 2])
+def test_capacity_never_replays_a_failed_optimizer(monkeypatch, optimizer_size):
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_minibatch_size=2,
+                             train_optimizer_batch_size=optimizer_size)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    step = trainer.optimizer.step
+    updates = []
+    def mutating_step(*args, **kwargs):
+        updates.append(True)
+        step(*args, **kwargs)
+        raise torch.OutOfMemoryError('optimizer partially mutated')
+    monkeypatch.setattr(trainer.optimizer, 'step', mutating_step)
+    with pytest.raises(torch.OutOfMemoryError):
+        trainer.train_batch(adapter_name='shared', batch=_capacity_rows(4))
+    assert len(updates) == 1
+    assert trainer.model.bias.item() != 0
+    assert trainer._microbatch_limits == {}
+    assert trainer.config.train_minibatch_size == 2
+
+
+@pytest.mark.parametrize('existing_state', [False, True])
+def test_later_group_oom_rolls_back_and_matches_four_independent_adam_updates(monkeypatch, existing_state):
+    import copy
+    import random
+    import numpy as np
+    from llm_local_rl.optimizer_batching import pack_optimizer_groups
+
+    actual = _fake_trainer()
+    actual.single_target_parameter_adapter_mode = False
+    actual.config = replace(actual.config, train_minibatch_size=4, train_optimizer_batch_size=4,
+                            train_keep_groups_together=True, train_length_bucket_batches=True)
+    actual.optimizer = torch.optim.AdamW(actual.model.parameters(), lr=.1)
+    if existing_state:
+        (actual.model.bias + actual.model.bias.square()).backward()
+        actual.optimizer.step()
+        actual.optimizer.zero_grad(set_to_none=True)
+    expected = _fake_trainer()
+    expected.config = actual.config
+    expected.model.load_state_dict(actual.model.state_dict())
+    expected.optimizer = torch.optim.AdamW(expected.model.parameters(), lr=.1)
+    expected.optimizer.load_state_dict(copy.deepcopy(actual.optimizer.state_dict()))
+    initial_logprob = float(torch.log_softmax(torch.stack([actual.model.bias.detach(), torch.tensor(0.)]), dim=0)[0])
+    batch = []
+    for index in range(16):
+        length = 1 + (index // 4) % 3
+        batch.append(TrainExample('shared', [0] * length, [0] * length, [1] * length,
+                                  [1] * length, [initial_logprob] * length,
+                                  [.2 + (index % 3) * .1] * length,
+                                  metadata={'optimizer_group_id': str(index // 2)}))
+    groups = [_order_batch_for_minibatching(batch=group, max_tokens=0, length_bucket_batches=True)
+              for group in pack_optimizer_groups(batch, max_rows=4)]
+    events = []
+    def progress(event, **fields):
+        events.append((event, fields))
+        if event == 'attempt_begin' and fields['attempt_index'] == 1:
+            state = actual.optimizer.state.get(actual.model.bias)
+            assert (state is None) if not existing_state else state['step'].item() == 1
+    actual.progress_callback = progress
+    def draw_rng():
+        return random.random(), float(np.random.random()), torch.rand(()).item()
+    forward = actual.model.forward
+    failed = False
+    def bounded_forward(**kwargs):
+        nonlocal failed
+        draw_rng()
+        if torch.is_grad_enabled() and kwargs['input_ids'].shape[0] == 4:
+            state = actual.optimizer.state.get(actual.model.bias)
+            if state is not None and state['step'].item() == int(existing_state) + 1:
+                failed = True
+                raise torch.OutOfMemoryError('longer second group after first Adam update')
+        return forward(**kwargs)
+    monkeypatch.setattr(actual.model, 'forward', bounded_forward)
+
+    # Independent optimizer loop at the final physical size, with the same
+    # frozen rollout policy and all parity forwards preceding any update.
+    def seed():
+        random.seed(42); np.random.seed(42); torch.manual_seed(42)
+    seed()
+    for group in groups:
+        for _ in range(0, len(group), 2):
+            draw_rng()
+    for group in groups:
+        for start in range(0, len(group), 2):
+            draw_rng()
+            rows = group[start:start + 2]
+            inputs = torch.tensor([row.input_ids for row in rows])
+            logits = expected.model(input_ids=inputs, attention_mask=torch.ones_like(inputs)).logits
+            logprobs = torch.log_softmax(logits, dim=-1)[..., 0]
+            ratios = torch.exp(logprobs - initial_logprob)
+            advantages = torch.tensor([row.advantages for row in rows])
+            epsilon = expected.config.ppo_clip_epsilon
+            loss = -torch.minimum(ratios * advantages, ratios.clamp(1-epsilon, 1+epsilon) * advantages).sum() / len(group)
+            loss.backward()
+        torch.nn.utils.clip_grad_norm_(expected.model.parameters(), expected.config.max_grad_norm)
+        expected.optimizer.step()
+        expected.optimizer.zero_grad(set_to_none=True)
+    expected_tail = draw_rng()
+    seed()
+    result = actual.train_batch(adapter_name='shared', batch=batch)
+    assert draw_rng() == expected_tail
+    assert failed
+    assert result['num_optimizer_steps'] == 4
+    assert result['microbatch_oom_attempts'] == 1
+    assert result['microbatch_rolled_back_optimizer_steps'] == 1
+    assert result['microbatch_rollback_snapshot_bytes'] == (16 if existing_state else 4)
+    assert result['physical_microbatch_size'] == 2
+    assert actual._microbatch_limits == {'shared': 2}
+    assert actual.training_state_dict()['microbatch_limits'] == {'shared': 2}
+    torch.testing.assert_close(actual.model.bias, expected.model.bias, atol=0, rtol=0)
+    a = actual.optimizer.state[actual.model.bias]
+    b = expected.optimizer.state[expected.model.bias]
+    for key in a:
+        torch.testing.assert_close(a[key], b[key], atol=0, rtol=0)
+    assert a['step'].item() == int(existing_state) + 4
+    rollback = [fields for event, fields in events if event == 'attempt_rollback']
+    assert len(rollback) == 1 and rollback[0]['discarded_optimizer_updates'] == 1
+    accepted = [(event, fields) for event, fields in events if fields['attempt_index'] == 1]
+    committed = [fields['end_row'] for event, fields in accepted if event == 'optimizer_step_complete']
+    assert committed == [4, 8, 12, 16]
+    assert all(fields['provisional'] for event, fields in accepted if event == 'optimizer_step_complete')
+    last_preflight = max(i for i, (event, _) in enumerate(accepted) if event == 'preflight_complete')
+    first_update = min(i for i, (event, _) in enumerate(accepted) if event == 'optimizer_step_complete')
+    assert last_preflight < first_update
+
+
+def test_later_group_oom_exhaustion_restores_initial_state_and_is_bounded(monkeypatch):
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_minibatch_size=4, train_optimizer_batch_size=4,
+                             on_policy_logprob_warn_only=True)
+    trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=.1)
+    forward = trainer.model.forward
+    sizes = []
+    def always_fail_after_update(**kwargs):
+        if torch.is_grad_enabled() and trainer.optimizer.state:
+            sizes.append(kwargs['input_ids'].shape[0])
+            raise torch.OutOfMemoryError('every later group fails')
+        return forward(**kwargs)
+    monkeypatch.setattr(trainer.model, 'forward', always_fail_after_update)
+    with pytest.raises(torch.OutOfMemoryError, match='no retained updates'):
+        trainer.train_batch(adapter_name='shared', batch=_capacity_rows(16))
+    assert sizes == [4, 2, 1]
+    assert trainer.model.bias.item() == 0
+    assert not trainer.optimizer.state
+    assert trainer.model.bias.grad is None
+    assert trainer._microbatch_limits == {'shared': 1}
+    assert trainer.config.train_minibatch_size == 4
+
+
+def test_rollback_snapshot_excludes_inactive_adapter_and_preserves_state_device():
+    from llm_local_rl.trainer import _OptimizerRollbackSnapshot
+    active = torch.nn.Parameter(torch.tensor([1.]))
+    inactive = torch.nn.Parameter(torch.tensor([2.]), requires_grad=False)
+    optimizer = torch.optim.AdamW([active, inactive], lr=.1)
+    active.sum().backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    optimizer.state[inactive] = {'step': torch.tensor(7.), 'exp_avg': torch.tensor([3.]),
+                                 'exp_avg_sq': torch.tensor([4.])}
+    inactive_state = optimizer.state[inactive]
+    saved_value = active.detach().clone()
+    saved_state = {key: value.clone() for key, value in optimizer.state[active].items()}
+    snapshot = _OptimizerRollbackSnapshot(optimizer)
+    assert snapshot.nbytes == 16
+    (2 * active.sum()).backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    snapshot.restore(optimizer)
+    torch.testing.assert_close(active, saved_value, atol=0, rtol=0)
+    assert inactive.item() == 2
+    assert optimizer.state[inactive] is inactive_state
+    for key, value in optimizer.state[active].items():
+        torch.testing.assert_close(value, saved_state[key], atol=0, rtol=0)
+        assert value.device == saved_state[key].device
+
+
+@pytest.mark.parametrize('paired', [False, True])
+def test_capacity_exhaustion_is_bounded_and_non_oom_is_not_retried(monkeypatch, paired):
+    trainer = _fake_trainer()
+    attempted = []
+    def always_oom(**kwargs):
+        attempted.append(trainer.config.train_minibatch_size)
+        raise torch.OutOfMemoryError('too large')
+    monkeypatch.setattr(trainer, '_train_batch', always_oom)
+    with pytest.raises(torch.OutOfMemoryError, match='minimum microbatch'):
+        trainer.train_batch(adapter_name='shared', batch=_capacity_rows(128),
+                            objective='supervised_label_ce_js' if paired else 'ppo')
+    assert attempted == ([128, 64, 32, 16, 8, 4, 2] if paired else [128, 64, 32, 16, 8, 4, 2, 1])
+    assert trainer.config.train_minibatch_size == 0
+    attempted.clear()
+    def invalid(**kwargs):
+        attempted.append(True)
+        raise FloatingPointError('invalid gradients')
+    monkeypatch.setattr(trainer, '_train_batch', invalid)
+    with pytest.raises(FloatingPointError):
+        trainer.train_batch(adapter_name='shared', batch=_capacity_rows(128))
+    assert len(attempted) == 1
+
+
+def test_capacity_reference_scoring_also_shrinks_and_stays_bounded(monkeypatch):
+    trainer = _fake_trainer()
+    trainer.reference_adapter_names = {'shared': 'reference__shared'}
+    active = None
+    calls = []
+    def set_adapter(name):
+        nonlocal active
+        active = name
+    trainer.set_adapter = set_adapter
+    forward = trainer.model.forward
+    def bounded_forward(**kwargs):
+        size = kwargs['input_ids'].shape[0]
+        calls.append((active, size))
+        if active == 'reference__shared' and size > 2:
+            raise torch.OutOfMemoryError('reference does not fit')
+        return forward(**kwargs)
+    monkeypatch.setattr(trainer.model, 'forward', bounded_forward)
+    metrics = trainer.train_batch(adapter_name='shared', batch=_capacity_rows(8), measure_reference_kl=True)
+    assert calls == [('reference__shared', 8), ('reference__shared', 4)] + [('reference__shared', 2)] * 4 + [('shared', 2)] * 4
+    assert metrics['microbatch_oom_attempts'] == 2
+    assert metrics['num_optimizer_steps'] == 1
+    calls.clear()
+    trainer.train_batch(adapter_name='shared', batch=_capacity_rows(8), measure_reference_kl=True)
+    assert all(size == 2 for _, size in calls)
+    calls.clear()
+    trainer.compute_logprobs(adapter_name='reference__shared', batch=_capacity_rows(8))
+    assert calls == [('reference__shared', 2)] * 4
+
+
+@pytest.mark.parametrize('backend', ['full_logits', 'selective_lm_head'])
+def test_logprob_microbatches_preserve_row_order_and_values(backend):
+    trainer = _tiny_causal_trainer(backend=backend)
+    rows = [TrainExample('shared', [i] * n, [(i + 1) % 16] * n, [1] * n, [1] * n,
+                         [0.] * n, [1.] * n) for i, n in enumerate([5, 1, 3, 2, 4])]
+    trainer.config = replace(trainer.config, train_minibatch_size=0)
+    expected = trainer.compute_logprobs(adapter_name='shared', batch=rows)
+    trainer.config = replace(trainer.config, train_minibatch_size=2)
+    actual = trainer.compute_logprobs(adapter_name='shared', batch=rows)
+    for a, b in zip(actual, expected, strict=True):
+        assert a == pytest.approx(b, abs=1e-6)
+
+
+def test_capacity_paired_judge_keeps_pairs_and_optimizer_grouping(monkeypatch):
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_optimizer_batch_size=4,
+                             train_length_bucket_batches=True)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    baseline = _fake_trainer()
+    baseline.config = trainer.config
+    baseline.optimizer = torch.optim.SGD(baseline.model.parameters(), lr=0.1)
+    rows = _ce_only_pair_rows()
+    forward = trainer.model.forward
+    sizes = []
+    def bounded_forward(**kwargs):
+        sizes.append(kwargs['input_ids'].shape[0])
+        if sizes[-1] > 2:
+            raise torch.OutOfMemoryError('pair memory')
+        return forward(**kwargs)
+    monkeypatch.setattr(trainer.model, 'forward', bounded_forward)
+    baseline.train_batch(adapter_name='judge', batch=rows, objective='supervised_label_ce_js')
+    metrics = trainer.train_batch(adapter_name='judge', batch=rows, objective='supervised_label_ce_js')
+    assert sizes == [4, 2, 2, 2]
+    assert metrics['num_optimizer_steps'] == 2
+    assert metrics['judge_coherence_pair_count'] == 3
+    torch.testing.assert_close(trainer.model.bias, baseline.model.bias, atol=1e-7, rtol=1e-6)
+
+
+def test_capacity_limits_survive_serialized_resume_and_old_checkpoints_load(tmp_path, monkeypatch):
+    import copy
+    trainer = _fake_trainer()
+    trainer.single_target_parameter_adapter_mode = False
+    calls = []
+    def bounded(**kwargs):
+        size = trainer.config.train_minibatch_size
+        calls.append(size)
+        if size > 4:
+            raise torch.OutOfMemoryError('injected')
+        return {}
+    monkeypatch.setattr(trainer, '_train_batch', bounded)
+    trainer.train_batch(adapter_name='shared', batch=_capacity_rows(16))
+    assert calls == [16, 8, 4]
+    checkpoint = tmp_path / 'trainer_state.pt'
+    torch.save(trainer.training_state_dict(), checkpoint)
+    restored = _fake_trainer()
+    state = torch.load(checkpoint, weights_only=False)
+    restored.load_training_state_dict(state)
+    result = restored.train_batch(adapter_name='shared', batch=_capacity_rows(16))
+    assert result['microbatch_initial_size'] == 4
+    assert result['microbatch_oom_attempts'] == 0
+    assert result['num_train_minibatches'] == 4
+    old = copy.deepcopy(state)
+    del old['microbatch_limits']
+    restored.load_training_state_dict(old)
+    assert restored._microbatch_limits == {}
+    state['microbatch_limits'] = {'shared': 0}
+    with pytest.raises(ValueError, match='microbatch limits'):
+        restored.load_training_state_dict(state)
+
+
+@pytest.mark.parametrize("physical_size", [16, 32])
+@pytest.mark.parametrize("bucket", [False, True])
+@pytest.mark.parametrize("group_count", [8, 64])
+def test_four_grouped_updates_match_independent_ppo(physical_size, bucket, group_count, capsys):
+    from llm_local_rl.optimizer_batching import pack_optimizer_groups
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_keep_groups_together=True,
+                             train_optimizer_batch_size=32, train_minibatch_size=physical_size,
+                             train_length_bucket_batches=bucket, max_grad_norm=0.0)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.7)
+    batch = []
+    for index in range(128 // group_count):
+        for group in range(group_count):
+            n = 1 + (group + index) % 5
+            advantage = [1.0, .4, -.8, .6, -.3, 1.2, .2, -1.0][group % 8]
+            batch.append(TrainExample("shared", [0] * n, [0] * n,
+                [0] * (n - 1) + [1], [0] * (n - 1) + [1],
+                [0.] * (n - 1) + [-math.log(2)], [0.] * (n - 1) + [advantage],
+                metadata={"optimizer_group_id": str(group)}))
+    original = [(list(r.old_logprobs), list(r.advantages)) for r in batch]
+    expected = torch.tensor(0., requires_grad=True)
+    optimizer = torch.optim.SGD([expected], lr=0.7)
+    for group in pack_optimizer_groups(batch, max_rows=32):
+        advantages = torch.tensor([r.advantages[-1] for r in group])
+        ratio = 2 * torch.sigmoid(expected)
+        loss = -torch.minimum(ratio * advantages, ratio.clamp(.8, 1.2) * advantages).mean()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+    result = trainer.train_batch(adapter_name="shared", batch=batch)
+    assert trainer.model.bias.item() == pytest.approx(expected.item(), abs=1e-7)
+    assert result["num_optimizer_steps"] == 4
+    assert result["num_train_minibatches"] == 128 // physical_size
+    assert result["completion_tokens_checked"] == 128
+    assert original == [(r.old_logprobs, r.advantages) for r in batch]
+    assert '"batch_rows": [32, 32, 32, 32]' in capsys.readouterr().out
+
+
+def test_grouped_capacity_retry_preserves_membership(monkeypatch, capsys):
+    import json
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_keep_groups_together=True,
+                             train_optimizer_batch_size=32, train_minibatch_size=32,
+                             train_length_bucket_batches=True)
+    batch = [replace(r, metadata={"optimizer_group_id": str(i % 8)})
+             for i, r in enumerate(_capacity_rows(128))]
+    forward = trainer.model.forward
+    def limited_forward(*args, **kwargs):
+        if torch.is_grad_enabled() and kwargs["input_ids"].shape[0] > 16:
+            raise torch.OutOfMemoryError("test physical capacity")
+        return forward(*args, **kwargs)
+    monkeypatch.setattr(trainer.model, "forward", limited_forward)
+    result = trainer.train_batch(adapter_name="shared", batch=batch)
+    plans = [json.loads(line) for line in capsys.readouterr().out.splitlines()
+             if '"event": "optimizer_group_plan"' in line]
+    assert len(plans) == 2 and plans[0] == plans[1]
+    assert result["num_optimizer_steps"] == 4
+    assert result["physical_microbatch_size"] == 16
+    assert result["microbatch_oom_attempts"] == 1
+
+
+def test_grouped_judge_updates_keep_all_pairs_and_match_reference():
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_keep_groups_together=True,
+                             train_optimizer_batch_size=32, train_minibatch_size=32,
+                             train_length_bucket_batches=True)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    reference = _fake_trainer()
+    reference.optimizer = torch.optim.SGD(reference.model.parameters(), lr=0.1)
+    templates = _ce_only_pair_rows()
+    batch = []
+    for pair in range(64):
+        for template in templates[(pair % 3) * 2:(pair % 3) * 2 + 2]:
+            batch.append(replace(template, metadata={**template.metadata,
+                "optimizer_group_id": str(pair // 8), "judge_coherence_pair_id": str(pair)}))
+    for start in range(0, 128, 32):
+        reference.train_batch(adapter_name="judge", batch=batch[start:start + 32],
+                              objective="supervised_label_ce_js", judge_coherence_js_weight=0.5)
+    result = trainer.train_batch(adapter_name="judge", batch=batch,
+                                  objective="supervised_label_ce_js", judge_coherence_js_weight=0.5)
+    assert result["num_optimizer_steps"] == 4
+    assert result["num_train_minibatches"] == 4
+    assert result["judge_coherence_pair_count"] == 64
+    assert trainer.model.bias.item() == pytest.approx(reference.model.bias.item(), abs=1e-7)
+
+
+def test_grouped_batches_refuse_partial_groups_before_update():
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_keep_groups_together=True,
+                             train_optimizer_batch_size=32)
+    batch = [replace(r, metadata={"optimizer_group_id": "one"}) for r in _capacity_rows(33)]
+    with pytest.raises(ValueError, match="cannot split"):
+        trainer.train_batch(adapter_name="shared", batch=batch)
+    assert trainer.model.bias.item() == 0.0
+    trainer.config = replace(trainer.config, train_max_tokens=1)
+    batch = [batch[0], replace(batch[1], input_ids=[0, 0])]
+    with pytest.raises(ValueError, match="complete optimizer group"):
+        trainer.train_batch(adapter_name="shared", batch=batch)
+    assert trainer.model.bias.item() == 0.0

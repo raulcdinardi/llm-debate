@@ -23,6 +23,13 @@ def _sha256(path: Path) -> str:
 def config_fingerprint(config: dict[str, Any]) -> str:
     # The new default is identical to historical single-update checkpoints.
     config = dict(config)
+    if config.get("train_keep_groups_together") is False:
+        del config["train_keep_groups_together"]
+    # Newly explicit kernel defaults preserve historical dispatch. Non-default
+    # choices stay in the fingerprint and cannot silently change on resume.
+    for key, default in (("train_gdn_backend", "auto"), ("train_lm_head_kernel", "torch")):
+        if config.get(key) == default:
+            del config[key]
     # An opt-out run remains compatible with pre-shadow exact-resume manifests.
     if not config.get("train_shadow_judge", False):
         config.pop("train_shadow_judge", None)

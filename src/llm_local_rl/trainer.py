@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from functools import cached_property
+import copy
+import gc
 import json
 import math
 from pathlib import Path
 import re
 from statistics import mean, pstdev
+import time
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from llm_local_rl.behavior_policy import BehaviorPolicySpec
+from llm_local_rl.checkpointing import capture_rng_state, restore_rng_state
 from llm_local_rl.memory_trace import (
     MemoryTraceRecorder,
     current_alloc_bytes,
@@ -28,7 +34,9 @@ from llm_local_rl.model_io_trace import (
     is_model_io_tracing_enabled,
 )
 from llm_local_rl.on_policy_logprobs import check_on_policy_logprobs
+from llm_local_rl.optimizer_batching import pack_optimizer_groups
 from llm_local_rl.types import AdapterName, TrainExample
+from llm_local_rl.training_kernels import validate_training_kernels, verify_fla_gdn
 
 
 TRAIN_LOGPROB_BACKEND_FULL_LOGITS = "full_logits"
@@ -48,6 +56,45 @@ class BehaviorPolicyLogprobMismatchError(RuntimeError):
     """Raised before PPO ratio/backward when zero-update parity fails."""
 
 
+class _OptimizerRollbackSnapshot:
+    """CPU-only transaction state for the active adapter's grouped updates."""
+
+    def __init__(self, optimizer):
+        self.entries = []
+        self.nbytes = 0
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                if not parameter.requires_grad:
+                    continue
+                value = parameter.detach().to(device="cpu", copy=True)
+                self.nbytes += value.numel() * value.element_size()
+                state = None
+                if parameter in optimizer.state:
+                    state = {}
+                    for key, item in optimizer.state[parameter].items():
+                        if torch.is_tensor(item):
+                            saved = item.detach().to(device="cpu", copy=True)
+                            self.nbytes += saved.numel() * saved.element_size()
+                            state[key] = (saved, item.device)
+                        else:
+                            state[key] = (copy.deepcopy(item), None)
+                self.entries.append((parameter, value, state))
+
+    @torch.no_grad()
+    def restore(self, optimizer):
+        # Discard lazy Adam allocations before copying the original state back.
+        # Missing state must remain missing; a zeroed state has different steps.
+        for parameter, _, _ in self.entries:
+            optimizer.state.pop(parameter, None)
+        for parameter, value, state in self.entries:
+            parameter.copy_(value)
+            if state is not None:
+                optimizer.state[parameter] = {
+                    key: saved.to(device=device, copy=True) if device is not None else copy.deepcopy(saved)
+                    for key, (saved, device) in state.items()
+                }
+
+
 @dataclass(frozen=True)
 class TrainerConfig:
     base_model_path: str
@@ -63,11 +110,14 @@ class TrainerConfig:
     ppo_clip_epsilon: float = 0.2
     train_minibatch_size: int = 0
     train_optimizer_batch_size: int = 0
+    train_keep_groups_together: bool = False
     train_max_tokens: int = 0
     train_length_bucket_batches: bool = False
     train_logprob_backend: str = TRAIN_LOGPROB_BACKEND_FULL_LOGITS
     compile_train_logprob_helper: bool = False
-    gradient_checkpointing: bool = True
+    train_lm_head_kernel: str = "torch"
+    train_gdn_backend: str = "auto"
+    gradient_checkpointing: bool = False
     on_policy_logprob_check: bool = True
     on_policy_logprob_warn_only: bool = False
     on_policy_logprob_abs_tol: float = 1e-3
@@ -76,6 +126,12 @@ class TrainerConfig:
     behavior_policy: BehaviorPolicySpec = field(default_factory=BehaviorPolicySpec)
 
     def __post_init__(self) -> None:
+        validate_training_kernels(
+            train_gdn_backend=self.train_gdn_backend,
+            train_lm_head_kernel=self.train_lm_head_kernel,
+            train_logprob_backend=self.train_logprob_backend,
+            compile_train_logprob_helper=self.compile_train_logprob_helper,
+        )
         if self.train_optimizer_batch_size < 0:
             raise ValueError("train_optimizer_batch_size must be non-negative")
         if self.train_logprob_backend not in TRAIN_LOGPROB_BACKENDS:
@@ -398,6 +454,26 @@ def _lm_head_logits(
     return logits
 
 
+def _lm_head_logprob_chunk(
+    hidden_states, weight, bias, target_ids, entropy_positions,
+    behavior_temperature, allowed_token_ids, compile_helper,
+):
+    logits = _lm_head_logits(
+        hidden_states=hidden_states, weight=weight, bias=bias,
+        compile_helper=compile_helper,
+    )
+    logits_float = logits.float() / float(behavior_temperature)
+    logprobs = _flat_target_logprobs(
+        logits_float=logits_float, target_ids=target_ids,
+        allowed_token_ids=allowed_token_ids,
+    )
+    with torch.no_grad():
+        entropy = _flat_policy_entropy(
+            logits_float=logits_float, allowed_token_ids=allowed_token_ids,
+        )[entropy_positions].sum()
+    return logprobs, entropy
+
+
 def _selected_lm_head_token_logprobs(
     *,
     hidden_states: torch.Tensor,
@@ -409,7 +485,12 @@ def _selected_lm_head_token_logprobs(
     allowed_token_ids_by_selected_position: list[tuple[int, ...]] | None = None,
     max_positions_per_chunk: int = _TARGET_LOGPROB_POSITIONS_PER_CHUNK,
     compile_helper: bool = False,
+    kernel: str = "torch",
 ) -> tuple[torch.Tensor, float]:
+    if kernel not in ("torch", "triton"):
+        raise ValueError(f"Unsupported LM-head kernel {kernel!r}")
+    if kernel == "triton" and compile_helper:
+        raise ValueError("triton LM-head kernel cannot use compile_helper")
     if hidden_states.ndim != 3:
         raise ValueError(f"hidden_states must have shape [batch, seq, hidden], got {tuple(hidden_states.shape)}")
     if target_ids.shape != hidden_states.shape[:2]:
@@ -464,37 +545,46 @@ def _selected_lm_head_token_logprobs(
             f"{int(selected_hidden_states.shape[-1])}."
         )
 
+    if kernel == "triton":
+        from llm_local_rl.fused_lm_head import selected_logprobs
+        return selected_logprobs(
+            hidden=selected_hidden_states, weight=weight, bias=bias,
+            targets=selected_target_ids, entropy_positions=selected_entropy_positions,
+            temperature=float(behavior_temperature),
+            allowed_tokens=allowed_token_ids_by_selected_position,
+            chunk_size=max_positions_per_chunk,
+        )
+
     logprob_chunks = []
     entropy_sum = 0.0
     for start in range(0, int(selected_target_ids.numel()), max_positions_per_chunk):
         end = min(start + max_positions_per_chunk, int(selected_target_ids.numel()))
-        logits = _lm_head_logits(
-            hidden_states=selected_hidden_states[start:end],
-            weight=weight,
-            bias=bias,
-            compile_helper=compile_helper,
-        )
-        logits_float = logits.float() / float(behavior_temperature)
         chunk_allowed = (
             None
             if allowed_token_ids_by_selected_position is None
             else allowed_token_ids_by_selected_position[start:end]
         )
-        logprob_chunks.append(
-            _flat_target_logprobs(
-                logits_float=logits_float,
-                target_ids=selected_target_ids[start:end],
-                allowed_token_ids=chunk_allowed,
-            )
+        args = (
+            selected_hidden_states[start:end], weight, bias,
+            selected_target_ids[start:end], selected_entropy_positions[start:end],
+            behavior_temperature, chunk_allowed, compile_helper,
         )
-        with torch.no_grad():
-            entropy_values = _flat_policy_entropy(
-                logits_float=logits_float,
-                allowed_token_ids=chunk_allowed,
+        # Chunking projection alone retains every chunk's vocabulary-sized CE
+        # activations. Checkpoint the entire projection/loss so backward recreates
+        # and frees those activations one chunk at a time. Pass chunk metadata as
+        # arguments: a loop closure would replay the final chunk during backward.
+        if torch.is_grad_enabled() and any(
+            tensor is not None and tensor.requires_grad
+            for tensor in (selected_hidden_states, weight, bias)
+        ):
+            logprobs, entropy = checkpoint(
+                _lm_head_logprob_chunk, *args, use_reentrant=False,
+                preserve_rng_state=False,
             )
-            entropy_sum += float(
-                entropy_values[selected_entropy_positions[start:end]].sum().detach().cpu().item()
-            )
+        else:
+            logprobs, entropy = _lm_head_logprob_chunk(*args)
+        logprob_chunks.append(logprobs)
+        entropy_sum += float(entropy.detach().cpu().item())
 
     return torch.cat(logprob_chunks, dim=0), entropy_sum
 
@@ -752,6 +842,7 @@ class MultiAdapterTrainer:
                 selected_positions=selected_positions,
             ),
             compile_helper=self.config.compile_train_logprob_helper,
+            kernel=self.config.train_lm_head_kernel,
         )
 
     @classmethod
@@ -820,6 +911,11 @@ class MultiAdapterTrainer:
             torch_dtype=_resolve_dtype(self.config.torch_dtype),
         )
         base_model.config.use_cache = False
+        if self.config.train_gdn_backend == "fla":
+            if torch.device(self.config.device).type != "cuda":
+                raise ValueError("train_gdn_backend='fla' requires CUDA training")
+            self.training_kernel_receipt = verify_fla_gdn(base_model)
+            print(json.dumps({"training_kernel_receipt": self.training_kernel_receipt}), flush=True)
         if self.config.gradient_checkpointing and hasattr(base_model, "gradient_checkpointing_enable"):
             base_model.gradient_checkpointing_enable()
         if hasattr(base_model, "enable_input_require_grads"):
@@ -1002,6 +1098,23 @@ class MultiAdapterTrainer:
             self.reference_adapter_names[logical_name] = reference_name
 
     def compute_logprobs(self, *, adapter_name: AdapterName, batch: list[TrainExample]) -> list[list[float]]:
+        # Reference scoring must obey the same physical limit as backward. A
+        # full-batch reference OOM cannot be fixed by shrinking backward alone.
+        size = self.config.train_minibatch_size if self.config.train_minibatch_size > 0 else len(batch)
+        logical_name = next((name for name, reference in getattr(self, "reference_adapter_names", {}).items()
+                             if reference == adapter_name), adapter_name)
+        size = min(size, self._microbatch_limits.get(logical_name, size))
+        rows: list[list[float]] = []
+        for start in range(0, len(batch), max(1, size)):
+            rows.extend(self._compute_logprobs_minibatch(
+                adapter_name=adapter_name, batch=batch[start:start + size],
+                minibatch_start=start,
+            ))
+        return rows
+
+    def _compute_logprobs_minibatch(
+        self, *, adapter_name: AdapterName, batch: list[TrainExample], minibatch_start: int,
+    ) -> list[list[float]]:
         self.wake_up()
         self.set_adapter(adapter_name)
         self.model.eval()
@@ -1054,7 +1167,7 @@ class MultiAdapterTrainer:
                         adapter_name=adapter_name,
                         batch=batch,
                         tensors=tensors,
-                        minibatch_start=0,
+                        minibatch_start=minibatch_start,
                         token_logprobs=token_logprobs,
                         top_token_ids=top_indices,
                         top_logprobs=top_values,
@@ -1086,6 +1199,17 @@ class MultiAdapterTrainer:
         self.model.train()
         return out
 
+    @cached_property
+    def _microbatch_limits(self) -> dict[str, int]:
+        # Per-adapter, monotone ceilings: a shorter subsequent batch must not
+        # trigger another upward capacity search or erase an earlier OOM limit.
+        return {}
+
+    def _training_progress(self, event: str, **fields) -> None:
+        callback = getattr(self, "progress_callback", None)
+        if callback is not None:
+            callback(event, attempt_index=getattr(self, "_capacity_attempt_index", 0), **fields)
+
     def train_batch(
         self,
         *,
@@ -1094,6 +1218,123 @@ class MultiAdapterTrainer:
         objective: str = TRAIN_OBJECTIVE_PPO,
         judge_coherence_js_weight: float = 1.0,
         measure_reference_kl: bool = False,
+    ) -> dict[str, object]:
+        kwargs = dict(adapter_name=adapter_name, batch=batch, objective=objective,
+                      judge_coherence_js_weight=judge_coherence_js_weight,
+                      measure_reference_kl=measure_reference_kl)
+        if not batch:
+            return self._train_batch(**kwargs)
+        original_config = self.config
+        requested = original_config.train_minibatch_size if original_config.train_minibatch_size > 0 else len(batch)
+        optimizer_size = original_config.train_optimizer_batch_size or len(batch)
+        paired = objective in (TRAIN_OBJECTIVE_SUPERVISED_LABEL_CE_JS, TRAIN_OBJECTIVE_UNSUPERVISED_JS)
+        if paired and requested % 2:
+            raise ValueError("direct JS objectives require an even train_minibatch_size")
+        if paired and optimizer_size % 2:
+            raise ValueError("direct JS objectives require an even train_optimizer_batch_size")
+        if paired and len(batch) % 2:
+            raise ValueError("direct JS objectives require an even number of rows")
+        unit = 2 if paired else 1
+        candidate = min(requested, optimizer_size, len(batch), self._microbatch_limits.get(adapter_name, requested))
+        candidate = max(unit, candidate // unit * unit)
+        initial_candidate = candidate
+        rng = capture_rng_state()
+        failures = 0
+        retry_seconds = 0.0
+        rolled_back_updates = 0
+        snapshot = None
+        snapshot_seconds = 0.0
+        if optimizer_size < len(batch):
+            self.wake_up()
+            self.set_adapter(adapter_name)
+            started = time.monotonic()
+            snapshot = _OptimizerRollbackSnapshot(self.optimizer)
+            snapshot_seconds = time.monotonic() - started
+        self._capacity_optimizer_started = False
+        self._capacity_optimizer_in_step = False
+        self._capacity_optimizer_updates = 0
+
+        def attempt():
+            started = time.monotonic()
+            try:
+                return self._train_batch(**kwargs, _ordering_minibatch_size=requested), None, 0.0
+            except torch.OutOfMemoryError as error:
+                elapsed = time.monotonic() - started
+                print(json.dumps({
+                    "event": "train_microbatch_oom", "adapter_name": adapter_name,
+                    "physical_microbatch_size": candidate, "attempt_seconds": elapsed,
+                    "optimizer_started": self._capacity_optimizer_started,
+                    "optimizer_in_step": self._capacity_optimizer_in_step,
+                    "completed_optimizer_updates": self._capacity_optimizer_updates,
+                }), flush=True)
+                # Optimizer.step can partially mutate state before raising.
+                # Only completed updates outside that call can be rolled back.
+                if self._capacity_optimizer_in_step or (self._capacity_optimizer_started and snapshot is None):
+                    raise
+                return None, str(error), elapsed
+
+        try:
+            while True:
+                self.config = replace(original_config, train_minibatch_size=candidate)
+                self._capacity_attempt_index = failures
+                self._capacity_optimizer_started = False
+                self._capacity_optimizer_in_step = False
+                self._capacity_optimizer_updates = 0
+                self._training_progress("attempt_begin", adapter_name=adapter_name, end_row=0,
+                                        physical_microbatch_size=candidate)
+                metrics, oom, elapsed = attempt()
+                if metrics is not None:
+                    metrics.update(
+                        train_lm_head_kernel=original_config.train_lm_head_kernel,
+                        train_gdn_backend=original_config.train_gdn_backend,
+                        train_keep_groups_together=original_config.train_keep_groups_together,
+                        physical_microbatch_size=candidate,
+                        microbatch_initial_size=initial_candidate,
+                        microbatch_oom_attempts=failures,
+                        microbatch_retry_seconds=retry_seconds,
+                        microbatch_rolled_back_optimizer_steps=rolled_back_updates,
+                        microbatch_rollback_snapshot_bytes=snapshot.nbytes if snapshot is not None else 0,
+                        microbatch_rollback_snapshot_seconds=snapshot_seconds,
+                    )
+                    return metrics
+                # The exception frame has unwound before clearing its tensors.
+                self.optimizer.zero_grad(set_to_none=True)
+                gc.collect()
+                if self.compute_device == "cuda":
+                    torch.cuda.empty_cache()
+                if self._capacity_optimizer_updates:
+                    snapshot.restore(self.optimizer)
+                    rolled_back_updates += self._capacity_optimizer_updates
+                    rollback = dict(adapter_name=adapter_name, end_row=0,
+                                    physical_microbatch_size=candidate,
+                                    discarded_optimizer_updates=self._capacity_optimizer_updates,
+                                    total_discarded_optimizer_updates=rolled_back_updates)
+                    print(json.dumps({"event": "train_microbatch_rollback", **rollback}), flush=True)
+                    self._training_progress("attempt_rollback", **rollback)
+                restore_rng_state(rng)
+                if candidate <= unit:
+                    raise torch.OutOfMemoryError(
+                        f"{adapter_name}: minimum microbatch {candidate} exhausted with no retained updates: {oom}"
+                    )
+                candidate = max(unit, (candidate // 2) // unit * unit)
+                self._microbatch_limits[adapter_name] = candidate
+                failures += 1
+                retry_seconds += elapsed
+        finally:
+            self.config = original_config
+            self._capacity_optimizer_started = False
+            self._capacity_optimizer_in_step = False
+            self._capacity_optimizer_updates = 0
+
+    def _train_batch(
+        self,
+        *,
+        adapter_name: AdapterName,
+        batch: list[TrainExample],
+        objective: str = TRAIN_OBJECTIVE_PPO,
+        judge_coherence_js_weight: float = 1.0,
+        measure_reference_kl: bool = False,
+        _ordering_minibatch_size: int | None = None,
     ) -> dict[str, object]:
         if objective not in TRAIN_OBJECTIVES:
             raise ValueError(f"Unsupported training objective={objective!r}; expected {TRAIN_OBJECTIVES!r}")
@@ -1146,6 +1387,14 @@ class MultiAdapterTrainer:
             raise ValueError(
                 "Dropping an overlength row would break a direct-JS forward/reverse pair"
             )
+        if self.config.train_keep_groups_together and num_dropped_overlength:
+            raise ValueError("Dropping overlength rows would break a complete optimizer group")
+
+        optimizer_batch_size = self.config.train_optimizer_batch_size or len(trainable_batch)
+        optimizer_groups = (
+            pack_optimizer_groups(trainable_batch, max_rows=optimizer_batch_size)
+            if self.config.train_keep_groups_together else None
+        )
 
         self.wake_up()
         reference_rows_by_example: dict[int, list[float]] = {}
@@ -1161,33 +1410,40 @@ class MultiAdapterTrainer:
         minibatch_size = (
             self.config.train_minibatch_size if self.config.train_minibatch_size > 0 else len(trainable_batch)
         )
+        ordering_size = minibatch_size
+        if 0 < self.config.train_optimizer_batch_size < len(trainable_batch) and _ordering_minibatch_size is not None:
+            # Retrying a physical batch must not repartition optimizer groups.
+            ordering_size = _ordering_minibatch_size
         if direct_js_objective:
             if minibatch_size % 2 != 0:
                 raise ValueError("direct JS objectives require an even train_minibatch_size")
-            ordered_batch = _order_paired_js_batch_for_minibatching(
-                batch=trainable_batch,
-                max_tokens=self.config.train_max_tokens,
-                length_bucket_batches=(
-                    self.config.train_length_bucket_batches
-                    and minibatch_size < len(trainable_batch)
-                ),
-            )
+        order_batch = _order_paired_js_batch_for_minibatching if direct_js_objective else _order_batch_for_minibatching
+        order_kwargs = dict(max_tokens=self.config.train_max_tokens,
+                            length_bucket_batches=self.config.train_length_bucket_batches and ordering_size < len(trainable_batch))
+        if optimizer_groups is None:
+            ordered_batch = order_batch(batch=trainable_batch, **order_kwargs)
+            optimizer_groups = [ordered_batch[start:start + optimizer_batch_size]
+                                for start in range(0, len(ordered_batch), optimizer_batch_size)]
         else:
-            ordered_batch = _order_batch_for_minibatching(
-                batch=trainable_batch,
-                max_tokens=self.config.train_max_tokens,
-                length_bucket_batches=self.config.train_length_bucket_batches and minibatch_size < len(trainable_batch),
-            )
-        optimizer_batch_size = self.config.train_optimizer_batch_size or len(ordered_batch)
+            # Membership is fixed BEFORE length sorting or OOM capacity retries.
+            optimizer_groups = [order_batch(batch=group, **order_kwargs) for group in optimizer_groups]
+            ordered_batch = [row for group in optimizer_groups for row in group]
         if direct_js_objective and optimizer_batch_size % 2:
             raise ValueError("direct JS objectives require an even train_optimizer_batch_size")
         # Physical chunks never straddle an optimizer boundary, including short tails.
         chunks = []
-        for optimizer_start in range(0, len(ordered_batch), optimizer_batch_size):
-            optimizer_end = min(optimizer_start + optimizer_batch_size, len(ordered_batch))
+        optimizer_start = 0
+        for group in optimizer_groups:
+            optimizer_end = optimizer_start + len(group)
             for start in range(optimizer_start, optimizer_end, minibatch_size):
                 chunks.append((start, min(start + minibatch_size, optimizer_end),
                                optimizer_start, optimizer_end - optimizer_start))
+            optimizer_start = optimizer_end
+        if self.config.train_keep_groups_together:
+            print(json.dumps({"event": "optimizer_group_plan", "adapter_name": adapter_name,
+                              "batch_rows": [len(group) for group in optimizer_groups],
+                              "group_ids": [list(dict.fromkeys(row.metadata["optimizer_group_id"] for row in group))
+                                            for group in optimizer_groups]}), flush=True)
 
         def check_minibatch(minibatch, current_logprob_rows, start_idx):
             check_result = check_on_policy_logprobs(
@@ -1252,13 +1508,15 @@ class MultiAdapterTrainer:
             return check_result
 
         preflight_checks = {}
-        if optimizer_batch_size < len(ordered_batch) and not direct_js_objective:
+        if len(optimizer_groups) > 1 and not direct_js_objective:
             # Check every sampled token at the rollout policy BEFORE any update.
             # Later ratios deliberately compare the updated policy to frozen rollout logprobs.
             for start, end, _, _ in chunks:
                 minibatch = ordered_batch[start:end]
                 rows = self.compute_logprobs(adapter_name=adapter_name, batch=minibatch)
                 preflight_checks[start] = check_minibatch(minibatch, rows, start)
+                self._training_progress("preflight_complete", adapter_name=adapter_name, end_row=end,
+                                        physical_microbatch_size=minibatch_size)
         total_loss_value = 0.0
         total_trained_tokens = 0
         approx_kl_numerator = 0.0
@@ -1294,7 +1552,7 @@ class MultiAdapterTrainer:
         if self._mem_trace_active():
             mem_step_idx = self._mem_rec.next_step()
 
-        def optimizer_step():
+        def optimizer_step(end_row):
             grad_params = [param for param in self.model.parameters() if param.requires_grad and param.grad is not None]
             nonfinite_gradient_count = sum(
                 int((~torch.isfinite(param.grad)).sum().detach().cpu().item()) for param in grad_params
@@ -1317,7 +1575,15 @@ class MultiAdapterTrainer:
                 grad_norm = 0.0
             if self._mem_trace_active():
                 reset_peak(self.compute_device)
+            self._capacity_optimizer_started = True
+            self._capacity_optimizer_in_step = True
             self.optimizer.step()
+            self._capacity_optimizer_in_step = False
+            self._capacity_optimizer_updates = getattr(self, "_capacity_optimizer_updates", 0) + 1
+            self._training_progress("optimizer_step_complete", adapter_name=adapter_name, end_row=end_row,
+                                    physical_microbatch_size=minibatch_size,
+                                    optimizer_group_index=self._capacity_optimizer_updates - 1,
+                                    provisional=True)
             selected_layer_metrics = self._selected_layer_optimizer_metrics()
             if self._mem_trace_active():
                 alloc_after_optim = current_alloc_bytes(self.compute_device)
@@ -1350,7 +1616,7 @@ class MultiAdapterTrainer:
         for start_idx, end_idx, optimizer_start, normalization_sample_count in chunks:
             if start_idx == optimizer_start and start_idx > 0:
                 if total_trained_tokens > trained_tokens_at_update_start:
-                    optimizer_metrics.append(optimizer_step())
+                    optimizer_metrics.append(optimizer_step(start_idx))
                 self.optimizer.zero_grad(set_to_none=True)
                 trained_tokens_at_update_start = total_trained_tokens
             normalization_pair_count = normalization_sample_count // 2 if direct_js_objective else 0
@@ -1501,6 +1767,7 @@ class MultiAdapterTrainer:
                             selected_positions=selected_positions,
                         ),
                         compile_helper=self.config.compile_train_logprob_helper,
+                        kernel=self.config.train_lm_head_kernel,
                     )
                     trained_within_selected = trained_positions[selected_positions]
                     selected_logprobs = scored_logprobs[trained_within_selected]
@@ -1648,6 +1915,8 @@ class MultiAdapterTrainer:
                 reset_peak(self.compute_device)
                 _mem_t_backward = now_seconds()
             loss.backward()
+            self._training_progress("backward_complete", adapter_name=adapter_name, end_row=end_idx,
+                                    physical_microbatch_size=minibatch_size)
             if self._mem_trace_active():
                 _mem_alloc_after_backward = current_alloc_bytes(self.compute_device)
                 _mem_peak_after_backward = peak_alloc_bytes(self.compute_device)
@@ -1772,7 +2041,7 @@ class MultiAdapterTrainer:
             }
 
         if total_trained_tokens > trained_tokens_at_update_start:
-            optimizer_metrics.append(optimizer_step())
+            optimizer_metrics.append(optimizer_step(len(ordered_batch)))
         grad_norm = max(item[0] for item in optimizer_metrics)
         grad_max_abs = max(item[1] for item in optimizer_metrics)
         selected_layer_metrics = optimizer_metrics[-1][2]
@@ -1982,6 +2251,7 @@ class MultiAdapterTrainer:
             "adapter_names": list(self.config.adapter_names),
             "learning_rate": float(self.config.learning_rate),
             "weight_decay": float(self.config.weight_decay),
+            "microbatch_limits": dict(self._microbatch_limits),
         }
 
     def load_training_state_dict(self, state: dict[str, object]) -> None:
@@ -1993,8 +2263,17 @@ class MultiAdapterTrainer:
             raise ValueError("Trainer-state learning rate does not match the run configuration.")
         if float(state.get("weight_decay", float("nan"))) != float(self.config.weight_decay):
             raise ValueError("Trainer-state weight decay does not match the run configuration.")
+        # Older checkpoints predate capacity memory; they start without a cap.
+        limits = state.get("microbatch_limits", {})
+        if not isinstance(limits, dict) or any(
+            not isinstance(name, str) or type(size) is not int or size < 1
+            for name, size in limits.items()
+        ):
+            raise ValueError("Invalid trainer-state microbatch limits")
         self.optimizer.load_state_dict(state["optimizer"])
         self._move_optimizer_state(device=self.current_device)
+        self._microbatch_limits.clear()
+        self._microbatch_limits.update(limits)
 
     def load_adapter(self, *, adapter_name: AdapterName, adapter_dir: str) -> None:
         if self.single_target_parameter_adapter_mode:

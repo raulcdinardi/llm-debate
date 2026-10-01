@@ -278,6 +278,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--train-max-tokens", type=int, default=0)
     parser.add_argument("--train-length-bucket-batches", action="store_true")
+    parser.add_argument("--train-keep-groups-together", action="store_true",
+                        help="Pack whole advantage/prompt groups into optimizer batches before length sorting.")
     parser.add_argument(
         "--train-logprob-backend",
         default="full_logits",
@@ -293,7 +295,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--stop-parsed-reward-hacking-min", type=float, default=None)
     parser.add_argument("--stop-parsed-reward-hacking-max", type=float, default=None)
-    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False,
+        help="Opt into backbone activation recomputation to reduce training memory. "
+        "Disabled by default; independent LM-head chunk checkpointing remains enabled.",
+    )
     parser.add_argument(
         "--on-policy-logprob-check",
         action="store_true",
@@ -313,6 +319,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--on-policy-logprob-abs-tol", type=float, default=1e-3)
     parser.add_argument("--on-policy-logprob-warning-path", default=None)
+    parser.add_argument("--train-lm-head-kernel", choices=["torch", "triton"], default="torch",
+                        help="Opt into chunked projection with fused logprobs/entropy; requires selective_lm_head and CUDA.")
+    parser.add_argument("--train-gdn-backend", choices=["auto", "fla"], default="auto",
+                        help="Require FLA GDN and causal-conv training kernels on Qwen3.5; fail if inactive.")
     parser.add_argument("--on-policy-logprob-max-records-per-batch", type=int, default=8)
     parser.add_argument("--sampler-gpu-memory-utilization", type=float, default=0.55)
     parser.add_argument("--sampler-max-model-len", type=int, default=512)
@@ -322,7 +332,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Opt into vLLM prefix reuse (including same-LoRA R2 to R3), using hybrid align mode. "
         "Omit to preserve engine defaults. Applies to all matching same-adapter prefixes.",
     )
-    parser.add_argument("--sampler-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--sampler-enforce-eager", action=argparse.BooleanOptionalAction, default=False,
+        help="Disable vLLM CUDA graphs and compilation; graph-capable inference is the default.",
+    )
     parser.add_argument(
         "--sampler-teardown-before-training",
         action="store_true",
@@ -506,10 +519,13 @@ def main() -> int:
                 rollout_assistant_prefill=args.rollout_assistant_prefill,
                 train_minibatch_size=args.train_minibatch_size,
                 train_optimizer_batch_size=args.train_optimizer_batch_size,
+                train_keep_groups_together=args.train_keep_groups_together,
                 train_max_tokens=args.train_max_tokens,
                 train_length_bucket_batches=args.train_length_bucket_batches,
                 train_logprob_backend=args.train_logprob_backend,
                 compile_train_logprob_helper=args.compile_train_logprob_helper,
+                train_lm_head_kernel=args.train_lm_head_kernel,
+                train_gdn_backend=args.train_gdn_backend,
                 train_adapter_names=tuple(args.train_adapter_names),
                 stop_parsed_reward_hacking_min=args.stop_parsed_reward_hacking_min,
                 stop_parsed_reward_hacking_max=args.stop_parsed_reward_hacking_max,
