@@ -88,15 +88,26 @@ class RoutedTrainer:
 class RoutedSampler:
     """Use two existing samplers without mixing model-specific token IDs."""
 
-    def __init__(self, *, actor: Any, judge: Any) -> None:
+    def __init__(self, *, actor: Any, judge: Any, trainable_adapter_names: set[str]) -> None:
         self.actor = actor
         self.judge = judge
+        self.trainable_adapter_names = set(trainable_adapter_names)
         self._active = None
+
+    def _names_for(self, sampler, names):
+        return names & JUDGE_ADAPTERS if sampler is self.judge else names - JUDGE_ADAPTERS
+
+    def _sleep_active(self, level):
+        if self._active is not None:
+            names = self._names_for(self._active, self.trainable_adapter_names)
+            if names:
+                self._active.unload_adapters(adapter_names=names)
+            self._active.sleep(level=level)
+            self._active = None
 
     def _activate(self, sampler):
         if self._active is not sampler:
-            if self._active is not None:
-                self._active.sleep(level=1)
+            self._sleep_active(level=1)
             sampler.wake_up()
             self._active = sampler
 
@@ -119,17 +130,24 @@ class RoutedSampler:
         self.judge.set_adapter_paths(adapter_paths=judge)
 
     def unload_adapters(self, *, adapter_names: set[str]) -> None:
-        self.actor.unload_adapters(adapter_names=adapter_names - JUDGE_ADAPTERS)
-        self.judge.unload_adapters(adapter_names=adapter_names & JUDGE_ADAPTERS)
+        for sampler in (self.actor, self.judge):
+            names = self._names_for(sampler, adapter_names)
+            if not names:
+                continue
+            if sampler is self._active:
+                sampler.unload_adapters(adapter_names=names)
+            else:
+                # Every registered mutable LoRA was evicted before sleep.
+                # Do not queue by name: next-step paths may bind it to a new ID.
+                if names - self.trainable_adapter_names:
+                    raise ValueError("Cannot unload a frozen adapter while its engine is asleep")
 
     def wake_up(self) -> None:
         # Each actual request activates exactly one engine.
         return None
 
     def sleep(self, *, level: int = 1) -> None:
-        if self._active is not None:
-            self._active.sleep(level=level)
-            self._active = None
+        self._sleep_active(level=level)
 
     def close(self) -> None:
         try:

@@ -25,7 +25,11 @@ def metadata(config, output_dir):
     phase = 'phase0' if any(word in str(output_dir).lower() for word in ('phase0', 'smoke', 'preflight', 'disposable')) else 'full'
     init = config.get('init_adapter_dirs')
     model = str(config.get('model_path', config.get('model', 'model unspecified')))
-    return {'observability_contract': CONTRACT_VERSION, 'observability_category': category,
+    backbones = {"actor": model}
+    if config.get("judge_model_path"):
+        backbones["judge"] = config["judge_model_path"]
+    return {'observability_backbones': json.dumps(backbones, sort_keys=True),
+            'observability_contract': CONTRACT_VERSION, 'observability_category': category,
             'observability_phase': phase,
             'observability_initialization': json.dumps(init, sort_keys=True) if init else f'fresh adapters · {model}'}
 
@@ -36,6 +40,8 @@ def default_name(config, output_dir, explicit=None):
         return explicit
     meta = metadata(config, output_dir)
     model = str(config.get('model_path', config.get('model', 'model unspecified'))).rsplit('/', 1)[-1]
+    if config.get("judge_model_path"):
+        model += " + judge=" + str(config["judge_model_path"]).rsplit("/", 1)[-1]
     init = config.get('init_adapter_dirs')
     if isinstance(init, dict) and init:
         lineage = ', '.join(f'{role}={Path(str(path)).parent.name}/{Path(str(path)).name}' for role, path in sorted(init.items()))

@@ -245,6 +245,8 @@ class TrainRunConfig:
         if self.judge_tokenizer_path is not None and self.judge_model_path is None:
             raise ValueError("judge_tokenizer_path requires judge_model_path")
         if self.judge_model_path is not None:
+            if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1") == "0":
+                raise ValueError("Two sleeping vLLM engines require separate V1 worker processes")
             if self.rollout.mode != "debate" or self.debate_judge_adapter != "judge":
                 raise ValueError("A separate judge backbone requires debate mode and the judge adapter")
             if self.sampler_backend != "vllm":

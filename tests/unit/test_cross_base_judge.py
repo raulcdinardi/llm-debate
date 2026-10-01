@@ -281,6 +281,7 @@ def test_driver_debate_runtime_forwards_cross_base_judge_config(monkeypatch: pyt
     )
     driver.debate_task = HTSequenceDebateTask(sequence_len=4)
     driver.tokenizer = tokenizer
+    driver.judge_tokenizer = tokenizer
     driver.sampler = policy_sampler
 
     runtime = driver._debate_runtime()

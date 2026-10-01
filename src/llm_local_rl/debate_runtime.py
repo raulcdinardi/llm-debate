@@ -210,7 +210,7 @@ class DebateRuntime:
 
     @property
     def _judge_tokenizer(self):
-        return getattr(self, "judge_tokenizer", None) or self.tokenizer
+        return self.tokenizer if self.judge_tokenizer is None else self.judge_tokenizer
 
     def __post_init__(self) -> None:
         if self.runtime_config.debate_judge_server_url is None:
@@ -389,7 +389,7 @@ class DebateRuntime:
                     SamplingRequest(
                         adapter_name=self._judge_adapter_name(),
                         prompt_token_ids=prompt_tokens,
-                        stop_token_ids=[adapter.stop_token_id],
+                        stop_token_ids=self.task.stop_token_ids(tokenizer=self._judge_tokenizer),
                         max_tokens=8,
                         temperature=0.0,
                         seed=step_seed,
@@ -789,8 +789,6 @@ class DebateRuntime:
         return out
 
     def _sample_judge_many(self, *, prompt_tokens_list: list[list[int]], round_num: int, step_seed: int | None, stop_token_ids: list[int], max_tokens: int, temperature: float) -> list[tuple[list[int], list[float], str, dict]]:
-        if self._judge_tokenizer is not self.tokenizer:
-            stop_token_ids = [get_chat_adapter(self._judge_tokenizer).stop_token_id]
         requests = []
         adapter_name = self._judge_adapter_name()
         allowed_token_ids = self._judge_allowed_token_ids()

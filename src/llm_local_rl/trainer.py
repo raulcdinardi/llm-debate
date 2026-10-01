@@ -98,7 +98,6 @@ class _OptimizerRollbackSnapshot:
 @dataclass(frozen=True)
 class TrainerConfig:
     base_model_path: str
-    tokenizer_path: str | None = None
     adapter_names: tuple[AdapterName, ...] = ("shared",)
     lora_rank: int = 32
     learning_rate: float = 1e-4
@@ -125,6 +124,7 @@ class TrainerConfig:
     on_policy_logprob_warning_path: str | None = None
     on_policy_logprob_max_records_per_batch: int = 8
     behavior_policy: BehaviorPolicySpec = field(default_factory=BehaviorPolicySpec)
+    tokenizer_path: str | None = None
 
     def __post_init__(self) -> None:
         validate_training_kernels(

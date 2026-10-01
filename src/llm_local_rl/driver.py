@@ -147,7 +147,9 @@ class TrainingDriver:
                 )
             )
         with self._stage("init_sampler", step=0):
-            self.sampler = self._make_sampler()
+            context = preserve_rng_state() if config.judge_model_path is not None else nullcontext()
+            with context:
+                self.sampler = self._make_sampler()
         self.observability = self._make_observability()
         self.observability.log_step(
             {
@@ -238,7 +240,10 @@ class TrainingDriver:
         with driver._stage("trainer_sleep", step=driver.start_step):
             driver.trainer.sleep()
         with driver._stage("init_sampler", step=driver.start_step):
-            driver.sampler = driver._make_sampler()
+            # Engine construction must not consume the restored training RNG.
+            context = preserve_rng_state() if config.judge_model_path is not None else nullcontext()
+            with context:
+                driver.sampler = driver._make_sampler()
         driver.observability = driver._make_observability()
         driver._rebuild_metric_history()
         driver._progress("driver_resume_done", output_dir=str(driver.output_dir), start_step=driver.start_step)
@@ -528,7 +533,7 @@ class TrainingDriver:
             on_policy_warning_path = str(self.output_dir / "on_policy_logprob_warnings.jsonl")
         return TrainerConfig(
             base_model_path=self.config.model_path,
-            tokenizer_path=self.config.tokenizer_path,
+            tokenizer_path=self.config.tokenizer_path if self.config.judge_model_path is not None else None,
             adapter_names=self._adapter_names(),
             learning_rate=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
@@ -663,7 +668,13 @@ class TrainingDriver:
                 finally:
                     actor.close()
                 raise
-            return RoutedSampler(actor=actor, judge=judge)
+            trainable = set(self._sampler_adapter_dirs())
+            selected = self._train_adapter_names()
+            if selected is not None:
+                trainable.intersection_update(selected)
+            if not self.config.train_judge:
+                trainable.difference_update({"judge", SHADOW_JUDGE})
+            return RoutedSampler(actor=actor, judge=judge, trainable_adapter_names=trainable)
         if self.config.sampler_backend == "transformers":
             from llm_local_rl.transformers_sampling import TrainerTransformersSampler
 
@@ -671,8 +682,7 @@ class TrainingDriver:
         if self.config.sampler_backend == "vllm":
             return self._make_vllm_sampler(model_path=self.config.model_path,
                 adapter_paths=self._sampler_adapter_dirs(),
-                memory_utilization=self.config.sampler_gpu_memory_utilization,
-                tokenizer_path=self.config.tokenizer_path)
+                memory_utilization=self.config.sampler_gpu_memory_utilization)
         if self.config.sampler_backend == "sglang":
             return SglangSampler(
                 runtime=SglangRuntimeConfig(
@@ -1002,7 +1012,7 @@ class TrainingDriver:
 
         judge_completion_tokens = debate.judge_completion_tokens or []
         judge_text = (
-            self.judge_tokenizer.decode(judge_completion_tokens, skip_special_tokens=True).strip()
+            getattr(self, "judge_tokenizer", self.tokenizer).decode(judge_completion_tokens, skip_special_tokens=True).strip()
             if judge_completion_tokens
             else ""
         )

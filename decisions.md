@@ -24,3 +24,7 @@
 2026-09-10T02:24:17.298541+00:00 | SID-20260909-shadow-judge | Implement opt-in paired CE judges: active null LoRA plus passive random-B/same-A adapter; explicit seed/std; same gold/order batches, isolated RNG and Adam state; no shadow sampler registration; dual metrics/checkpoint/harness/resume; raw soft rewards now permitted with CE. 417unitPASS/9skip, tiny real PEFT exact-resume and parameter isolation. No rental/full-model training. docs/paired_shadow_judge.md.
 
 2026-09-10T02:32:50.673837+00:00 | SID-20260909-qwen-h200 | User authorizes full Qwen3.5-4B MMLU-Pro fixed-R1 training with paired active/shadow judges and both-judge OOD/CW evaluations on one H200. Mode: rigorous scientific implementation, autonomous infrastructure within explicit scope. Preparing native token/prompt integration, pinned inputs, PRE and lifecycle; no rental yet.
+
+## 2026-10-01 — heterogeneous trainable judge
+
+Keep one TrainingDriver and MultiAdapterTrainer objective implementation for warm-up and coherence RL. Route judge/judge_shadow to an optional second backbone with native judge tokenization and independent Adam/capacity state. Shared hyperparameters and PEFT/kernel choices are explicit; the first implementation requires vLLM V1 worker isolation and sleep level1. Phase-0 validation on real hardware remains required. Preserve default single-backbone dispatch and frozen experiment sources.
