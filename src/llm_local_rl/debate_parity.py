@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import hashlib
 import math
 import re
 from typing import Any, Callable, Literal
 
 from llm_local_rl.prompts import load_prompt
 from llm_local_rl.types import TrainExample
+from llm_local_rl.trajectory_batching import merge_trajectory_examples
 
 Verdict = Literal["A", "B", "INVALID"]
 
@@ -50,13 +52,24 @@ def _legacy_numbered_completion_would_truncate(text: str) -> bool:
     return bool(truncated and truncated != clean)
 
 
-def audit_base_text_debate_format(*, text: str, round_num: int) -> dict[str, Any]:
+def audit_base_text_debate_format(*, text: str, round_num: int, contract: str = "legacy_base") -> dict[str, Any]:
     """Audit the exact visible later-round contract used by the base-text harness.
 
     The canonical header and ``1)`` are prompt-side prefill.  They are checked
     to ensure the expected harness was used, but only sampled completion tokens
     receive advantages, so no reward is assigned to the prefill itself.
     """
+    if contract in ("qwen35_instruct_three_points", "qwen35_instruct_three_points_structure_only"):
+        from llm_local_rl.qwen35_instruct_format import audit_three_points
+        audit = audit_three_points(text=text, round_num=round_num)
+        if contract.endswith("_structure_only"):
+            audit["failures"] = [failure for failure in audit["failures"]
+                                 if failure != "one_to_30_whitespace_words_per_point"]
+            audit["strict_ok"] = not audit["failures"]
+            audit["word_limit_ok"] = None
+        return audit
+    if contract != "legacy_base":
+        raise ValueError(f"Unknown debate format contract: {contract}")
     if round_num < 2:
         raise ValueError(f"round_num must be at least 2, got {round_num!r}")
     header = _BASE_R2_HEADER if round_num == 2 else _BASE_R3_HEADER
@@ -160,7 +173,7 @@ class DebateResult:
 
 
 def summarize_generated_debate_format(
-    debates: list[DebateResult],
+    debates: list[DebateResult], *, format_contract: str = "legacy_base",
 ) -> dict[str, Any]:
     """Audit exactly the generated post-R1 transitions in ``debates``."""
     audits_by_round: dict[int, list[dict[str, Any]]] = {}
@@ -173,7 +186,7 @@ def summarize_generated_debate_format(
                     continue
                 audit = audit_base_text_debate_format(
                     text=str(trajectory.metrics.get(f"r{transition.round_num}", "")),
-                    round_num=transition.round_num,
+                    round_num=transition.round_num, contract=format_contract,
                 )
                 audits_by_round.setdefault(transition.round_num, []).append(audit)
                 trajectory_audits.append(audit)
@@ -196,7 +209,7 @@ def summarize_generated_debate_format(
 
     per_round: dict[str, dict[str, float | int]] = {}
     summary: dict[str, Any] = {
-        "schema": "base_text_raw_exact_generated_rounds_terminal_concluded_v3",
+        "schema": ("qwen35_three_points_30_words_v1" if format_contract == "qwen35_instruct_three_points" else "base_text_raw_exact_generated_rounds_terminal_concluded_v3"),
         "generated_round_numbers": round_numbers,
         "generated_round_min": min(round_numbers) if round_numbers else None,
         "generated_round_max": max(round_numbers) if round_numbers else None,
@@ -549,9 +562,9 @@ def _merge_transition_pair_with_adv_values(
         raise ValueError(f"Non-zero R{second.round_num} advantage with zero completion tokens.")
 
     first_full_len = len(first.prompt_tokens) + len(first.completion_tokens)
-    if len(second.prompt_tokens) < first_full_len:
+    if second.prompt_tokens[:first_full_len] != first.prompt_tokens + first.completion_tokens:
         raise ValueError(
-            f"R{second.round_num} prompt shorter than R{first.round_num} history; "
+            f"R{second.round_num} prompt does not extend exact R{first.round_num} token history; "
             "extension property violated."
         )
     continuation_tokens = second.prompt_tokens[first_full_len:]
@@ -614,9 +627,9 @@ def _merge_transition_sequence_with_adv_values(
             )
         if previous is not None:
             previous_full_len = len(previous.prompt_tokens) + len(previous.completion_tokens)
-            if len(transition.prompt_tokens) < previous_full_len:
+            if transition.prompt_tokens[:previous_full_len] != previous.prompt_tokens + previous.completion_tokens:
                 raise ValueError(
-                    f"R{transition.round_num} prompt shorter than R{previous.round_num} history; "
+                    f"R{transition.round_num} prompt does not extend exact R{previous.round_num} token history; "
                     "extension property violated."
                 )
             continuation = transition.prompt_tokens[previous_full_len:]
@@ -1307,6 +1320,20 @@ def assemble_training_data_by_mode(
     raise ValueError(f"Unsupported num_rounds={num_rounds!r}")
 
 
+def _debate_group_key(debate: DebateResult) -> str:
+    instance_id_a = debate.trajectory_a.metrics.get("instance_id")
+    instance_id_b = debate.trajectory_b.metrics.get("instance_id")
+    if instance_id_a is not None and instance_id_b is not None and instance_id_a != instance_id_b:
+        raise ValueError(f"Debate trajectories disagree on instance_id: A={instance_id_a!r}, B={instance_id_b!r}")
+    instance_id = instance_id_a if instance_id_a is not None else instance_id_b
+    return debate.question if instance_id is None else f"{debate.question}\0{instance_id}"
+
+
+def _optimizer_group_metadata(group_key: str) -> dict[str, str]:
+    # Full normalization identity, not the truncated question in display metadata.
+    return {"optimizer_group_id": hashlib.sha256(group_key.encode()).hexdigest()}
+
+
 def assemble_split_train_examples(
     *,
     debates: list[DebateResult],
@@ -1320,8 +1347,10 @@ def assemble_split_train_examples(
     r1_judge_delta_q: float = 1.0,
     incoherent_r23_reward: float = -0.5,
     r23_format_failure_penalty: float = 0.0,
+    r23_format_contract: str = "legacy_base",
     pointwise_reward_map: dict[int, float] | None = None,
     r23_advantage_scope: Literal["per_round", "merged_r23"] = "per_round",
+    keep_optimizer_groups: bool = False,
 ) -> dict[str, list[TrainExample]]:
     if not round_adapter_names:
         raise ValueError("Need at least one round adapter name")
@@ -1365,6 +1394,8 @@ def assemble_split_train_examples(
 
 
     if num_rounds == 1 and r1_reward_mode == "judge":
+        if keep_optimizer_groups:
+            raise ValueError("Group-preserving batches require the round-wise trajectory projection")
         result = assemble_training_data_r1_only_compare(
             debates,
             r1_reward=float(r23_constant),
@@ -1384,10 +1415,6 @@ def assemble_split_train_examples(
 
     selected_r1_trajectory_ids: set[int] | None = None
     if r1_reward_mode == "judge_rejection_task":
-        if round_adapter_names[0] in round_adapter_names[1:num_rounds]:
-            raise ValueError(
-                "judge_rejection_task requires an R1 adapter distinct from all later-round adapters"
-            )
         selected_r1_trajectory_ids = set()
 
     groups: dict[str, list[tuple[DebateTrajectory, DebateResult, float]]] = {}
@@ -1463,17 +1490,10 @@ def assemble_split_train_examples(
         else:
             r1_a = 0.0
             r1_b = 0.0
-        instance_id_a = traj_a.metrics.get("instance_id")
-        instance_id_b = traj_b.metrics.get("instance_id")
-        if instance_id_a is not None and instance_id_b is not None and instance_id_a != instance_id_b:
-            raise ValueError(
-                "Debate trajectories disagree on instance_id: "
-                f"A={instance_id_a!r}, B={instance_id_b!r}"
-            )
-        instance_id = instance_id_a if instance_id_a is not None else instance_id_b
-        group_key = debate.question if instance_id is None else f"{debate.question}\0{instance_id}"
+        group_key = _debate_group_key(debate)
         groups.setdefault(group_key, []).extend([(traj_a, debate, float(r1_a)), (traj_b, debate, float(r1_b))])
 
+    projected_trajectories: list[tuple[str, dict[str, list[TrainExample]]]] = []
     for group_index, (question, group) in enumerate(groups.items()):
         _ = question
         selected_group = [
@@ -1511,7 +1531,14 @@ def assemble_split_train_examples(
             prompt_grpo_std = 0.0
 
         for traj, debate, r1_reward in group:
+            # Reward normalization above remains across the original prompt
+            # group. Only physical training rows are coalesced, within one
+            # agent trajectory; repeated questions must never be deduplicated.
+            grouped = {}
+            projected_trajectories.append((question, grouped))
             r1_selected = selected_r1_trajectory_ids is None or id(traj) in selected_r1_trajectory_ids
+            if isinstance(traj.transitions[0].raw_response, dict) and traj.transitions[0].raw_response.get("fixed_r1"):
+                r1_selected = False
             if r1_selected:
                 t1 = traj.transitions[0]
                 if len(t1.completion_tokens) == 0:
@@ -1632,7 +1659,7 @@ def assemble_split_train_examples(
                     advantages=r1_advantages,
                     metadata=r1_metadata,
                 )
-            if num_rounds >= 4 or len(traj.transitions) < num_rounds:
+            if num_rounds == 2 or num_rounds >= 4 or len(traj.transitions) < num_rounds:
                 if len(traj.transitions) > num_rounds:
                     raise ValueError(
                         f"Trajectory has {len(traj.transitions)} rounds, above configured maximum {num_rounds}"
@@ -1664,6 +1691,7 @@ def assemble_split_train_examples(
                     ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
                 format_audits = [
                     audit_base_text_debate_format(
+                        contract=r23_format_contract,
                         text=str(traj.metrics.get(f"r{transition.round_num}", "")),
                         round_num=transition.round_num,
                     )
@@ -1784,6 +1812,7 @@ def assemble_split_train_examples(
                         winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
                     ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
                 r2_format = audit_base_text_debate_format(
+                        contract=r23_format_contract,
                     text=str(traj.metrics.get("r2", "")), round_num=2
                 ) if r23_format_failure_penalty != 0.0 else {"strict_ok": True, "failures": []}
                 r2_format_penalty = 0.0 if r2_format["strict_ok"] else r23_format_failure_penalty
@@ -1794,6 +1823,7 @@ def assemble_split_train_examples(
                     if len(t3.completion_tokens) == 0:
                         raise ValueError("R3 completion tokens empty.")
                     r3_format = audit_base_text_debate_format(
+                        contract=r23_format_contract,
                         text=str(traj.metrics.get("r3", "")), round_num=3
                     ) if r23_format_failure_penalty != 0.0 else {"strict_ok": True, "failures": []}
                     r3_format_penalty = 0.0 if r3_format["strict_ok"] else r23_format_failure_penalty
@@ -1919,6 +1949,7 @@ def assemble_split_train_examples(
                         winner_reward if debate.get_winner_trajectory().agent == traj.agent else loser_reward
                     ) if coherent or not judge_audit.get("bidirectional_judge") else incoherent_r23_reward
                 r3_format = audit_base_text_debate_format(
+                        contract=r23_format_contract,
                     text=str(traj.metrics.get("r3", "")), round_num=3
                 ) if r23_format_failure_penalty != 0.0 else {"strict_ok": True, "failures": []}
                 r3_format_penalty = 0.0 if r3_format["strict_ok"] else r23_format_failure_penalty
@@ -1963,6 +1994,13 @@ def assemble_split_train_examples(
                         "r23_reliability_applied": False if r23_reward_mode == "soft_judge_prompt_grpo" else None,
                     },
                 )
+    grouped = {}
+    for group_key, trajectory in projected_trajectories:
+        for adapter_name, examples in trajectory.items():
+            example = merge_trajectory_examples(examples)
+            if keep_optimizer_groups:
+                example = replace(example, metadata={**example.metadata, **_optimizer_group_metadata(group_key)})
+            grouped.setdefault(adapter_name, []).append(example)
     return grouped
 
 
@@ -1971,6 +2009,7 @@ def assemble_judge_coherence_grpo_examples(
     *,
     adapter_name: str = "judge",
     reward_mode: str = "coherence",
+    keep_optimizer_groups: bool = False,
 ) -> tuple[list[TrainExample], dict[str, float | int | str]]:
     """Build one global judge-GRPO group from both transcript orderings.
 
@@ -2074,6 +2113,7 @@ def assemble_judge_coherence_grpo_examples(
                 "judge_coherence_reward": reward if reward_mode == "coherence" else None,
                 "behavior_policy_allowed_token_ids": list(allowed_token_ids),
                 "judge_grpo_group_index": 0,
+                **({"optimizer_group_id": "judge_grpo_global"} if keep_optimizer_groups else {}),
                 "judge_grpo_group_size": len(turns),
                 "judge_grpo_reward_mean": reward_mean,
                 "judge_grpo_reward_std": reward_std,
@@ -2105,6 +2145,7 @@ def assemble_judge_supervised_label_examples(
     debates: list[DebateResult],
     *,
     adapter_name: str = "judge",
+    keep_optimizer_groups: bool = False,
 ) -> tuple[list[TrainExample], dict[str, float | int | str]]:
     """Build paired examples for direct label CE plus differentiable JS coherence.
 
@@ -2179,6 +2220,7 @@ def assemble_judge_supervised_label_examples(
                 completion_advantages=[0.0],
                 metadata={
                     "reason": "judge_bidirectional_supervised_label_ce_js",
+                    **(_optimizer_group_metadata(_debate_group_key(debate)) if keep_optimizer_groups else {}),
                     "training_objective": "supervised_label_ce_js",
                     "question": debate.question[:100],
                     "judge_coherence_pair_id": f"{pair_index}:{debate.question[:100]}",
@@ -2221,6 +2263,7 @@ def assemble_judge_unsupervised_js_examples(
     debates: list[DebateResult],
     *,
     adapter_name: str = "judge",
+    keep_optimizer_groups: bool = False,
 ) -> tuple[list[TrainExample], dict[str, float | int | str]]:
     """Build paired referent probes for differentiable JS-only judge training.
 
@@ -2287,6 +2330,7 @@ def assemble_judge_unsupervised_js_examples(
                 metadata={
                     "reason": "judge_bidirectional_unsupervised_js",
                     "training_objective": "unsupervised_js",
+                    **(_optimizer_group_metadata(_debate_group_key(debate)) if keep_optimizer_groups else {}),
                     "question": debate.question[:100],
                     "judge_coherence_pair_id": f"{pair_index}:{debate.question[:100]}",
                     "judge_coherence_pair_member": order,
@@ -2325,6 +2369,18 @@ def summarize_judge_rejection_r1_projection(
     r1_examples: list[TrainExample],
     debates: list[DebateResult],
 ) -> dict[str, int]:
+    # A shared actor row can contain winner R1 and later-round objectives.
+    # Count the R1 projection, not its container or the later advantages.
+    r1_only = []
+    for example in r1_examples:
+        if "round_projections" in example.metadata:
+            for projection in example.metadata["round_projections"]:
+                if projection.get("round_num") == 1:
+                    r1_only.append(replace(example, metadata=projection,
+                                           advantages=[projection["r1_zscore"]]))
+        elif example.metadata.get("round_num") == 1:
+            r1_only.append(example)
+    r1_examples = r1_only
     valid_verdict_count = sum(debate.verdict in ("A", "B") for debate in debates)
     winner_r1_example_count = 0
     loser_r1_example_count = 0

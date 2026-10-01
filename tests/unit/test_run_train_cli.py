@@ -113,6 +113,7 @@ def test_cli_accepts_arbitrary_heterogeneous_debate_depth() -> None:
 
 def test_config_repeats_last_adapter_for_arbitrary_round_depth() -> None:
     config = TrainRunConfig(
+        adapter_layout="split",
         model_path="/tmp/model",
         output_dir="/tmp/out",
         rollout=RolloutConfig(num_groups=2, group_size=8),

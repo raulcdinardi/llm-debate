@@ -55,6 +55,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "countdown_code",
             "constrained_writing",
             "mmlu_pro_pairwise",
+            "mixed_label_pairwise",
+            "python_optimization",
         ],
     )
     parser.add_argument("--mode", default="debate", choices=["single_turn", "debate"])
@@ -82,6 +84,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--quality-topic-contains", default="Science fiction")
     parser.add_argument("--quality-download", action="store_true")
     parser.add_argument("--mmlu-pro-data-path", default=None)
+    parser.add_argument("--python-optimization-config", default=None)
+    parser.add_argument("--debate-r23-penalize-word-limit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--thinking-mode", default="default", choices=["default", "no_think", "force_think"])
     parser.add_argument("--advantage-mode", default="zscore", choices=["identity", "centered_mean", "zscore"])
     parser.add_argument("--ppo-clip-epsilon", type=float, default=0.2)
@@ -179,7 +183,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--judge-label-token-contract",
         default="none",
-        choices=["none", "lfm25_ab_whitespace_compat_v1", "lfm25_openbookqa_spaced_ab_v1"],
+        choices=["none", "lfm25_ab_whitespace_compat_v1", "lfm25_openbookqa_spaced_ab_v1", "qwen35_instruct_ab_v1"],
         help=(
             "Temporary tokenizer compatibility contract for soft judge scoring. "
             "Replace and Phase-0 validate when the judge tokenizer or answer stem changes."
@@ -196,6 +200,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--train-judge-coherence-grpo spelling is retained as a CLI alias."
         ),
     )
+    parser.add_argument("--train-shadow-judge", action="store_true", help="Train a passive random-delta judge on the active judge's gold CE examples.")
+    parser.add_argument("--shadow-judge-init-seed", type=int, default=None)
+    parser.add_argument("--shadow-judge-init-std", type=float, default=None, help="Explicit standard deviation of shadow LoRA B ~ Normal(0, std); A is copied from the active judge.")
     parser.add_argument(
         "--judge-training-objective",
         choices=["grpo", "supervised_label_ce_js", "unsupervised_js"],
@@ -235,7 +242,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--debate-prompt-format",
         default="chat",
-        choices=["chat", "qwen35_base_text_prefill"],
+        choices=["chat", "qwen35_base_text_prefill", "qwen35_instruct_three_points"],
     )
     parser.add_argument(
         "--debate-stop-on-concluded",
@@ -275,6 +282,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--train-max-tokens", type=int, default=0)
     parser.add_argument("--train-length-bucket-batches", action="store_true")
+    parser.add_argument("--train-keep-groups-together", action="store_true",
+                        help="Pack whole advantage/prompt groups into optimizer batches before length sorting.")
     parser.add_argument(
         "--train-logprob-backend",
         default="full_logits",
@@ -290,7 +299,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--stop-parsed-reward-hacking-min", type=float, default=None)
     parser.add_argument("--stop-parsed-reward-hacking-max", type=float, default=None)
-    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False,
+        help="Opt into backbone activation recomputation to reduce training memory. "
+        "Disabled by default; independent LM-head chunk checkpointing remains enabled.",
+    )
     parser.add_argument(
         "--on-policy-logprob-check",
         action="store_true",
@@ -310,6 +323,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--on-policy-logprob-abs-tol", type=float, default=1e-3)
     parser.add_argument("--on-policy-logprob-warning-path", default=None)
+    parser.add_argument("--train-lm-head-kernel", choices=["torch", "triton"], default="torch",
+                        help="Opt into chunked projection with fused logprobs/entropy; requires selective_lm_head and CUDA.")
+    parser.add_argument("--train-gdn-backend", choices=["auto", "fla"], default="auto",
+                        help="Require FLA GDN and causal-conv training kernels on Qwen3.5; fail if inactive.")
     parser.add_argument("--on-policy-logprob-max-records-per-batch", type=int, default=8)
     parser.add_argument("--sampler-gpu-memory-utilization", type=float, default=0.55)
     parser.add_argument("--sampler-max-model-len", type=int, default=512)
@@ -319,7 +336,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Opt into vLLM prefix reuse (including same-LoRA R2 to R3), using hybrid align mode. "
         "Omit to preserve engine defaults. Applies to all matching same-adapter prefixes.",
     )
-    parser.add_argument("--sampler-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--sampler-enforce-eager", action=argparse.BooleanOptionalAction, default=False,
+        help="Disable vLLM CUDA graphs and compilation; graph-capable inference is the default.",
+    )
     parser.add_argument(
         "--sampler-teardown-before-training",
         action="store_true",
@@ -446,6 +466,8 @@ def main() -> int:
                 quality_topic_contains=args.quality_topic_contains,
                 quality_download=args.quality_download,
                 mmlu_pro_data_path=args.mmlu_pro_data_path,
+                python_optimization_config=args.python_optimization_config,
+                debate_r23_penalize_word_limit=args.debate_r23_penalize_word_limit,
                 thinking_mode=args.thinking_mode,
                 advantage_mode=args.advantage_mode,
                 ppo_clip_epsilon=args.ppo_clip_epsilon,
@@ -484,6 +506,9 @@ def main() -> int:
                 debate_judge_score_mode=args.debate_judge_score_mode,
                 judge_label_token_contract=args.judge_label_token_contract,
                 train_judge=args.train_judge,
+                train_shadow_judge=args.train_shadow_judge,
+                shadow_judge_init_seed=args.shadow_judge_init_seed,
+                shadow_judge_init_std=args.shadow_judge_init_std,
                 judge_training_objective=args.judge_training_objective,
                 judge_coherence_js_weight=args.judge_coherence_js_weight,
                 judge_grpo_reward_mode=args.judge_grpo_reward_mode,
@@ -500,10 +525,13 @@ def main() -> int:
                 rollout_assistant_prefill=args.rollout_assistant_prefill,
                 train_minibatch_size=args.train_minibatch_size,
                 train_optimizer_batch_size=args.train_optimizer_batch_size,
+                train_keep_groups_together=args.train_keep_groups_together,
                 train_max_tokens=args.train_max_tokens,
                 train_length_bucket_batches=args.train_length_bucket_batches,
                 train_logprob_backend=args.train_logprob_backend,
                 compile_train_logprob_helper=args.compile_train_logprob_helper,
+                train_lm_head_kernel=args.train_lm_head_kernel,
+                train_gdn_backend=args.train_gdn_backend,
                 train_adapter_names=tuple(args.train_adapter_names),
                 stop_parsed_reward_hacking_min=args.stop_parsed_reward_hacking_min,
                 stop_parsed_reward_hacking_max=args.stop_parsed_reward_hacking_max,

@@ -8,7 +8,9 @@ from typing import Mapping, Protocol
 JUDGE_LABEL_TOKEN_CONTRACT_NONE = "none"
 LFM25_AB_WHITESPACE_COMPAT_V1 = "lfm25_ab_whitespace_compat_v1"
 LFM25_OPENBOOKQA_SPACED_AB_V1 = "lfm25_openbookqa_spaced_ab_v1"
+QWEN35_INSTRUCT_AB_V1 = "qwen35_instruct_ab_v1"
 JUDGE_LABEL_TOKEN_CONTRACTS = (
+    QWEN35_INSTRUCT_AB_V1,
     JUDGE_LABEL_TOKEN_CONTRACT_NONE,
     LFM25_AB_WHITESPACE_COMPAT_V1,
     LFM25_OPENBOOKQA_SPACED_AB_V1,
@@ -92,6 +94,14 @@ def resolve_judge_label_token_contract(
             a_token_ids=(),
             b_token_ids=(),
             temporary=False,
+        )
+    if contract_name == QWEN35_INSTRUCT_AB_V1:
+        ids = [tuple(tokenizer.encode(label, add_special_tokens=False)) for label in ("A", "B")]
+        if ids != [(32,), (33,)]:
+            raise ValueError(f"Pinned Qwen A/B token IDs changed: {ids}")
+        return JudgeLabelTokenContract(
+            name=contract_name, a_token_ids=ids[0], b_token_ids=ids[1], temporary=False,
+            canonical_a="A", canonical_b="B", required_prompt_suffix="<think>\n\n</think>\n\n",
         )
     if contract_name not in (LFM25_AB_WHITESPACE_COMPAT_V1, LFM25_OPENBOOKQA_SPACED_AB_V1):
         raise ValueError(f"Unknown judge label token contract: {contract_name!r}")

@@ -238,21 +238,13 @@ def test_judge_rejection_task_config_roundtrip_and_fail_closed() -> None:
             adapter_layout="split",
             debate_r1_reward="judge_rejection_task",
         )
-    with pytest.raises(ValueError, match="adapter_layout='split'"):
-        TrainRunConfig(
-            model_path="/tmp/model",
-            output_dir="/tmp/out",
-            adapter_layout="shared",
-            debate_r1_reward="judge_rejection_task",
-        )
-    with pytest.raises(ValueError, match="requires round adapters"):
-        TrainRunConfig(
-            model_path="/tmp/model",
-            output_dir="/tmp/out",
-            adapter_layout="split",
-            debate_r1_reward="judge_rejection_task",
-            debate_round_adapter_names=("solution", "solution", "debate"),
-        )
+    shared = TrainRunConfig(
+        model_path="/tmp/model", output_dir="/tmp/out",
+        rollout=RolloutConfig(mode="debate"), adapter_layout="shared",
+        debate_r1_reward="judge_rejection_task",
+    )
+    assert shared.resolved_debate_round_adapter_names() == ("shared",) * 3
+    assert not shared.uses_legacy_shared_projection()
 
 
 def test_judge_delta_task_config_roundtrip_and_fail_closed() -> None:
@@ -942,3 +934,39 @@ def test_coin_flip_prompt_and_reward_match_between_single_turn_and_debate() -> N
     assert env_reward == task_reward.reward
     assert env_metrics["choice"] == task_reward.metrics["choice"]
     assert env_metrics["target"] == task_reward.metrics["target"]
+
+
+@pytest.mark.parametrize("layout, actor", [("split", "debate"), ("shared", "shared")])
+def test_single_actor_inventory_and_independent_paired_judges(layout, actor):
+    from dataclasses import replace
+    from llm_local_rl.driver import TrainingDriver
+    from llm_local_rl.debate_runtime import DebateRuntime, DebateRuntimeConfig
+
+    driver = object.__new__(TrainingDriver)
+    driver.config = TrainRunConfig(
+        model_path="/unused", output_dir="/unused", rollout=RolloutConfig(mode="debate"),
+        adapter_layout=layout, debate_round_adapter_names=("debate",) * 3,
+        debate_judge_adapter="judge", train_judge=True, train_shadow_judge=True,
+        judge_training_objective="supervised_label_ce_js", judge_coherence_js_weight=0.,
+        shadow_judge_init_seed=17, shadow_judge_init_std=.03,
+        debate_judge_harness="qwen35_chat_single_token_v1",
+        debate_judge_bidirectional=True, debate_judge_constrain_single_token=True,
+        debate_judge_score_mode="order_sym_soft_logit",
+        judge_label_token_contract="qwen35_instruct_ab_v1",
+        debate_r1_reward="task", debate_r23_reward="soft_judge_raw",
+        train_adapter_names=(actor, "judge", "judge_shadow"),
+        init_adapter_dirs={actor: "/step100/debate", "judge": "/step100/judge", "judge_shadow": "/step100/shadow"},
+    )
+    assert driver._adapter_names() == (actor, "judge", "judge_shadow")
+    assert set(driver.config.init_adapter_dirs) == set(driver._adapter_names())
+    assert driver._train_adapter_names() == {actor, "judge", "judge_shadow"}
+    assert not driver.config.uses_legacy_shared_projection()
+    assert driver.config.resolved_debate_round_adapter_names() == (actor,) * 3
+    assert TrainRunConfig.from_dict(driver.config.to_dict()) == driver.config
+    runtime = object.__new__(DebateRuntime)
+    runtime.adapter_layout = layout
+    runtime.runtime_config = DebateRuntimeConfig(num_rounds=3, round_adapter_names=(actor,) * 3, judge_adapter="judge")
+    assert [runtime._policy_adapter_name_for_round(round_num=r) for r in (1, 2, 3)] == [actor] * 3
+    assert runtime._judge_adapter_name() == "judge"
+    runtime.runtime_config = replace(runtime.runtime_config, judge_adapter="policy")
+    assert runtime._judge_adapter_name() == actor

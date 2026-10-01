@@ -44,6 +44,7 @@ from llm_local_rl.registry import build_debate_task, build_environment, build_ep
 from llm_local_rl.resource_monitor import ResourceMonitor
 from llm_local_rl.observability import RunObservability, WandbSettings, rollback_rollout_shards
 from llm_local_rl.sglang_sampling import SglangRuntimeConfig, SglangSampler
+from llm_local_rl.shadow_judge import SHADOW_JUDGE, preserve_rng_state, shadow_label_examples
 from llm_local_rl.types import EpisodeSample, EpisodeTurn, SamplingRequest
 from llm_local_rl.vllm_sampling import VllmRuntimeConfig, VllmSampler
 
@@ -128,7 +129,7 @@ class TrainingDriver:
                 adapter_name=adapter_name,
                 adapter_dir=self.current_adapter_dirs[adapter_name],
             )
-        self.reference_adapter_dirs = dict(self.current_adapter_dirs)
+        self.reference_adapter_dirs = self._sampler_adapter_dirs()
         if self.config.reference_kl_every > 0:
             self.trainer.load_reference_adapters(adapter_dirs=self.reference_adapter_dirs)
         with self._stage("trainer_sleep", step=0):
@@ -197,6 +198,7 @@ class TrainingDriver:
         driver.latest_exact_resume_checkpoint = manifest.exact_resume_checkpoint
         driver._metric_history = {}
         driver.reference_adapter_dirs = dict(manifest.reference_adapter_dirs or {})
+        trainer_state = None
         if manifest.exact_resume_checkpoint is not None:
             exact_path = Path(manifest.exact_resume_checkpoint)
             exact_manifest = validate_exact_resume_checkpoint(
@@ -204,6 +206,12 @@ class TrainingDriver:
             )
             driver.start_step = int(exact_manifest["completed_step"])
             driver.current_adapter_dirs = checkpoint_adapter_dirs(exact_path)
+            import torch
+            trainer_state = torch.load(exact_path / "trainer_state.pt", map_location="cpu", weights_only=False)
+            if trainer_state["schema"] == "multi_adapter_trainer_state_v1":
+                driver._resume_adapter_names = tuple(trainer_state["adapter_names"])
+                if set(driver._resume_adapter_names) != set(driver.current_adapter_dirs):
+                    raise ValueError("Exact-resume adapter state and file inventory differ")
             driver._rollback_step_records_to(step=driver.start_step)
         else:
             if manifest.current_step > 0:
@@ -220,6 +228,7 @@ class TrainingDriver:
                     path=manifest.exact_resume_checkpoint,
                     trainer=driver.trainer,
                     run_config=config.to_dict(),
+                    trainer_state=trainer_state,
                 )
             if config.reference_kl_every > 0 and driver.reference_adapter_dirs:
                 driver.trainer.load_reference_adapters(adapter_dirs=driver.reference_adapter_dirs)
@@ -287,7 +296,8 @@ class TrainingDriver:
         return sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys, strict=True)) / math.sqrt(x_var * y_var)
 
     def _add_temporal_metrics(self, record: dict[str, object]) -> None:
-        train_metrics = record.get("train_metrics", {})
+        train_metrics = {name: metrics for name, metrics in record.get("train_metrics", {}).items()
+                         if name != SHADOW_JUDGE}
         entropy_values = [float(item["entropy"]) for item in train_metrics.values() if "entropy" in item]
         kl_values = [float(item["ppo_sampled_approx_kl"]) for item in train_metrics.values() if "ppo_sampled_approx_kl" in item]
         rollout_metrics = record.setdefault("rollout_metrics", {})
@@ -326,24 +336,44 @@ class TrainingDriver:
                 self._add_temporal_metrics(json.loads(line))
 
     def _adapter_names(self) -> tuple[str, ...]:
+        if hasattr(self, "_resume_adapter_names"):
+            return self._resume_adapter_names
+        if self.config.rollout.mode == "debate":
+            names = list(dict.fromkeys(self.config.resolved_debate_round_adapter_names()))
+            judge = self.config.debate_judge_adapter
+            if judge == "policy":
+                judge = self.config.resolved_debate_round_adapter_names()[-1]
+            elif self.config.adapter_layout == "shared" and judge in ("solution", "debate"):
+                judge = "shared"
+            if judge != "base" and judge not in names:
+                names.append(judge)
+            if self.config.train_shadow_judge:
+                names.append(SHADOW_JUDGE)
+            return tuple(names)
         if self.config.adapter_layout == "shared":
             return ("shared",)
         if self.config.debate_judge_adapter == "judge":
-            return ("solution", "debate", "judge")
+            names = ("solution", "debate", "judge")
+            return (*names, SHADOW_JUDGE) if self.config.train_shadow_judge else names
         return ("solution", "debate")
 
+    def _sampler_adapter_dirs(self) -> dict[str, str]:
+        # Passive adapters never enter reward inference or occupy a sampler slot.
+        return {name: path for name, path in self.current_adapter_dirs.items() if name != SHADOW_JUDGE}
+
     def _validate_judge_adapter_harness(self, adapter_dirs: dict[str, str]) -> None:
-        judge_dir = adapter_dirs.get("judge")
-        if judge_dir is None or self.config.debate_judge_adapter != "judge":
+        if self.config.debate_judge_adapter != "judge":
             return
-        validate_judge_harness_manifest(
-            adapter_dir=judge_dir,
-            harness_id=self.config.judge_harness().harness_id,
-            max_rounds=self.config.effective_debate_max_rounds(),
-        )
+        for name in ("judge", SHADOW_JUDGE) if self.config.train_shadow_judge else ("judge",):
+            if name in adapter_dirs:
+                validate_judge_harness_manifest(
+                    adapter_dir=adapter_dirs[name],
+                    harness_id=self.config.judge_harness().harness_id,
+                    max_rounds=self.config.effective_debate_max_rounds(),
+                )
 
     def _write_saved_judge_harness(self, *, adapter_name: str, adapter_dir: str) -> None:
-        if adapter_name != "judge" or self.config.debate_judge_adapter != "judge":
+        if adapter_name not in ("judge", SHADOW_JUDGE) or self.config.debate_judge_adapter != "judge":
             return
         if not self.config.train_judge and self.config.init_adapter_dirs:
             source = self.config.init_adapter_dirs.get("judge")
@@ -506,10 +536,13 @@ class TrainingDriver:
             ppo_clip_epsilon=self.config.ppo_clip_epsilon,
             train_minibatch_size=self.config.train_minibatch_size,
             train_optimizer_batch_size=self.config.train_optimizer_batch_size,
+            train_keep_groups_together=self.config.train_keep_groups_together,
             train_max_tokens=self.config.train_max_tokens,
             train_length_bucket_batches=self.config.train_length_bucket_batches,
             train_logprob_backend=self.config.train_logprob_backend,
             compile_train_logprob_helper=self.config.compile_train_logprob_helper,
+            train_lm_head_kernel=self.config.train_lm_head_kernel,
+            train_gdn_backend=self.config.train_gdn_backend,
             gradient_checkpointing=self.config.gradient_checkpointing,
             on_policy_logprob_check=self.config.on_policy_logprob_check,
             on_policy_logprob_warn_only=self.config.on_policy_logprob_warn_only,
@@ -547,7 +580,14 @@ class TrainingDriver:
     def _make_fresh_trainer(self) -> MultiAdapterTrainer:
         from llm_local_rl.trainer import MultiAdapterTrainer
 
-        return MultiAdapterTrainer(config=self._trainer_config(device="cuda"))
+        trainer = MultiAdapterTrainer(config=self._trainer_config(device="cuda"))
+        if self.config.train_shadow_judge:
+            receipt = trainer.initialize_shadow_judge(
+                seed=self.config.shadow_judge_init_seed,
+                std=self.config.shadow_judge_init_std,
+            )
+            (self.output_dir / "shadow_judge_initialization.json").write_text(json.dumps(receipt, indent=2))
+        return trainer
 
     def _make_trainer_from_init_adapters(self) -> MultiAdapterTrainer:
         from llm_local_rl.trainer import MultiAdapterTrainer
@@ -600,7 +640,7 @@ class TrainingDriver:
                     max_lora_rank=self.config.sampler_max_lora_rank,
                     max_loras=self.config.sampler_max_loras,
                 ),
-                adapter_paths=dict(self.current_adapter_dirs),
+                adapter_paths=self._sampler_adapter_dirs(),
             )
         if self.config.sampler_backend == "sglang":
             return SglangSampler(
@@ -611,7 +651,7 @@ class TrainingDriver:
                     unload_stale_adapters=self.config.sampler_sglang_unload_stale_adapters,
                     memory_saver=self.config.sampler_sleep_before_training,
                 ),
-                adapter_paths=dict(self.current_adapter_dirs),
+                adapter_paths=self._sampler_adapter_dirs(),
             )
         raise ValueError(f"Unsupported sampler_backend={self.config.sampler_backend!r}.")
 
@@ -705,7 +745,12 @@ class TrainingDriver:
                     make_train_example(
                         turn=turn,
                         advantage_per_token=sample_advantage / len(turn.completion_token_ids),
-                        extra_metadata={"instance_id": sample.instance_id},
+                        extra_metadata={"instance_id": sample.instance_id, **(
+                            {"optimizer_group_id": str(sample.instance_id)
+                             if self.config.rollout.num_rollouts_per_instance > 1 or self.config.advantage_mode == "identity"
+                             else "single_turn_global"}
+                            if self.config.train_keep_groups_together else {}
+                        )},
                     )
                 )
         return grouped
@@ -1153,7 +1198,7 @@ class TrainingDriver:
         if self.config.debate_r1_reward == "judge_pointwise":
             pointwise_reward_map = runtime.sample_pointwise_judge_rewards(debates=debates, step_seed=step_seed)
 
-        if self.config.adapter_layout == "shared":
+        if self.config.uses_legacy_shared_projection():
             training_data = assemble_training_data_by_mode(
                 debates=debates,
                 num_rounds=self.config.effective_debate_max_rounds(),
@@ -1178,6 +1223,7 @@ class TrainingDriver:
             }
 
         grouped = assemble_split_train_examples(
+            keep_optimizer_groups=self.config.train_keep_groups_together,
             debates=debates,
             num_rounds=self.config.effective_debate_max_rounds(),
             round_adapter_names=self.config.resolved_debate_round_adapter_names(),
@@ -1191,22 +1237,26 @@ class TrainingDriver:
             r1_judge_delta_q=self.config.debate_r1_judge_delta_q,
             incoherent_r23_reward=self.config.debate_incoherent_r23_reward,
             r23_format_failure_penalty=self.config.debate_r23_format_failure_penalty,
+            r23_format_contract=(("qwen35_instruct_three_points" if self.config.debate_r23_penalize_word_limit else "qwen35_instruct_three_points_structure_only") if self.config.debate_prompt_format == "qwen35_instruct_three_points" else "legacy_base"),
         )
         judge_grpo_record: dict[str, float | int | str] | None = None
         if self.config.train_judge:
             if self.config.judge_training_objective == "supervised_label_ce_js":
                 judge_examples, judge_grpo_record = assemble_judge_supervised_label_examples(
-                    debates
+                    debates, keep_optimizer_groups=self.config.train_keep_groups_together,
                 )
             elif self.config.judge_training_objective == "unsupervised_js":
                 judge_examples, judge_grpo_record = assemble_judge_unsupervised_js_examples(
-                    debates
+                    debates, keep_optimizer_groups=self.config.train_keep_groups_together,
                 )
             else:
                 judge_examples, judge_grpo_record = assemble_judge_coherence_grpo_examples(
-                    debates, reward_mode=self.config.judge_grpo_reward_mode
+                    debates, reward_mode=self.config.judge_grpo_reward_mode,
+                    keep_optimizer_groups=self.config.train_keep_groups_together,
                 )
             grouped.setdefault("judge", []).extend(judge_examples)
+            if self.config.train_shadow_judge:
+                grouped[SHADOW_JUDGE] = shadow_label_examples(grouped["judge"])
         projection_record: dict[str, object] = {
             "source_exact_shared_equivalent": False,
             "reason": "split_layout_per_round_projection",
@@ -1217,7 +1267,7 @@ class TrainingDriver:
         }
         if self.config.debate_r23_format_failure_penalty != 0.0:
             projection_record["debate_format"] = summarize_generated_debate_format(
-                debates
+                debates, format_contract=("qwen35_instruct_three_points" if self.config.debate_prompt_format == "qwen35_instruct_three_points" else "legacy_base")
             )
         if judge_grpo_record is not None:
             if self.config.judge_training_objective == "supervised_label_ce_js":
@@ -1232,7 +1282,7 @@ class TrainingDriver:
                     else "judge_coherence_grpo"
                 ] = judge_grpo_record
         if self.config.debate_r1_reward == "judge_rejection_task":
-            r1_adapter_name = self.config.debate_round_adapter_names[0]
+            r1_adapter_name = self.config.resolved_debate_round_adapter_names()[0]
             projection_record["r1_projection"] = {
                 "mode": "judge_rejection_task",
                 "selection": "judge_winner_only",
@@ -1304,6 +1354,21 @@ class TrainingDriver:
                 "r23_constant_ignored": True,
             }
         return grouped, projection_record
+
+    def _train_adapter_batch(self, *, adapter_name: str, batch: list, step_num: int) -> dict:
+        direct_judge = adapter_name in ("judge", SHADOW_JUDGE) and self.config.judge_training_objective in (
+            "supervised_label_ce_js", "unsupervised_js"
+        )
+        context = preserve_rng_state() if adapter_name == SHADOW_JUDGE else nullcontext()
+        with context:
+            return self.trainer.train_batch(
+                adapter_name=adapter_name,
+                batch=batch,
+                objective=self.config.judge_training_objective if direct_judge else "ppo",
+                judge_coherence_js_weight=self.config.judge_coherence_js_weight,
+                measure_reference_kl=(not direct_judge and self.config.reference_kl_every > 0
+                                      and step_num % self.config.reference_kl_every == 0),
+            )
 
     def _adapter_output_dir(self, *, step: int, adapter_name: str, durable: bool) -> Path:
         if durable:
@@ -1417,7 +1482,7 @@ class TrainingDriver:
                         self._progress("sampler_wake_start", step=step_num)
                         self.sampler.wake_up()
                         self._progress("sampler_wake_done", step=step_num)
-                    self.sampler.set_adapter_paths(adapter_paths=self.current_adapter_dirs)
+                    self.sampler.set_adapter_paths(adapter_paths=self._sampler_adapter_dirs())
                     if self.config.rollout.mode == "single_turn":
                         with self._stage("rollout_single_turn", step=step_num), trace_context(
                             step=step_num, rollout_mode="single_turn"
@@ -1543,7 +1608,7 @@ class TrainingDriver:
                                 step=step_num,
                                 adapter_names=sorted(adapter_names_to_unload),
                             )
-                            self.sampler.unload_adapters(adapter_names=adapter_names_to_unload)
+                            self.sampler.unload_adapters(adapter_names=adapter_names_to_unload - {SHADOW_JUDGE})
                             self._progress(
                                 "sampler_unload_trainable_loras_done",
                                 step=step_num,
@@ -1585,27 +1650,8 @@ class TrainingDriver:
                                 adapter_name=adapter_name,
                                 num_examples=len(batch),
                             )
-                            train_metrics[adapter_name] = self.trainer.train_batch(
-                                adapter_name=adapter_name,
-                                batch=batch,
-                                objective=(
-                                    self.config.judge_training_objective
-                                    if adapter_name == "judge"
-                                    and self.config.judge_training_objective
-                                    in ("supervised_label_ce_js", "unsupervised_js")
-                                    else "ppo"
-                                ),
-                                judge_coherence_js_weight=self.config.judge_coherence_js_weight,
-                                measure_reference_kl=(
-                                    not (
-                                        adapter_name == "judge"
-                                        and self.config.judge_training_objective
-                                        in ("supervised_label_ce_js", "unsupervised_js")
-                                    )
-                                    and
-                                    self.config.reference_kl_every > 0
-                                    and step_num % self.config.reference_kl_every == 0
-                                ),
+                            train_metrics[adapter_name] = self._train_adapter_batch(
+                                adapter_name=adapter_name, batch=batch, step_num=step_num,
                             )
                             self._progress(
                                 "train_adapter_done",

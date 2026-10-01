@@ -22,6 +22,31 @@ The key split is:
 
 This avoids the previous shape where debate mechanics and task/environment logic leaked into each other.
 
+## Inference execution
+
+vLLM inference defaults to `sampler_enforce_eager=false`, allowing its CUDA graph
+and compilation optimizations. Use `--sampler-enforce-eager` to explicitly select
+eager execution. JSON configurations that omit the field use the graph-capable
+default; explicitly saved values are preserved when loading existing runs.
+
+## Training activation memory
+
+Optional [fused training kernels](fused_training.md) add strict FLA GDN selection
+and a Triton LM-head scoring path; these are independent of inference caching
+and backbone activation checkpointing.
+
+Backbone activation checkpointing defaults to `gradient_checkpointing=false` in
+the shared trainer, run config, JSON loader and CLI. This retains intermediate
+activations to avoid replaying decoder layers during backward, trading more GPU
+memory for less recomputation. Use `--gradient-checkpointing` or an explicit
+JSON `true` to enable it. Explicit values in saved run configs are preserved.
+
+The selective LM-head path still checkpoints projection/loss chunks independently,
+so vocabulary-sized intermediates do not accumulate across chunks. This default
+does not change model/optimizer checkpoint saving or inference KV caching.
+Memory pressure lowers the physical microbatch through the existing OOM fallback;
+it does not automatically enable backbone checkpointing.
+
 ## Multiple optimizer updates per rollout
 
 `--train-optimizer-batch-size 32 --train-minibatch-size 8` takes four optimizer
@@ -53,6 +78,69 @@ report the last update. Existing forward-token/minibatch counters count training
 passes; the additional parity pass is counted separately. Old exact-resume
 checkpoints remain compatible with the default; changing optimizer batch size
 changes the configuration fingerprint and requires a new run.
+
+### Four updates of 32 trajectories, keeping groups intact
+
+For a new round-wise debate run, use:
+
+```bash
+--train-optimizer-batch-size 32 --train-minibatch-size 32 --train-keep-groups-together
+```
+
+For the HS3/OBQA layout of 64 groups of two trajectories, this produces four
+optimizer batches containing 16 complete debate pairs each. Eight groups of
+16 trajectories also pack into four batches, with two groups each. Physical batch 32 gives one
+forward/backward and one optimizer step per batch. Both rounds of one agent
+remain one merged trajectory row. Both orderings of a supervised CE/JS judge
+pair remain together; with 128 judge rows this also gives four judge updates.
+
+The assembler attaches a stable ID for the full original question/instance
+normalization group. The trainer packs complete groups in first-seen order,
+then optionally length-sorts **within** each optimizer batch. Rewards and
+advantages are computed once on the original groups and are not recomputed
+after an update. All PPO parity checks run before the first optimizer step;
+later ratios use the frozen rollout logprobs against the updated policy.
+
+An OOM fallback to physical batch 16 accumulates two backwards within each
+fixed 32-row optimizer batch; it never repartitions the optimizer groups.
+Unequal groups can produce short batches, normalized by their actual row count.
+An oversized group, missing group metadata, or partial overlength filtering
+fails before that adapter's first optimizer step. Plans log exact group IDs
+and row counts in `optimizer_group_plan`. All-zero-advantage PPO batches retain
+the existing no-update behavior.
+
+This changes optimization: four Adam updates, clipping and weight-decay
+applications replace one. It is not four times less backward computation;
+PPO additionally performs the existing no-gradient parity pass. Learning rate
+is not automatically rescaled. Rollout/checkpoint step counts stay unchanged.
+The option defaults off for compatibility; exact-resume fingerprints distinguish
+the new behavior. Legacy shared projection is unsupported. The older global
+judge-GRPO objective forms one global group, which cannot be split into 32-row
+updates under this option; supervised label CE/JS uses the prompt groups.
+
+### Remembered physical capacity
+
+The shared trainer treats `train_minibatch_size` as a physical ceiling. On an
+out-of-memory failure **before any optimizer step starts**, it discards partial
+gradients, restores the RNG state and retries with half as many rows. It remembers
+the reduced ceiling separately for each adapter, including in exact-resume
+checkpoints. Later batches reuse it; larger inputs may lower it further. Limits
+never increase automatically, trading some potential throughput on shorter
+batches for avoiding repeated failed capacity searches. Older checkpoints without
+this field start without a learned limit.
+
+The effective optimizer batch, row coverage and forward/reverse judge pairing
+are preserved. Reference logprob scoring also honors the physical limit. An OOM
+inside or after an optimizer step propagates without replay, since weights or
+optimizer state may already have changed. Retries stop at one row (two for paired
+judge objectives); non-OOM errors are never treated as capacity failures.
+
+Per-adapter metrics report `physical_microbatch_size`, `microbatch_initial_size`,
+`microbatch_oom_attempts` and `microbatch_retry_seconds` (failed attempt time,
+excluding cleanup); each failed attempt also emits a `train_microbatch_oom`
+event. This is built into `MultiAdapterTrainer`:
+new launches must not install the old experiment-specific `backward_batching`
+wrapper on top. Historical frozen experiments retain their original source.
 
 ## Test strata
 
@@ -202,3 +290,17 @@ training. CPU configuration tests do not establish real cache hits or speedup.
 
 Backend references: [LFM2 aligned-cache support](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/model_executor/models/lfm2.py#L424),
 [vLLM hybrid cache defaults](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/engine/arg_utils.py#L2391).
+
+### Grouped-update OOM recovery
+
+When one rollout produces multiple optimizer updates, the trainer keeps a CPU
+snapshot of the active adapter, its Adam state and the pre-iteration RNG state.
+An OOM outside `optimizer.step()` restores that snapshot before retrying with a
+smaller physical batch, preserving the original optimizer-group order. The
+capacity ceiling remains remembered. An exception inside `optimizer.step()` is
+fatal because the update may have partially mutated state.
+
+Intermediate optimizer calls are provisional until the complete adapter batch
+returns; rollback events explicitly record discarded updates. Snapshot bytes,
+copy time and discarded-update counts are logged. This adds CPU memory and
+transfer work, without changing the intended four sequential updates.

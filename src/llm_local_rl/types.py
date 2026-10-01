@@ -5,7 +5,7 @@ from typing import Any, Literal, Protocol
 
 from llm_local_rl.behavior_policy import BehaviorPolicySpec, LogprobSemantics
 
-AdapterName = Literal["shared", "solution", "debate", "judge"]
+AdapterName = Literal["shared", "solution", "debate", "judge", "judge_shadow"]
 
 
 @dataclass(frozen=True)
