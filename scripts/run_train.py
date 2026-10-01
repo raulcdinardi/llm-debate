@@ -42,6 +42,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generic rollout+train driver for the rewrite stack.")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--tokenizer-path", default=None)
+    parser.add_argument("--judge-model-path", default=None)
+    parser.add_argument("--judge-tokenizer-path", default=None)
+    parser.add_argument("--judge-sampler-gpu-memory-utilization", type=float, default=0.25)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--env",
@@ -437,6 +440,9 @@ def main() -> int:
             config=TrainRunConfig(
                 model_path=args.model_path,
                 tokenizer_path=args.tokenizer_path,
+                judge_model_path=args.judge_model_path,
+                judge_tokenizer_path=args.judge_tokenizer_path,
+                judge_sampler_gpu_memory_utilization=args.judge_sampler_gpu_memory_utilization,
                 output_dir=args.output_dir,
                 rollout=RolloutConfig(
                     env_name=args.env,

@@ -98,6 +98,7 @@ class _OptimizerRollbackSnapshot:
 @dataclass(frozen=True)
 class TrainerConfig:
     base_model_path: str
+    tokenizer_path: str | None = None
     adapter_names: tuple[AdapterName, ...] = ("shared",)
     lora_rank: int = 32
     learning_rate: float = 1e-4
@@ -767,7 +768,7 @@ class MultiAdapterTrainer:
         self.config = config
         self.compute_device = "cuda" if config.device == "cuda" and torch.cuda.is_available() else "cpu"
         self.current_device = "cpu"
-        self.tokenizer = self._load_tokenizer(base_model_path=config.base_model_path)
+        self.tokenizer = self._load_tokenizer(base_model_path=config.tokenizer_path or config.base_model_path)
         self.saved_adapter_dirs: dict[AdapterName, str] = {}
         self.single_target_parameter_adapter_mode = False
         self.loaded_adapter_name: AdapterName | None = None
@@ -856,7 +857,7 @@ class MultiAdapterTrainer:
         trainer.config = config
         trainer.compute_device = "cuda" if config.device == "cuda" and torch.cuda.is_available() else "cpu"
         trainer.current_device = "cpu"
-        trainer.tokenizer = trainer._load_tokenizer(base_model_path=config.base_model_path)
+        trainer.tokenizer = trainer._load_tokenizer(base_model_path=config.tokenizer_path or config.base_model_path)
         trainer.saved_adapter_dirs = dict(adapter_dirs)
         trainer.single_target_parameter_adapter_mode = _uses_target_parameter_adapters(adapter_dirs=adapter_dirs)
         trainer.loaded_adapter_name = None

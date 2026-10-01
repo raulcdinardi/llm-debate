@@ -56,6 +56,9 @@ class TrainRunConfig:
     model_path: str
     output_dir: str
     tokenizer_path: str | None = None
+    judge_model_path: str | None = None
+    judge_tokenizer_path: str | None = None
+    judge_sampler_gpu_memory_utilization: float = 0.25
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     steps: int = 1
     learning_rate: float = 1e-5
@@ -239,6 +242,24 @@ class TrainRunConfig:
     def __post_init__(self) -> None:
         if not self.debate_r23_penalize_word_limit and self.debate_prompt_format != "qwen35_instruct_three_points":
             raise ValueError("Word-limit penalty opt-out requires the Qwen three-point format")
+        if self.judge_tokenizer_path is not None and self.judge_model_path is None:
+            raise ValueError("judge_tokenizer_path requires judge_model_path")
+        if self.judge_model_path is not None:
+            if self.rollout.mode != "debate" or self.debate_judge_adapter != "judge":
+                raise ValueError("A separate judge backbone requires debate mode and the judge adapter")
+            if self.sampler_backend != "vllm":
+                raise ValueError("Two-backbone training currently requires the in-process vLLM samplers")
+            if self.sampler_teardown_before_training or self.sampler_sleep_level != 1:
+                raise ValueError("Two-backbone sampling requires persistent engines with sleep level 1")
+            if any(value is not None for value in (self.debate_judge_server_url,
+                    self.debate_external_judge_url, self.debate_mock_judge_seed)):
+                raise ValueError("A local judge backbone cannot be combined with an external/mock judge")
+            if any(name in ("judge", "judge_shadow") for name in self.resolved_debate_round_adapter_names()):
+                raise ValueError("Judge-backbone adapters cannot generate actor rounds")
+            if self.trace_model_io:
+                raise ValueError("Two-backbone model-I/O tracing requires per-model tracer routing")
+            if not 0.0 < self.judge_sampler_gpu_memory_utilization < 1.0:
+                raise ValueError("judge_sampler_gpu_memory_utilization must be between 0 and 1")
         if self.train_keep_groups_together and self.rollout.mode == "debate":
             if self.uses_legacy_shared_projection() or (self.effective_debate_max_rounds() == 1 and self.debate_r1_reward == "judge"):
                 raise ValueError("Group-preserving optimizer batches require round-wise trajectory projection")
@@ -598,6 +619,9 @@ class TrainRunConfig:
             model_path=data["model_path"],
             output_dir=data["output_dir"],
             tokenizer_path=data.get("tokenizer_path"),
+            judge_model_path=data.get("judge_model_path"),
+            judge_tokenizer_path=data.get("judge_tokenizer_path"),
+            judge_sampler_gpu_memory_utilization=data.get("judge_sampler_gpu_memory_utilization", 0.25),
             rollout=RolloutConfig(
                 env_name=rollout_data.get("env_name", "ht_sequence"),
                 mode=rollout_data.get("mode", "debate"),

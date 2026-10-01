@@ -20,7 +20,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-_NEUTRAL_DEFAULTS = {"python_optimization_config": None, "debate_r23_penalize_word_limit": True}
+_NEUTRAL_DEFAULTS = {
+    "python_optimization_config": None, "debate_r23_penalize_word_limit": True,
+    "judge_model_path": None, "judge_tokenizer_path": None,
+    "judge_sampler_gpu_memory_utilization": 0.25,
+}
 
 
 def config_fingerprint(config: dict[str, Any], *, normalize_new_defaults: bool = True) -> str:

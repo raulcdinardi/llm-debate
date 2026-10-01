@@ -205,7 +205,12 @@ class DebateRuntime:
     runtime_config: DebateRuntimeConfig
     adapter_layout: str
     judge_fn: JudgeFn | None = None
+    judge_tokenizer: object | None = None
     judge_sampler: RolloutSampler = field(init=False, repr=False)
+
+    @property
+    def _judge_tokenizer(self):
+        return getattr(self, "judge_tokenizer", None) or self.tokenizer
 
     def __post_init__(self) -> None:
         if self.runtime_config.debate_judge_server_url is None:
@@ -359,7 +364,7 @@ class DebateRuntime:
         return visible_texts, metrics
 
     def sample_pointwise_judge_rewards(self, *, debates: list[DebateResult], step_seed: int | None) -> dict[int, float]:
-        adapter = get_chat_adapter(self.tokenizer)
+        adapter = get_chat_adapter(self._judge_tokenizer)
         system = load_prompt("debate/system_pointwise_judge.md")
         requests: list[SamplingRequest] = []
         keys: list[int] = []
@@ -384,7 +389,7 @@ class DebateRuntime:
                     SamplingRequest(
                         adapter_name=self._judge_adapter_name(),
                         prompt_token_ids=prompt_tokens,
-                        stop_token_ids=self.task.stop_token_ids(tokenizer=self.tokenizer),
+                        stop_token_ids=[adapter.stop_token_id],
                         max_tokens=8,
                         temperature=0.0,
                         seed=step_seed,
@@ -784,6 +789,8 @@ class DebateRuntime:
         return out
 
     def _sample_judge_many(self, *, prompt_tokens_list: list[list[int]], round_num: int, step_seed: int | None, stop_token_ids: list[int], max_tokens: int, temperature: float) -> list[tuple[list[int], list[float], str, dict]]:
+        if self._judge_tokenizer is not self.tokenizer:
+            stop_token_ids = [get_chat_adapter(self._judge_tokenizer).stop_token_id]
         requests = []
         adapter_name = self._judge_adapter_name()
         allowed_token_ids = self._judge_allowed_token_ids()
@@ -836,17 +843,17 @@ class DebateRuntime:
             return ()
         if self.runtime_config.judge_label_token_contract != JUDGE_LABEL_TOKEN_CONTRACT_NONE:
             contract = resolve_judge_label_token_contract(
-                tokenizer=self.tokenizer,
+                tokenizer=self._judge_tokenizer,
                 contract_name=self.runtime_config.judge_label_token_contract,
             )
             return contract.allowed_token_ids
         harness = get_judge_harness(self.runtime_config.judge_harness_id)
         token_ids: list[int] = []
         for candidate in ("A", " A", "B", " B"):
-            encoded = list(self.tokenizer.encode(candidate, add_special_tokens=False))
+            encoded = list(self._judge_tokenizer.encode(candidate, add_special_tokens=False))
             if len(encoded) != 1:
                 continue
-            if harness.parse_verdict(self.tokenizer.decode(encoded)) not in ("A", "B"):
+            if harness.parse_verdict(self._judge_tokenizer.decode(encoded)) not in ("A", "B"):
                 continue
             if encoded[0] not in token_ids:
                 token_ids.append(encoded[0])
@@ -876,10 +883,10 @@ class DebateRuntime:
             base_system_text=self.debate_config.system_judge,
         )
         if rendered.raw_text is not None:
-            prompt_tokens = list(self.tokenizer.encode(rendered.raw_text, add_special_tokens=False))
+            prompt_tokens = list(self._judge_tokenizer.encode(rendered.raw_text, add_special_tokens=False))
             if self.runtime_config.judge_label_token_contract == LFM25_OPENBOOKQA_SPACED_AB_V1:
                 contract = resolve_judge_label_token_contract(
-                    tokenizer=self.tokenizer,
+                    tokenizer=self._judge_tokenizer,
                     contract_name=self.runtime_config.judge_label_token_contract,
                 )
                 # Harness-authored suffix is invariant across examples. Validate
@@ -889,7 +896,7 @@ class DebateRuntime:
                 validated = getattr(self, "_validated_judge_label_boundaries", set())
                 if cache_key not in validated:
                     validate_judge_prompt_label_boundary(
-                        tokenizer=self.tokenizer,
+                        tokenizer=self._judge_tokenizer,
                         prompt_text=rendered.raw_text,
                         prompt_token_ids=prompt_tokens,
                         contract=contract,
@@ -897,16 +904,16 @@ class DebateRuntime:
                     validated.add(cache_key)
                     self._validated_judge_label_boundaries = validated
             return prompt_tokens
-        prompt_tokens = get_chat_adapter(self.tokenizer).encode_messages(
+        prompt_tokens = get_chat_adapter(self._judge_tokenizer).encode_messages(
             list(rendered.messages),
             add_generation_prompt=True,
             enable_thinking=False,
         )
 
         if self.runtime_config.judge_label_token_contract == QWEN35_INSTRUCT_AB_V1:
-            contract = resolve_judge_label_token_contract(tokenizer=self.tokenizer, contract_name=QWEN35_INSTRUCT_AB_V1)
-            prompt_text = self.tokenizer.decode(prompt_tokens, skip_special_tokens=False)
-            validate_judge_prompt_label_boundary(tokenizer=self.tokenizer, prompt_text=prompt_text,
+            contract = resolve_judge_label_token_contract(tokenizer=self._judge_tokenizer, contract_name=QWEN35_INSTRUCT_AB_V1)
+            prompt_text = self._judge_tokenizer.decode(prompt_tokens, skip_special_tokens=False)
+            validate_judge_prompt_label_boundary(tokenizer=self._judge_tokenizer, prompt_text=prompt_text,
                                                 prompt_token_ids=prompt_tokens, contract=contract)
         return prompt_tokens
 
@@ -1390,7 +1397,7 @@ class DebateRuntime:
             else []
         )
         prompt_tokens = forward_prompt_tokens + reverse_prompt_tokens
-        stop_token_ids = self.task.stop_token_ids(tokenizer=self.tokenizer)
+        stop_token_ids = self.task.stop_token_ids(tokenizer=self._judge_tokenizer)
         results = self._sample_judge_many(
             prompt_tokens_list=prompt_tokens,
             round_num=99,
@@ -1422,7 +1429,7 @@ class DebateRuntime:
             if not self.runtime_config.judge_bidirectional:
                 raise ValueError("order_sym_soft_logit requires bidirectional judge sampling")
             contract = resolve_judge_label_token_contract(
-                tokenizer=self.tokenizer,
+                tokenizer=self._judge_tokenizer,
                 contract_name=self.runtime_config.judge_label_token_contract,
             )
             debate_count = len(transcripts)

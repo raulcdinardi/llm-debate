@@ -132,6 +132,7 @@ def _extract_candidate_logprobs(
 @dataclass(frozen=True)
 class VllmRuntimeConfig:
     model_path: str
+    tokenizer_path: str | None = None
     gpu_memory_utilization: float = 0.55
     max_model_len: int = 64
     max_num_seqs: int | None = None
@@ -344,6 +345,8 @@ class VllmSampler:
             "max_model_len": runtime.max_model_len,
             "enforce_eager": runtime.enforce_eager,
         }
+        if runtime.tokenizer_path is not None:
+            llm_kwargs["tokenizer"] = runtime.tokenizer_path
         if runtime.enable_prefix_caching is not None:
             llm_kwargs["enable_prefix_caching"] = runtime.enable_prefix_caching
             if runtime.enable_prefix_caching:
@@ -362,6 +365,8 @@ class VllmSampler:
                 )
             llm_kwargs["logprobs_mode"] = runtime.logprobs_mode
         self._llm = LLM(**llm_kwargs)
+        if runtime.tokenizer_path is not None:
+            llm_kwargs["tokenizer"] = runtime.tokenizer_path
         if runtime.enable_prefix_caching is not None:
             cache_config = self._llm.llm_engine.vllm_config.cache_config
             if cache_config.enable_prefix_caching != runtime.enable_prefix_caching:
