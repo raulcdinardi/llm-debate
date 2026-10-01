@@ -141,6 +141,7 @@ class VllmRuntimeConfig:
     max_lora_rank: int = 32
     max_loras: int = 4
     logprobs_mode: str = "processed_logprobs"
+    tokenizer_path: str | None = None
 
 
 def _engine_accepts_logprobs_mode() -> bool:
@@ -344,6 +345,8 @@ class VllmSampler:
             "max_model_len": runtime.max_model_len,
             "enforce_eager": runtime.enforce_eager,
         }
+        if runtime.tokenizer_path is not None:
+            llm_kwargs["tokenizer"] = runtime.tokenizer_path
         if runtime.enable_prefix_caching is not None:
             llm_kwargs["enable_prefix_caching"] = runtime.enable_prefix_caching
             if runtime.enable_prefix_caching:

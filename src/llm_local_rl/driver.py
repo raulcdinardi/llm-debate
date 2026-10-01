@@ -39,6 +39,7 @@ from llm_local_rl.masking import make_train_example
 from llm_local_rl.metrics import mean_numeric_metrics
 from llm_local_rl.mock_judge import SeededRandomJudge
 from llm_local_rl.model_io_trace import configure_model_io_tracing, trace_context
+from llm_local_rl.model_routing import RoutedTrainer, RoutedSampler, partition_adapters
 from llm_local_rl.qwen35_base_format import resolve_countdown_assistant_prefill
 from llm_local_rl.registry import build_debate_task, build_environment, build_episode_builder
 from llm_local_rl.resource_monitor import ResourceMonitor
@@ -98,6 +99,7 @@ class TrainingDriver:
         self.episode_builder = build_episode_builder(config) if config.rollout.mode == "single_turn" else None
         self.debate_task = build_debate_task(config) if config.rollout.mode == "debate" else None
         self.tokenizer = self._load_tokenizer()
+        self.judge_tokenizer = self._load_judge_tokenizer()
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         if self.tokenizer.pad_token_id is None:
@@ -145,7 +147,9 @@ class TrainingDriver:
                 )
             )
         with self._stage("init_sampler", step=0):
-            self.sampler = self._make_sampler()
+            context = preserve_rng_state() if config.judge_model_path is not None else nullcontext()
+            with context:
+                self.sampler = self._make_sampler()
         self.observability = self._make_observability()
         self.observability.log_step(
             {
@@ -188,6 +192,7 @@ class TrainingDriver:
         driver.episode_builder = build_episode_builder(config) if config.rollout.mode == "single_turn" else None
         driver.debate_task = build_debate_task(config) if config.rollout.mode == "debate" else None
         driver.tokenizer = driver._load_tokenizer()
+        driver.judge_tokenizer = driver._load_judge_tokenizer()
         if driver.tokenizer.pad_token_id is None and driver.tokenizer.eos_token_id is not None:
             driver.tokenizer.pad_token = driver.tokenizer.eos_token
         if driver.tokenizer.pad_token_id is None:
@@ -235,7 +240,10 @@ class TrainingDriver:
         with driver._stage("trainer_sleep", step=driver.start_step):
             driver.trainer.sleep()
         with driver._stage("init_sampler", step=driver.start_step):
-            driver.sampler = driver._make_sampler()
+            # Engine construction must not consume the restored training RNG.
+            context = preserve_rng_state() if config.judge_model_path is not None else nullcontext()
+            with context:
+                driver.sampler = driver._make_sampler()
         driver.observability = driver._make_observability()
         driver._rebuild_metric_history()
         driver._progress("driver_resume_done", output_dir=str(driver.output_dir), start_step=driver.start_step)
@@ -525,6 +533,7 @@ class TrainingDriver:
             on_policy_warning_path = str(self.output_dir / "on_policy_logprob_warnings.jsonl")
         return TrainerConfig(
             base_model_path=self.config.model_path,
+            tokenizer_path=self.config.tokenizer_path if self.config.judge_model_path is not None else None,
             adapter_names=self._adapter_names(),
             learning_rate=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
@@ -577,38 +586,55 @@ class TrainingDriver:
             },
         )
 
-    def _make_fresh_trainer(self) -> MultiAdapterTrainer:
+    def _make_trainer(self, *, adapter_dirs: dict[str, str] | None = None):
         from llm_local_rl.trainer import MultiAdapterTrainer
+        from dataclasses import replace
 
-        trainer = MultiAdapterTrainer(config=self._trainer_config(device="cuda"))
-        if self.config.train_shadow_judge:
-            receipt = trainer.initialize_shadow_judge(
-                seed=self.config.shadow_judge_init_seed,
-                std=self.config.shadow_judge_init_std,
+        def build(config, dirs):
+            return (MultiAdapterTrainer(config=config) if dirs is None else
+                    MultiAdapterTrainer.from_saved_adapters(config=config, adapter_dirs=dirs))
+
+        config = self._trainer_config(device="cuda")
+        if self.config.judge_model_path is None:
+            trainer = build(config, adapter_dirs)
+            judge_trainer = trainer
+        else:
+            actor_names, judge_names = partition_adapters(dict.fromkeys(config.adapter_names))
+            actor_dirs, judge_dirs = (partition_adapters(adapter_dirs) if adapter_dirs is not None else (None, None))
+            actor = build(replace(config, adapter_names=tuple(actor_names)), actor_dirs)
+            actor.sleep()
+            judge_trainer = build(replace(config, base_model_path=self.config.judge_model_path,
+                                         tokenizer_path=self.config.judge_tokenizer_path,
+                                         adapter_names=tuple(judge_names)), judge_dirs)
+            trainer = RoutedTrainer(actor=actor, judge=judge_trainer)
+        if adapter_dirs is None and self.config.train_shadow_judge:
+            receipt = judge_trainer.initialize_shadow_judge(
+                seed=self.config.shadow_judge_init_seed, std=self.config.shadow_judge_init_std,
             )
             (self.output_dir / "shadow_judge_initialization.json").write_text(json.dumps(receipt, indent=2))
         return trainer
 
-    def _make_trainer_from_init_adapters(self) -> MultiAdapterTrainer:
-        from llm_local_rl.trainer import MultiAdapterTrainer
+    def _make_fresh_trainer(self):
+        return self._make_trainer()
 
+    def _make_trainer_from_init_adapters(self):
         if self.config.init_adapter_dirs is None:
             raise ValueError("init_adapter_dirs is required for adapter initialization.")
         expected = set(self._adapter_names())
         provided = set(self.config.init_adapter_dirs)
         if provided != expected:
             raise ValueError(f"init_adapter_dirs keys must be {sorted(expected)}, got {sorted(provided)}.")
-        return MultiAdapterTrainer.from_saved_adapters(
-            config=self._trainer_config(device="cuda"),
-            adapter_dirs=self.config.init_adapter_dirs,
-        )
+        return self._make_trainer(adapter_dirs=self.config.init_adapter_dirs)
 
-    def _make_trainer_from_current_adapters(self) -> MultiAdapterTrainer:
-        from llm_local_rl.trainer import MultiAdapterTrainer
+    def _make_trainer_from_current_adapters(self):
+        return self._make_trainer(adapter_dirs=self.current_adapter_dirs)
 
-        return MultiAdapterTrainer.from_saved_adapters(
-            config=self._trainer_config(device="cuda"),
-            adapter_dirs=self.current_adapter_dirs,
+    def _load_judge_tokenizer(self):
+        if self.config.judge_model_path is None:
+            return self.tokenizer
+        from transformers import AutoTokenizer
+        return AutoTokenizer.from_pretrained(
+            self.config.judge_tokenizer_path or self.config.judge_model_path, use_fast=True,
         )
 
     def _write_manifest(self, *, current_step: int) -> None:
@@ -623,25 +649,40 @@ class TrainingDriver:
         manifest.write_json(self.output_dir / "manifest.json")
 
     def _make_sampler(self):
+        if self.config.judge_model_path is not None:
+            actor_paths, judge_paths = partition_adapters(self._sampler_adapter_dirs())
+            actor = self._make_vllm_sampler(model_path=self.config.model_path,
+                adapter_paths=actor_paths, memory_utilization=self.config.sampler_gpu_memory_utilization,
+                tokenizer_path=self.config.tokenizer_path)
+            judge = None
+            try:
+                actor.sleep(level=1)
+                judge = self._make_vllm_sampler(model_path=self.config.judge_model_path,
+                    adapter_paths=judge_paths, memory_utilization=self.config.judge_sampler_gpu_memory_utilization,
+                    tokenizer_path=self.config.judge_tokenizer_path)
+                judge.sleep(level=1)
+            except BaseException:
+                try:
+                    if judge is not None:
+                        judge.close()
+                finally:
+                    actor.close()
+                raise
+            trainable = set(self._sampler_adapter_dirs())
+            selected = self._train_adapter_names()
+            if selected is not None:
+                trainable.intersection_update(selected)
+            if not self.config.train_judge:
+                trainable.difference_update({"judge", SHADOW_JUDGE})
+            return RoutedSampler(actor=actor, judge=judge, trainable_adapter_names=trainable)
         if self.config.sampler_backend == "transformers":
             from llm_local_rl.transformers_sampling import TrainerTransformersSampler
 
             return TrainerTransformersSampler(trainer=self.trainer, tokenizer=self.tokenizer)
         if self.config.sampler_backend == "vllm":
-            return VllmSampler(
-                runtime=VllmRuntimeConfig(
-                    model_path=self.config.model_path,
-                    gpu_memory_utilization=self.config.sampler_gpu_memory_utilization,
-                    max_model_len=self.config.sampler_max_model_len,
-                    max_num_seqs=None if self.config.sampler_max_num_seqs <= 0 else self.config.sampler_max_num_seqs,
-                    enable_prefix_caching=self.config.sampler_prefix_caching,
-                    enforce_eager=self.config.sampler_enforce_eager,
-                    enable_sleep_mode=self._should_sleep_sampler_before_training(),
-                    max_lora_rank=self.config.sampler_max_lora_rank,
-                    max_loras=self.config.sampler_max_loras,
-                ),
+            return self._make_vllm_sampler(model_path=self.config.model_path,
                 adapter_paths=self._sampler_adapter_dirs(),
-            )
+                memory_utilization=self.config.sampler_gpu_memory_utilization)
         if self.config.sampler_backend == "sglang":
             return SglangSampler(
                 runtime=SglangRuntimeConfig(
@@ -654,6 +695,22 @@ class TrainingDriver:
                 adapter_paths=self._sampler_adapter_dirs(),
             )
         raise ValueError(f"Unsupported sampler_backend={self.config.sampler_backend!r}.")
+
+    def _make_vllm_sampler(self, *, model_path, adapter_paths, memory_utilization, tokenizer_path=None):
+        return VllmSampler(
+            runtime=VllmRuntimeConfig(
+                model_path=model_path,
+                tokenizer_path=tokenizer_path,
+                gpu_memory_utilization=memory_utilization,
+                max_model_len=self.config.sampler_max_model_len,
+                max_num_seqs=None if self.config.sampler_max_num_seqs <= 0 else self.config.sampler_max_num_seqs,
+                enable_prefix_caching=self.config.sampler_prefix_caching,
+                enforce_eager=self.config.sampler_enforce_eager,
+                enable_sleep_mode=self._should_sleep_sampler_before_training(),
+                max_lora_rank=self.config.sampler_max_lora_rank,
+                max_loras=self.config.sampler_max_loras,
+            ), adapter_paths=adapter_paths,
+        )
 
     def _ensure_sampler(self) -> None:
         if self.sampler is None:
@@ -850,6 +907,7 @@ class TrainingDriver:
                 debate_judge_server_adapter_path=self.config.debate_judge_server_adapter_path,
             ),
             adapter_layout=self.config.adapter_layout,
+            judge_tokenizer=self.judge_tokenizer,
             judge_fn=judge_fn,
         )
 
@@ -954,7 +1012,7 @@ class TrainingDriver:
 
         judge_completion_tokens = debate.judge_completion_tokens or []
         judge_text = (
-            self.tokenizer.decode(judge_completion_tokens, skip_special_tokens=True).strip()
+            getattr(self, "judge_tokenizer", self.tokenizer).decode(judge_completion_tokens, skip_special_tokens=True).strip()
             if judge_completion_tokens
             else ""
         )
