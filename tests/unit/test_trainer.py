@@ -2089,3 +2089,13 @@ def test_token_budget_capacity_exhaustion_is_bounded(monkeypatch):
     with pytest.raises(torch.OutOfMemoryError, match="single-unit chunks"):
         trainer.train_batch(adapter_name="shared", batch=_len_rows([5] * 8))
     assert calls[-1] == 1 and len(calls) <= 12
+
+
+def test_token_budget_reports_physical_chunk_stats():
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_minibatch_size=32, train_optimizer_batch_size=32, train_microbatch_token_budget=64)
+    rows = _ce_only_pair_rows()
+    actual = trainer.train_batch(adapter_name="judge", batch=rows, objective="supervised_label_ce_js", judge_coherence_js_weight=0.5)
+    assert actual["physical_chunk_count"] >= 1 and actual["physical_chunk_rows_max"] % 2 == 0
+    assert actual["physical_chunk_rows_min"] <= actual["physical_chunk_rows_mean"] <= actual["physical_chunk_rows_max"]
+    assert 0 < actual["physical_chunk_padded_tokens_max"] <= 64 or actual["physical_chunk_rows_max"] == 2
