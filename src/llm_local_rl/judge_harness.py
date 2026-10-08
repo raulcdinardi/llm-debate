@@ -11,6 +11,7 @@ from llm_local_rl.debate_parity import Verdict
 
 
 QWEN35_CHAT_SINGLE_TOKEN_V1 = "qwen35_chat_single_token_v1"
+QWEN35_CHAT_SINGLE_TOKEN_INTERLEAVED_V1 = "qwen35_chat_single_token_interleaved_v1"
 CHAT_SOLUTION_TAGGED_V1 = "chat_solution_tagged_v1"
 CHAT_POINTWISE_TAGGED_V1 = "chat_pointwise_tagged_v1"
 SOLUTION_R1_RATIONALE_V1 = "solution_r1_rationale_v1"
@@ -22,6 +23,7 @@ JUDGE_HARNESS_MANIFEST_SCHEMA = "llm_local_rl_judge_harness_v1"
 
 JudgeHarnessId = Literal[
     "qwen35_chat_single_token_v1",
+    "qwen35_chat_single_token_interleaved_v1",
     "chat_solution_tagged_v1",
     "chat_pointwise_tagged_v1",
     "solution_r1_rationale_v1",
@@ -272,6 +274,24 @@ def _render_qwen35_chat_single_token(transcript: JudgeTranscript, _base_system_t
     ))
 
 
+def _render_qwen35_chat_single_token_interleaved(transcript: JudgeTranscript, _base_system_text: str) -> RenderedJudgePrompt:
+    """Same system text and contract as qwen35_chat_single_token_v1, but the transcript is serialized round by
+    round (Round k: Agent A, then Agent B) instead of grouped by agent, so each rebuttal follows the argument it
+    answers. Added 2026-10-08 after the frozen-judge serialization test (analyses/k1k2_followup_5090_20261008)."""
+    rounds_a, rounds_b = transcript.agent_a.rounds, transcript.agent_b.rounds
+    blocks = []
+    for index in range(1, max(len(rounds_a), len(rounds_b)) + 1):
+        parts = [f"Agent {name}:\n{rounds[index - 1]}" for name, rounds in (("A", rounds_a), ("B", rounds_b))
+                 if len(rounds) >= index]
+        blocks.append(f"=== ROUND {index} ===\n" + "\n\n".join(parts))
+    system = _render_qwen35_chat_single_token(transcript, _base_system_text).messages[0]["content"]
+    return RenderedJudgePrompt(messages=(
+        {"role": "system", "content": system},
+        {"role": "user", "content": "Task:\n" + transcript.question + "\n\nCriterion:\n" +
+         transcript.constitution + "\n\n" + "\n\n".join(blocks)},
+    ))
+
+
 def _render_consultancy_single_token(
     transcript: JudgeTranscript, _base_system_text: str
 ) -> RenderedJudgePrompt:
@@ -440,6 +460,14 @@ _HARNESSES: dict[JudgeHarnessId, JudgeHarnessSpec] = {
         render=_render_qwen35_chat_single_token, parse_verdict=extract_single_token_verdict,
         required_phrases=("Do not reward confidence, rhetoric, or debate skill by itself.",),
         forbidden_phrases=("more convincing case", "rebuttal effectiveness"),
+    ),
+    QWEN35_CHAT_SINGLE_TOKEN_INTERLEAVED_V1: JudgeHarnessSpec(
+        harness_id=QWEN35_CHAT_SINGLE_TOKEN_INTERLEAVED_V1, serialization="chat",
+        objective="select_best_original_response", output_contract="single_token_a_or_b",
+        assistant_prefill="<think>\n\n</think>\n\n", default_max_tokens=1, required_rounds=2,
+        render=_render_qwen35_chat_single_token_interleaved, parse_verdict=extract_single_token_verdict,
+        required_phrases=("Do not reward confidence, rhetoric, or debate skill by itself.", "=== ROUND 2 ==="),
+        forbidden_phrases=("more convincing case", "rebuttal effectiveness", "=== AGENT"),
     ),
     CONSTITUTION_SINGLE_TOKEN_V1: JudgeHarnessSpec(
         harness_id=CONSTITUTION_SINGLE_TOKEN_V1,
