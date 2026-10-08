@@ -1346,6 +1346,7 @@ class MultiAdapterTrainer:
                         physical_microbatch_size=candidate,
                         microbatch_initial_size=initial_candidate,
                         physical_microbatch_token_budget=token_budget,
+                        **getattr(self, "_last_chunk_stats", {}),
                         microbatch_initial_token_budget=initial_token_budget,
                         microbatch_oom_attempts=failures,
                         microbatch_retry_seconds=retry_seconds,
@@ -1519,6 +1520,13 @@ class MultiAdapterTrainer:
                 chunks.append((start, end, optimizer_start, optimizer_end - optimizer_start))
             optimizer_start = optimizer_end
         self._last_chunk_max_rows = max((end - start for start, end, _, _ in chunks), default=0)
+        _rows = [end - start for start, end, _, _ in chunks]
+        _padded = [(end - start) * max(_effective_train_length(example=r, max_tokens=self.config.train_max_tokens)
+                                         for r in ordered_batch[start:end]) for start, end, _, _ in chunks]
+        self._last_chunk_stats = dict(physical_chunk_count=len(_rows), physical_chunk_rows_min=min(_rows, default=0),
+                                      physical_chunk_rows_max=max(_rows, default=0),
+                                      physical_chunk_rows_mean=(sum(_rows) / len(_rows)) if _rows else 0.0,
+                                      physical_chunk_padded_tokens_max=max(_padded, default=0))
         if self.config.train_keep_groups_together:
             print(json.dumps({"event": "optimizer_group_plan", "adapter_name": adapter_name,
                               "batch_rows": [len(group) for group in optimizer_groups],
