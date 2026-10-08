@@ -12,6 +12,7 @@ from llm_local_rl.judge_harness import (
     CHAT_SOLUTION_TAGGED_V1,
     CONSTITUTION_SINGLE_TOKEN_V1,
     QWEN35_CHAT_SINGLE_TOKEN_V1,
+    QWEN35_CHAT_SINGLE_TOKEN_INTERLEAVED_V1,
     JudgeHarnessSpec,
     SOLUTION_R1_RATIONALE_V1,
     get_judge_harness,
@@ -404,7 +405,7 @@ class TrainRunConfig:
                 raise ValueError(
                     "direct JS judge objectives require the strict two-token contract"
                 )
-            if (self.judge_label_token_contract, self.debate_judge_harness) not in ((LFM25_OPENBOOKQA_SPACED_AB_V1, CONSTITUTION_SINGLE_TOKEN_V1), (QWEN35_INSTRUCT_AB_V1, QWEN35_CHAT_SINGLE_TOKEN_V1)):
+            if (self.judge_label_token_contract, self.debate_judge_harness) not in ((LFM25_OPENBOOKQA_SPACED_AB_V1, CONSTITUTION_SINGLE_TOKEN_V1), (QWEN35_INSTRUCT_AB_V1, QWEN35_CHAT_SINGLE_TOKEN_V1), (QWEN35_INSTRUCT_AB_V1, QWEN35_CHAT_SINGLE_TOKEN_INTERLEAVED_V1)):
                 raise ValueError(
                     "direct JS judge objectives require constitution_single_token_v1"
                 )
@@ -454,7 +455,7 @@ class TrainRunConfig:
                     )
                 if float(self.debate_judge_temperature) <= 0.0:
                     raise ValueError("trainable soft judge requires stochastic temperature > 0")
-                if (self.judge_label_token_contract, self.debate_judge_harness) not in ((LFM25_OPENBOOKQA_SPACED_AB_V1, CONSTITUTION_SINGLE_TOKEN_V1), (QWEN35_INSTRUCT_AB_V1, QWEN35_CHAT_SINGLE_TOKEN_V1)):
+                if (self.judge_label_token_contract, self.debate_judge_harness) not in ((LFM25_OPENBOOKQA_SPACED_AB_V1, CONSTITUTION_SINGLE_TOKEN_V1), (QWEN35_INSTRUCT_AB_V1, QWEN35_CHAT_SINGLE_TOKEN_V1), (QWEN35_INSTRUCT_AB_V1, QWEN35_CHAT_SINGLE_TOKEN_INTERLEAVED_V1)):
                     raise ValueError(
                         "strict OpenBookQA token boundary is bound to constitution_single_token_v1"
                     )
