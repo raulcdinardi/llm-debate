@@ -141,6 +141,7 @@ class TrainRunConfig:
     train_keep_groups_together: bool = False
     train_max_tokens: int = 0
     train_length_bucket_batches: bool = False
+    train_microbatch_token_budget: int = 0
     train_logprob_backend: str = "full_logits"
     compile_train_logprob_helper: bool = False
     train_lm_head_kernel: str = "torch"
@@ -730,6 +731,7 @@ class TrainRunConfig:
             train_keep_groups_together=data.get("train_keep_groups_together", False),
             train_max_tokens=data.get("train_max_tokens", 0),
             train_length_bucket_batches=data.get("train_length_bucket_batches", False),
+            train_microbatch_token_budget=int(data.get("train_microbatch_token_budget", 0)),
             train_logprob_backend=data.get("train_logprob_backend", "full_logits"),
             compile_train_logprob_helper=data.get("compile_train_logprob_helper", False),
             train_lm_head_kernel=data.get("train_lm_head_kernel", "torch"),

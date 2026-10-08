@@ -1963,3 +1963,129 @@ def test_grouped_batches_refuse_partial_groups_before_update():
     with pytest.raises(ValueError, match="complete optimizer group"):
         trainer.train_batch(adapter_name="shared", batch=batch)
     assert trainer.model.bias.item() == 0.0
+
+
+# --- token-budget physical microbatching -------------------------------------------------------------
+
+def _len_rows(lengths, adapter="shared", advantages=None):
+    rows = []
+    for i, n in enumerate(lengths):
+        adv = advantages[i] if advantages else 1.0
+        rows.append(TrainExample(adapter, [0] * n, [0] * n, [0] * (n - 1) + [1], [0] * (n - 1) + [1],
+                                 [0.] * (n - 1) + [-math.log(2)], [0.] * (n - 1) + [adv]))
+    return rows
+
+
+@pytest.mark.parametrize("unit", [1, 2])
+@pytest.mark.parametrize("budget", [1, 7, 20, 64])
+def test_token_budget_chunks_cover_rows_and_respect_budget(unit, budget):
+    from llm_local_rl.trainer import _token_budget_chunks
+    lengths = sorted([1, 2, 2, 3, 5, 5, 8, 13, 13, 21, 2, 3][:12])
+    rows = _len_rows(lengths)
+    chunks = _token_budget_chunks(rows=rows, start=0, end=len(rows), row_cap=8, token_budget=budget, unit=unit)
+    assert chunks[0][0] == 0 and chunks[-1][1] == len(rows)
+    assert all(a == prev_b for (a, _), (_, prev_b) in zip(chunks[1:], chunks[:-1]))
+    for a, b in chunks:
+        assert (b - a) % unit == 0 and b - a <= 8
+        if b - a > unit:  # only a lone oversize unit may exceed the budget
+            assert (b - a) * max(lengths[a:b]) <= budget
+
+
+def test_token_budget_zero_keeps_fixed_row_chunks():
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_minibatch_size=4, train_optimizer_batch_size=32)
+    result = trainer.train_batch(adapter_name="shared", batch=_len_rows([1, 2, 3, 4, 5, 6, 7, 8]))
+    assert result["num_train_minibatches"] == 2
+    assert result["physical_microbatch_token_budget"] == 0
+
+
+@pytest.mark.parametrize("budget", [6, 16, 40, 10_000])
+@pytest.mark.parametrize("bucket", [False, True])
+def test_token_budget_grouped_updates_match_independent_ppo(budget, bucket):
+    from llm_local_rl.optimizer_batching import pack_optimizer_groups
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_keep_groups_together=True, train_optimizer_batch_size=32,
+                             train_minibatch_size=32, train_length_bucket_batches=bucket, max_grad_norm=0.0,
+                             train_microbatch_token_budget=budget)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.7)
+    batch = []
+    for index in range(16):
+        for group in range(8):
+            n = 1 + (group * 3 + index) % 7
+            advantage = [1.0, .4, -.8, .6, -.3, 1.2, .2, -1.0][group % 8]
+            batch.append(TrainExample("shared", [0] * n, [0] * n, [0] * (n - 1) + [1], [0] * (n - 1) + [1],
+                                      [0.] * (n - 1) + [-math.log(2)], [0.] * (n - 1) + [advantage],
+                                      metadata={"optimizer_group_id": str(group)}))
+    expected = torch.tensor(0., requires_grad=True)
+    optimizer = torch.optim.SGD([expected], lr=0.7)
+    for group in pack_optimizer_groups(batch, max_rows=32):
+        advantages = torch.tensor([r.advantages[-1] for r in group])
+        ratio = 2 * torch.sigmoid(expected)
+        loss = -torch.minimum(ratio * advantages, ratio.clamp(.8, 1.2) * advantages).mean()
+        loss.backward(); optimizer.step(); optimizer.zero_grad()
+    result = trainer.train_batch(adapter_name="shared", batch=batch)
+    assert trainer.model.bias.item() == pytest.approx(expected.item(), abs=1e-6)  # fp32 accumulation order over many chunks
+    assert result["num_optimizer_steps"] == 4
+    if budget >= 32 * 7:
+        assert result["num_train_minibatches"] == 4  # whole groups fit
+    else:
+        assert result["num_train_minibatches"] > 4
+
+
+def test_token_budget_capacity_halves_budget_not_rows_and_persists(monkeypatch, tmp_path):
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_minibatch_size=32, train_optimizer_batch_size=32,
+                             train_length_bucket_batches=True, train_microbatch_token_budget=256)
+    forward = trainer.model.forward
+    padded = []
+    limit = 60
+
+    def bounded_forward(**kwargs):
+        rows, width = kwargs["input_ids"].shape
+        padded.append(rows * width)
+        if rows * width > limit:
+            raise torch.OutOfMemoryError("injected padded-token limit")
+        return forward(**kwargs)
+
+    monkeypatch.setattr(trainer.model, "forward", bounded_forward)
+    batch = _len_rows([4] * 16 + [8] * 16)
+    result = trainer.train_batch(adapter_name="shared", batch=batch)
+    assert result["physical_microbatch_token_budget"] == 32 and result["microbatch_initial_token_budget"] == 256
+    assert result["microbatch_oom_attempts"] == 3
+    assert result["physical_microbatch_size"] == 32  # row cap untouched in token-budget mode
+    assert trainer._microbatch_token_limits == {"shared": 32}
+    assert max(padded[-int(result["num_train_minibatches"]):]) <= 32
+    import copy
+    trainer.single_target_parameter_adapter_mode = False
+    checkpoint = tmp_path / "trainer_state.pt"
+    torch.save(trainer.training_state_dict(), checkpoint)
+    state = torch.load(checkpoint, weights_only=False)
+    assert state["microbatch_token_limits"] == {"shared": 32}
+    restored = _fake_trainer()
+    restored.config = trainer.config
+    restored.load_training_state_dict(state)
+    assert restored._microbatch_token_limits == {"shared": 32}
+    old = copy.deepcopy(state)
+    del old["microbatch_token_limits"]  # checkpoints from before this field still load
+    restored.load_training_state_dict(old)
+    assert restored._microbatch_token_limits == {}
+    state["microbatch_token_limits"] = {"shared": 0}
+    with pytest.raises(ValueError, match="token limits"):
+        restored.load_training_state_dict(state)
+
+
+def test_token_budget_capacity_exhaustion_is_bounded(monkeypatch):
+    trainer = _fake_trainer()
+    trainer.config = replace(trainer.config, train_minibatch_size=32, train_optimizer_batch_size=32,
+                             train_microbatch_token_budget=1024)
+    forward = trainer.model.forward
+    calls = []
+
+    def always_oom(**kwargs):
+        calls.append(kwargs["input_ids"].shape[0])
+        raise torch.OutOfMemoryError("injected")
+
+    monkeypatch.setattr(trainer.model, "forward", always_oom)
+    with pytest.raises(torch.OutOfMemoryError, match="single-unit chunks"):
+        trainer.train_batch(adapter_name="shared", batch=_len_rows([5] * 8))
+    assert calls[-1] == 1 and len(calls) <= 12
