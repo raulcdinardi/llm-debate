@@ -113,6 +113,8 @@ class TrainerConfig:
     train_keep_groups_together: bool = False
     train_max_tokens: int = 0
     train_length_bucket_batches: bool = False
+    # Padded-token cap per physical chunk (rows x longest row). 0 keeps fixed-row chunks.
+    train_microbatch_token_budget: int = 0
     train_logprob_backend: str = TRAIN_LOGPROB_BACKEND_FULL_LOGITS
     compile_train_logprob_helper: bool = False
     train_lm_head_kernel: str = "torch"
@@ -653,6 +655,37 @@ def _order_batch_for_minibatching(
     return sorted(batch, key=lambda example: _effective_train_length(example=example, max_tokens=max_tokens))
 
 
+def _token_budget_chunks(
+    *,
+    rows: list[TrainExample],
+    start: int,
+    end: int,
+    row_cap: int,
+    token_budget: int,
+    unit: int = 1,
+    max_tokens: int = 0,
+) -> list[tuple[int, int]]:
+    """Contiguous unit-aligned chunks of rows[start:end] with rows x longest row <= token_budget.
+
+    A chunk never exceeds row_cap rows. A single unit that alone exceeds the budget still forms its own
+    chunk (rows are never split). With length-bucketed ordering the longest row is the chunk's last unit.
+    """
+    chunks: list[tuple[int, int]] = []
+    left = start
+    while left < end:
+        right = min(left + unit, end)
+        longest = max(_effective_train_length(example=r, max_tokens=max_tokens) for r in rows[left:right])
+        while right < end and right + unit - left <= row_cap:
+            nxt = min(right + unit, end)
+            candidate = max(longest, max(_effective_train_length(example=r, max_tokens=max_tokens) for r in rows[right:nxt]))
+            if (nxt - left) * candidate > token_budget:
+                break
+            right, longest = nxt, candidate
+        chunks.append((left, right))
+        left = right
+    return chunks
+
+
 def _order_paired_js_batch_for_minibatching(
     *,
     batch: list[TrainExample],
@@ -1108,10 +1141,17 @@ class MultiAdapterTrainer:
         logical_name = next((name for name, reference in getattr(self, "reference_adapter_names", {}).items()
                              if reference == adapter_name), adapter_name)
         size = min(size, self._microbatch_limits.get(logical_name, size))
+        budget = self.config.train_microbatch_token_budget
+        if budget > 0:
+            budget = min(budget, self._microbatch_token_limits.get(logical_name, budget))
+            bounds = _token_budget_chunks(rows=batch, start=0, end=len(batch), row_cap=max(1, size),
+                                          token_budget=budget, max_tokens=self.config.train_max_tokens)
+        else:
+            bounds = [(start, min(start + max(1, size), len(batch))) for start in range(0, len(batch), max(1, size))]
         rows: list[list[float]] = []
-        for start in range(0, len(batch), max(1, size)):
+        for start, end in bounds:
             rows.extend(self._compute_logprobs_minibatch(
-                adapter_name=adapter_name, batch=batch[start:start + size],
+                adapter_name=adapter_name, batch=batch[start:end],
                 minibatch_start=start,
             ))
         return rows
@@ -1204,6 +1244,11 @@ class MultiAdapterTrainer:
         return out
 
     @cached_property
+    def _microbatch_token_limits(self) -> dict[str, int]:
+        # Per-adapter, monotone padded-token ceilings learned from OOMs (token-budget mode only).
+        return {}
+
+    @cached_property
     def _microbatch_limits(self) -> dict[str, int]:
         # Per-adapter, monotone ceilings: a shorter subsequent batch must not
         # trigger another upward capacity search or erase an earlier OOM limit.
@@ -1242,6 +1287,10 @@ class MultiAdapterTrainer:
         candidate = min(requested, optimizer_size, len(batch), self._microbatch_limits.get(adapter_name, requested))
         candidate = max(unit, candidate // unit * unit)
         initial_candidate = candidate
+        token_budget = original_config.train_microbatch_token_budget
+        if token_budget > 0:
+            token_budget = min(token_budget, self._microbatch_token_limits.get(adapter_name, token_budget))
+        initial_token_budget = token_budget
         rng = capture_rng_state()
         failures = 0
         retry_seconds = 0.0
@@ -1279,11 +1328,13 @@ class MultiAdapterTrainer:
 
         try:
             while True:
-                self.config = replace(original_config, train_minibatch_size=candidate)
+                self.config = replace(original_config, train_minibatch_size=candidate,
+                                      train_microbatch_token_budget=token_budget)
                 self._capacity_attempt_index = failures
                 self._capacity_optimizer_started = False
                 self._capacity_optimizer_in_step = False
                 self._capacity_optimizer_updates = 0
+                self._last_chunk_max_rows = None  # unknown until this attempt plans its chunks
                 self._training_progress("attempt_begin", adapter_name=adapter_name, end_row=0,
                                         physical_microbatch_size=candidate)
                 metrics, oom, elapsed = attempt()
@@ -1294,6 +1345,8 @@ class MultiAdapterTrainer:
                         train_keep_groups_together=original_config.train_keep_groups_together,
                         physical_microbatch_size=candidate,
                         microbatch_initial_size=initial_candidate,
+                        physical_microbatch_token_budget=token_budget,
+                        microbatch_initial_token_budget=initial_token_budget,
                         microbatch_oom_attempts=failures,
                         microbatch_retry_seconds=retry_seconds,
                         microbatch_rolled_back_optimizer_steps=rolled_back_updates,
@@ -1316,6 +1369,20 @@ class MultiAdapterTrainer:
                     print(json.dumps({"event": "train_microbatch_rollback", **rollback}), flush=True)
                     self._training_progress("attempt_rollback", **rollback)
                 restore_rng_state(rng)
+                if token_budget > 0:
+                    # Halve the padded-token budget; once every chunk is already a single unit, a smaller
+                    # budget cannot help and capacity is exhausted.
+                    last_rows = getattr(self, "_last_chunk_max_rows", None)
+                    if (last_rows is not None and last_rows <= unit) or token_budget // 2 < 1:
+                        raise torch.OutOfMemoryError(
+                            f"{adapter_name}: single-unit chunks at token budget {token_budget} exhausted "
+                            f"with no retained updates: {oom}"
+                        )
+                    token_budget //= 2
+                    self._microbatch_token_limits[adapter_name] = token_budget
+                    failures += 1
+                    retry_seconds += elapsed
+                    continue
                 if candidate <= unit:
                     raise torch.OutOfMemoryError(
                         f"{adapter_name}: minimum microbatch {candidate} exhausted with no retained updates: {oom}"
@@ -1437,12 +1504,21 @@ class MultiAdapterTrainer:
         # Physical chunks never straddle an optimizer boundary, including short tails.
         chunks = []
         optimizer_start = 0
+        token_budget = self.config.train_microbatch_token_budget
+        chunk_unit = 2 if direct_js_objective else 1  # judge forward/reverse pairs are never split
         for group in optimizer_groups:
             optimizer_end = optimizer_start + len(group)
-            for start in range(optimizer_start, optimizer_end, minibatch_size):
-                chunks.append((start, min(start + minibatch_size, optimizer_end),
-                               optimizer_start, optimizer_end - optimizer_start))
+            if token_budget > 0:
+                bounds = _token_budget_chunks(rows=ordered_batch, start=optimizer_start, end=optimizer_end,
+                                              row_cap=minibatch_size, token_budget=token_budget,
+                                              unit=chunk_unit, max_tokens=self.config.train_max_tokens)
+            else:
+                bounds = [(start, min(start + minibatch_size, optimizer_end))
+                          for start in range(optimizer_start, optimizer_end, minibatch_size)]
+            for start, end in bounds:
+                chunks.append((start, end, optimizer_start, optimizer_end - optimizer_start))
             optimizer_start = optimizer_end
+        self._last_chunk_max_rows = max((end - start for start, end, _, _ in chunks), default=0)
         if self.config.train_keep_groups_together:
             print(json.dumps({"event": "optimizer_group_plan", "adapter_name": adapter_name,
                               "batch_rows": [len(group) for group in optimizer_groups],
@@ -2256,6 +2332,7 @@ class MultiAdapterTrainer:
             "learning_rate": float(self.config.learning_rate),
             "weight_decay": float(self.config.weight_decay),
             "microbatch_limits": dict(self._microbatch_limits),
+            "microbatch_token_limits": dict(self._microbatch_token_limits),
         }
 
     def load_training_state_dict(self, state: dict[str, object]) -> None:
@@ -2276,8 +2353,16 @@ class MultiAdapterTrainer:
             raise ValueError("Invalid trainer-state microbatch limits")
         self.optimizer.load_state_dict(state["optimizer"])
         self._move_optimizer_state(device=self.current_device)
+        token_limits = state.get("microbatch_token_limits", {})
+        if not isinstance(token_limits, dict) or any(
+            not isinstance(name, str) or type(size) is not int or size < 1
+            for name, size in token_limits.items()
+        ):
+            raise ValueError("Invalid trainer-state microbatch token limits")
         self._microbatch_limits.clear()
         self._microbatch_limits.update(limits)
+        self._microbatch_token_limits.clear()
+        self._microbatch_token_limits.update(token_limits)
 
     def load_adapter(self, *, adapter_name: AdapterName, adapter_dir: str) -> None:
         if self.single_target_parameter_adapter_mode:

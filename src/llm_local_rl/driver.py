@@ -548,6 +548,7 @@ class TrainingDriver:
             train_keep_groups_together=self.config.train_keep_groups_together,
             train_max_tokens=self.config.train_max_tokens,
             train_length_bucket_batches=self.config.train_length_bucket_batches,
+            train_microbatch_token_budget=self.config.train_microbatch_token_budget,
             train_logprob_backend=self.config.train_logprob_backend,
             compile_train_logprob_helper=self.config.compile_train_logprob_helper,
             train_lm_head_kernel=self.config.train_lm_head_kernel,
